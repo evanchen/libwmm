@@ -9,7 +9,7 @@ build/
 *.gcno
 *.profraw
 *.profdata
-bench
+bench/bench
 
 # ---- editor / OS ----
 .vscode/

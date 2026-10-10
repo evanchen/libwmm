@@ -140,7 +140,7 @@ config.lg_page           返回页面 2^N            config.verbose  verbose
 - DoD:脚本内断言与指南 §4.2 逐行一致;`SC1/SC3` 过
 
 **T0.2 构建骨架**
-- 内容:Makefile(debug/release/sanitize 三变体)、`wmm.h`(§2)、`bench.c`(吞吐/latency/RSS,与 glibc 对照)
+- 内容:Makefile(debug/release/sanitize 三变体)、`wmm.h`(§2)、`bench/bench.c`(吞吐/latency/RSS,与 glibc 对照)
 - DoD:空库可编译链接;`-fno-omit-frame-pointer` 生效(`nm` 无 FP 缺失警告);基准可复跑并输出三指标
 
 ### P1 核心(单线程正确性,无 tcache)
@@ -214,7 +214,7 @@ config.lg_page           返回页面 2^N            config.verbose  verbose
 | 压力 | 多线程随机分配 10 分钟 | TC1/G2/G5/PHY1 |
 | 注入 | 四类 bug 注入(泄漏/越界/UAF/双释放) | OBS2/3/4 |
 | 对照 | 同一属性测试跑 ASan + valgrind | 全规格交叉验证 |
-| 基准 | `bench.c` 吞吐/latency/RSS | 性能回归,入 CI |
+| 基准 | `bench/bench.c` 吞吐/latency/RSS | 性能回归,入 CI |
 
 **CI 门槛**:所有单元 + 属性 + 注入测试通过;`live` 恒等钩子全程为真;
 基准与 glibc 对比在可接受区间(快路径同量级)。

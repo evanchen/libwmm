@@ -49,7 +49,7 @@
 ├── gen/gen_sc.py              # 尺寸类生成器(手写)
 ├── tests/                     # 每个模块对应一个 test_*.c
 ├── monitor/                   # 独立监控进程(读共享区)
-└── bench.c                    # 基准
+└── bench/bench.c              # 基准
 ```
 
 ---
@@ -744,7 +744,7 @@ void *__wrap_aligned_alloc(size_t a, size_t s) { return wmm_aligned_alloc(a, s);
 - `mmap` 共享文件只读 → seqlock 读 → 每 1s 打印/写 CSV:live/active/RSS/per-class TOP5/事件;
 - 告警阈值(可配):live 高水位、frag 占比、事件环非空。
 
-### M16.2 `bench.c`
+### M16.2 `bench/bench.c`
 - 场景:单线程顺序、多线程随机、大小混合、大对象;指标:吞吐(op/s)、p50/p99 延迟、RSS;
 - 与 glibc 对照跑同一套(输出对比表)。
 

@@ -700,7 +700,7 @@ void  __wrap_free(void *p)    { if (p) wmm_free(p); }
 
 | 阶段 | 文件 | 内容 | 规模(约) | 验收 |
 |---|---|---|---|---|
-| P0 | `gen_sc.py` `bench.c` | 尺寸类生成器(§4)+ 基准(与 glibc 对照) | 150 | 生成表与 §4.2 一致;基准可复跑 |
+| P0 | `gen_sc.py` `bench/bench.c` | 尺寸类生成器(§4)+ 基准(与 glibc 对照) | 150 | 生成表与 §4.2 一致;基准可复跑 |
 | P1 | `wmm_core.c` `wmm_core.h` | `wmm_alloc/free/realloc` 单线程正确:尺寸类+slab+freelist+页表+合并 | 800 | 单元+压力测试;`live` 恒等(I2) |
 | P2 | `wmm_tcache.c` | cache_bin+批量+自适应 GC+线程退出 | 450 | 多线程吞吐 ≥ 单线程 90%;线程退出零泄漏 |
 | P3 | `wmm_phys.c` | retained/dirty+合并+周期 purge+大对象 | 400 | 长期压力 RSS 平稳;无碎片爆炸 |
