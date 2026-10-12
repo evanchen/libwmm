@@ -1,5 +1,7 @@
-/* wmm_boot.c —— 启动:VA 堆区、页表、bin 初始化(M2,见 doc/tasks.md §4)
+/* wmm_boot.c —— 分配器初始化
  *
- * 手写起点。只做三件事:固定 VA 堆区 mmap(PROT_NONE)、g_pte 页表、
- * g_bins[36] 初始化。boot 过程禁止调用自身分配函数(I4 自举检查)。
+ * 职责:预留 VA 堆区窗口、建立页表、建立元数据 bump 区、初始化
+ * bin 表、注册 fork 钩子。全部工作在单线程、任何分配发生之前
+ * 完成;初始化过程中只允许 mmap/munmap/madvise/memset——绝不
+ * 能调用本库的分配函数(元数据都还没建好,自举递归即死锁)。
  */

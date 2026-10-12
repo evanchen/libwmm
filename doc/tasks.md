@@ -106,7 +106,7 @@ extern const uint8_t wmm_lookup_tab[513];      /* (size+7)>>3 → bin index, siz
 /* 8B 项,低 1 位 tag: 0=指向 slab_header_t*(小对象); 1=指向 wmm_extent_t*(大对象);
    raw==0 表示该页未分配。 */
 typedef union { struct { uintptr_t tag : 1, ptr : 63; } s; uintptr_t raw; } wmm_pte_t;
-extern wmm_pte_t *g_pte;             /* 大小 = HEAP_VA_SIZE/PAGE,M2 boot 时 mmap */
+extern wmm_pte_t *g_pte;             /* 大小 = WMM_HEAP_VA_SIZE/PAGE,M2 boot 时 mmap */
 
 /* ---- slab ---- */
 typedef struct wmm_slab_s wmm_slab_t;
@@ -116,15 +116,18 @@ struct wmm_slab_s {
     uint32_t     free_head;           /* 空闲链头(region 索引),见 M3 */
     void        *addr;                /* slab 基址(页对齐) */
     wmm_slab_t  *full_prev, *full_next;    /* full 双向链 */
-    wmm_slab_t  *np_prev,  *np_next;       /* nonfull 地址序双向链 */
+    wmm_slab_t  *ph_prev, *ph_next, *ph_child;  /* nonfull 地址序配对堆(仿 jemalloc
+                                                 edata_heap;开发期可退化为有序双链,
+                                                 只用前两个指针,M7 前升级) */
     void        *ext;                 /* 所属 extent(M6 之后才用到) */
 };
 
-/* ---- bin ---- */
+/* ---- bin(每类一把锁;M3 单线程阶段先不加锁,M8 多线程起用) ---- */
 typedef struct {
+    pthread_mutex_t lock;             /* PTHREAD_MUTEX_INITIALIZER 静态初始化;fork 后 child 重置 */
     wmm_slab_t *slabcur;
     wmm_slab_t *full_head;
-    wmm_slab_t *nonfull_head;         /* 地址序,最低地址在头 */
+    wmm_slab_t *nonfull_root;         /* 地址序配对堆根(最低地址在堆顶,AR1) */
     uint64_t live, ndalloc, nslabs, curslabs;   /* M11 才用,先占位 */
 } wmm_bin_t;
 extern wmm_bin_t g_bins[WMM_NBINS];   /* 全局单 arena */
@@ -135,16 +138,52 @@ typedef struct {
     uint16_t ncached_max;
     uint16_t head;                    /* 已缓存数;栈顶=stack[head-1] */
     uint16_t low_water;               /* 上次 GC 后 head 的最小值 */
-    uint16_t pad;
+    uint16_t nfill;                   /* 下次填充目标,自适应(M9;初值 ncached_max>>1) */
     uint64_t nrequests;
 } wmm_cache_bin_t;
 
-/* ---- 线程数据 ---- */
+/* ---- 线程数据(tcache 与线程注册表节点合一,整块一次 mmap,布局见 M8.1;
+       实现以 src/wmm_internal.h 为准) ---- */
+typedef struct wmm_tcache_s wmm_tcache_t;
+struct wmm_tcache_s {
+    struct wmm_tcache_s *prev, *next; /* g_threads 双向链;g_threads_lock 保护 */
+    uint32_t tid;                     /* gettid() 缓存(事件/快照) */
+    bool     enabled;                 /* 本线程 tcache 开关(默认 true) */
+    uint64_t t_alloc_bytes, t_free_bytes;  /* L1 计数(§10.1):非原子,快照时合并 */
+    uint32_t t_alloc_cnt, t_free_cnt;
+    wmm_cache_bin_t bins[WMM_NBINS + 1];   /* [0..35] 小对象;[36] 预留
+                                              (大对象第一版不缓存,理由见 M8.5) */
+};
+extern _Thread_local wmm_tcache_t *g_tcache;   /* 惰性创建;NULL=本线程未建 */
+extern wmm_tcache_t *g_threads;       /* 线程注册表链头(M11 快照 / M15 枚举 GC) */
+extern pthread_mutex_t g_threads_lock;
+
+/* ---- 全局单例(M2 boot 初始化;文件头需 #include <pthread.h>) ---- */
+extern void *g_heap_base, *g_heap_cur, *g_heap_end;  /* VA 堆区窗口(M2.1) */
+extern pthread_mutex_t g_ext_lock;    /* extent 地址链 + free 链 + g_large 共用一把 */
+typedef struct { uint64_t live, live_bytes, ndalloc; } wmm_large_stats_t;
+extern wmm_large_stats_t g_large;     /* 大对象统计(M6 起埋点;g_ext_lock 内更新;
+                                         匿名 struct 跨编译单元类型不兼容,必须命名) */
 typedef struct {
-    wmm_cache_bin_t bins[WMM_NBINS + 2];   /* 36 小 + 大对象缓存 + 1 预留 */
-    bool enabled;
-} wmm_tcache_t;
-extern _Thread_local wmm_tcache_t *g_tcache;   /* 惰性创建,或 __thread 内嵌 */
+    size_t   dirty_max;               /* 默认 8MB(M10) */
+    int      madvise_mode;            /* MADV_DONTNEED / MADV_FREE,运行期可切 */
+    unsigned sample_n;                /* 采样间隔,默认 1000;0=关(M13) */
+    bool     guard;                   /* redzone/poison/quarantine 总开关(M14) */
+    bool     verbose;
+    bool     abort_oom;               /* OOM 时 abort(plan §2 opt_abort,默认 false) */
+} wmm_opt_t;
+extern wmm_opt_t g_opt;
+
+/* ---- 索引类型与页表查询(M4 实现,wmm_core.c) ---- */
+typedef uint32_t szind_t;             /* 尺寸类索引;36 = WMM_INDEX_LARGE(大对象) */
+#define WMM_INDEX_LARGE WMM_NBINS
+wmm_pte_t wmm_pte_get(const void *p);
+void      wmm_pte_set(const void *p, wmm_pte_t v);
+bool      wmm_pte_is_slab(const void *p, wmm_slab_t **out);
+bool      wmm_pte_is_extent(const void *p, void **out_ext);
+
+/* ---- 元数据区(仿 jemalloc base.c;I4 自举) ---- */
+void *wmm_base_alloc(size_t size);    /* 8B 对齐 bump,只分配不回收(M2.3) */
 
 /* ---- 小工具(全库通用) ---- */
 void wmm_dprintf(const char *fmt, ...);   /* write(2) 直出,禁止 printf */
@@ -186,7 +225,8 @@ for s in range(1, 513):
     size = s << 3                       # 8..4096,步进 8
     tab[s] = size2index(size)           # 用 size2index 主函数回填
 ```
-- 手工核对:`tab[1]=0(8B)`, `tab[2]=1(16B)`, `tab[3]=1(17B 归 16)`, `tab[512]=28(4096)`。
+- 手工核对:`tab[1]=0(8B)`, `tab[2]=1(16B)`, `tab[3]=2(17..24B 归 32)`, `tab[512]=28(4096)`。
+  (勘误:原稿 `tab[3]=1` 有误——24B 的最小上界是 32B 类;SC2"最小上界"属性测试会抓住它。)
 
 ### M1.3 生成头文件骨架
 - 头部注释:生成时间、算法出处(sc.c)、**校验和断言**(`static_assert(sizeof(wmm_bin_info)==16)` 等);
@@ -205,28 +245,47 @@ for s in range(1, 513):
 
 ### M2.1 堆区 VA(为可手写而简化的关键决策)
 ```
-HEAP_VA_SIZE = 16GB(可配置)
-base = mmap(NULL, HEAP_VA_SIZE, PROT_NONE,
+WMM_HEAP_VA_SIZE = 64GB(编译期常量,定义在 wmm_internal.h,-D 可覆盖)
+base = mmap(NULL, WMM_HEAP_VA_SIZE, PROT_NONE,
             MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE)   /* 只占 VA,不占物理 */
 ```
-- **为什么**:页表大小 = VA/PAGE×8 = 32MB,**固定一次分配**;不需要动态增长页表(手写最容易错的地方);
-- 32MB 一次性 memset 可接受;后续优化点:二级页表按需(M16 之后)。
+- **为什么固定窗口**:页表因此可以是一次 mmap 到位的平坦数组,免掉
+  "堆长大要扩页表"的全部动态管理(手写最容易错的地方);
+- **代价模型(选窗口大小只看这两行)**:
+  VA 预留 = 窗口/512(64GB → 页表数组 128MB;x86-64 地址空间 128TB,VA 免费);
+  物理占用 ≈ 实际堆/512(0.2%),随使用惰性增长,**与窗口大小无关**;
+- **预留失败重试**:strict overcommit(vm.overcommit_memory=2)会把预留计入
+  commit 配额,mmap 失败则窗口减半重试(64G→32G→…≥4G),最终大小记录之;
+- **撞顶处理**:窗口耗尽 = OOM,写 0xDB 事件并附当时用量
+  (g_heap_cur−g_heap_base),让运维能区分"真没内存"与"撞了人为上限"。
 
 ### M2.2 页表
 ```
-g_pte = mmap(NULL, HEAP_VA_SIZE/PAGE * 8, PROT_READ|WRITE, MAP_PRIVATE|MAP_ANONYMOUS)
-memset(g_pte, 0, 大小)                 /* 0=未用 */
+g_pte = mmap(NULL, (WMM_HEAP_VA_SIZE / WMM_PAGE) * sizeof(wmm_pte_t),
+             PROT_READ|WRITE, MAP_PRIVATE|MAP_ANONYMOUS)
+madvise(g_pte, 大小, MADV_NOHUGEPAGE)
+/* 严禁 memset:匿名私有映射内核保证零填充(raw==0 即"未分配");
+   手写 memset 会把整个数组触碰一遍,凭空给 RSS 垫 128MB 的底,
+   还废掉"物理随用增长"的整个设计 */
 ```
+- 首次写某个页表项才分配它所在页的物理内存——页表自身的驻留随堆长大;
+- `MADV_NOHUGEPAGE`:防 khugepaged 把零星触碰的页表页合并成 2MB 大页
+  (THP=always 的机器),把"每次驻留 4KB"放大成"每次 2MB"。
 
 ### M2.3 初始化
-- `g_bins[36]` 全零;
+- 元数据区(base,仿 jemalloc `base.c`):mmap 一块(默认 4MB)做 bump 分配器,
+  `wmm_base_alloc()` 供 slab 头 / extent 结点分配,**只分配不回收**(I4;杜绝递归分配);
+- `g_bins[36]` 全零(锁用 `PTHREAD_MUTEX_INITIALIZER` 静态初始化,免运行时 init);
 - 记录 `g_heap_base / g_heap_cur`(bump 指针,M6 用);
 - 注册 `pthread_atfork` 三个钩子(先空实现,§15 指南坑 3 补全);
 - **I4 自举检查**:boot 过程中只允许 `mmap/munmap/madvise/memset`,禁止调用自身分配函数。
 
 ### 自测清单(M2)
-- [ ] `wmm_boot` 后 `g_pte` 32MB 可读写、`g_bins` 全零;
-- [ ] 重复调用 `wmm_boot` 返回错误(幂等保护)。
+- [ ] `wmm_boot` 后 `g_pte` 覆盖整个实际窗口、任意页首查为 0(零值来自内核
+      零页而非 memset);`g_bins` 全零;
+- [ ] boot 后 RSS 无与页表数组等量的台阶(仅实际触碰部分驻留);
+- [ ] 重复调用 `wmm_boot` 无效果(幂等;注意其返回类型是 void,不存在"返回错误");
+- [ ] 预留失败场景(ulimit -v 调小)会减半重试,最终窗口大小被记录(verbose 打印)。
 
 ---
 
@@ -274,9 +333,13 @@ void  wmm_bin_slab_install(wmm_bin_t *b, wmm_slab_t *sl);  /* 新 slab 上任 */
 1. sl->nfree++ 并压链
 2. 若 nfree==nregs(全空): 从所在结构摘除(slabcur 置 NULL / 从 nonfull 摘),
    返回"可归还"标志 → 调用方交给 M6
-3. 若原在 full 链: 摘除, 按地址插入 nonfull(最低在前, O(n) 插入即可)
+3. 若原在 full 链: 摘除, 按地址插入 nonfull 配对堆(堆顶=最低地址;仿 jemalloc
+   edata_heap,~50 行;开发期可先用有序双链,行为等价、插入 O(n),M7 前升级)
 4. b->live--(G2)
 ```
+
+- **特例 nregs==1 的类(4096/8192/12288)**:分配即满、释放即空,**永不进入 nonfull**
+  (指南 §4.2 注,仿 `bin.c:202`);上面的通用状态机天然覆盖,不要为它们写 nonfull 插入分支;
 
 ### 自测清单(M3)
 - [ ] SLAB1:单测建 slab 后遍历全部 region,地址 = addr+r*reg_size、互不重叠、覆盖全区间;
@@ -382,7 +445,9 @@ typedef struct wmm_extent_s {
 } wmm_extent_t;
 ```
 - **单一地址序双向链**:carve 时插入、free 时原地改 state——**找邻居合并 = 链上 prev/next,O(1)**;
-- 空闲另挂一条 free 链(便于 first-fit 搜索)。
+- 空闲另挂一条 free 链(便于 first-fit 搜索);
+- extent 结点从 base 元数据区 `wmm_base_alloc`(M2.3)取;合并吞并或真正 munmap 后,
+  空结点挂全局单链 `g_ext_free_nodes` 复用——extent 随大对象频繁生灭,不复用会泄漏元数据。
 
 ### M6.2 carve(拿页)
 ```c
@@ -458,13 +523,15 @@ void  wmm_large_free(void *p);         /* pte→extent→wmm_extent_free */
 
 ### M8.1 初始化与栈内存
 - `g_tcache` 用 `_Thread_local`;首次使用时惰性创建:
-  - 栈数组内存:一个 `mmap` 按需分配(M15 优化:批量一个数组);**不能用 wmm_alloc 自举(I4)**;
-  - 每个 bin 的 `ncached_max` 按公式(指南 §7.4):
+  - **整块一次 mmap**:`[ wmm_tcache_t 结构 | 各 bin 栈数组 ]`(结构在块头,
+    本身即 `g_threads` 链节点——这是 M11 合并线程计数、M15 枚举 GC 的基础);
+    **不能用 wmm_alloc 自举(I4)**;线程退出整块 munmap——
+    不走 base 元数据区(base 不回收,线程反复创建销毁会泄漏元数据);
+  - 每个 bin 的 `ncached_max` 按公式(指南 §7.4,仅小对象):
     ```
-    小对象: candidate = nregs << 1(取偶), clamp [20,200]
-    大对象缓存(bins[36]): 20
+    candidate = nregs << 1(取偶), clamp [20,200]
     ```
-- `stack = mmap(NULL, ncached_max*8, ...)`;`head=0; low_water=0`。
+- 各 bin 栈空间按序排在上述整块 mmap 内;`head=0; low_water=0`。
 
 ### M8.2 快路径(核心,对照指南 §7.2)
 ```c
@@ -511,7 +578,16 @@ wmm_alloc: if (size<=14336 && tcache 启用):
 wmm_free:  反查 szind → if (小 && tcache 启用) wmm_tcache_free(i, p)
            else 直接 bin/大对象归还
 ```
-- **大对象**也走 tcache 缓存(bins[36],容量 20)——M8.6。
+- **大对象不进 tcache(第一版决策,勘误)**:原稿"bins[36] 容量 20"是从 jemalloc
+  剥离语境的移植错误——jemalloc 的 20 槽属于"每个大对象类各一个 cache bin"的
+  语境,弹出规格必然匹配请求;塞进单一混合槽后,要 1MB 可能弹出 16KB 的块
+  (usable_size 错乱),且固定 20 槽 × 任意大的对象可囤出 GB 级缓存。大对象
+  分配/释放直走物理层;将来若要缓存:释放对象首 8B 存页数、弹栈时校验
+  (bins[36] 已为此预留,避免届时改 tcache 结构布局)。
+- **live 语义(与指南 §10.1 I2 勘误一致)**:fill 时 bin 锁内 `live += n`、flush 时
+  `live -= n`、慢路径直接分配/释放 ±1 → **live = 应用持有 + tcache 缓存**(jemalloc 同义)。
+  自 M8 起,M7 oracle 断言④改为 `Σ live[i] − Σ tcache head[i] == 活指针集合数`;
+  线程退出(G5)flush 归零后,`Σ live` 回到"应用持有"基线。
 
 ### 自测清单(M8)
 - [ ] TC1:单线程分配 10 万次,命中 tcache(打点:head 无变化路径计数)≥ 90%;
@@ -539,12 +615,14 @@ static unsigned wmm_tcache_gc_bin(szind_t i) {
 }
 ```
 - **触发点**:a) `wmm_tcache_free` 满时(先 GC 再压栈);b) 慢路径经过时按 bin 轮流 GC(简单版:每 N 次分配 GC 一个 bin,轮转);
-- **填充目标自适应**(可后做,先固定 nfill= ncached_max 的一半):`nfill` 翻倍/减半公式见指南 §7.5。
+- **填充目标自适应**(必做,共 ~6 行,照指南 §7.5):每 bin 存 `nfill`
+  (初值 `ncached_max>>1`,下限 2);GC 触发后 `nfill >>= 1`,连续填满则 `nfill <<= 1`
+  (封顶 `ncached_max>>1`)。
 
 ### M9.2 线程退出(必做,指南 §7.6)
 ```c
 void wmm_thread_exit(void) {
-    for (i in 0..36) if (head>0) wmm_tcache_flush(i, head);
+    for (i in 0..35) if (head>0) wmm_tcache_flush(i, head);
     munmap(tcache 内存); g_tcache = NULL;
 }
 ```
@@ -612,12 +690,14 @@ int wmm_stats_snapshot(wmm_stats_t *st) {
        3) 填 active/frag/high_water;epoch++; */
 }
 ```
-- **自检断言(测试钩子,始终开启)**:`Σ_i live[i]*reg_size[i] + large.live_bytes == st->live_bytes`(OBS1)。
+- **自检断言(测试钩子,始终开启)**:`Σ_i live[i]*reg_size[i] + large.live_bytes == st->live_bytes`(OBS1;live 含 tcache 内对象,口径见 M8.5)。
+- `threads[128]` 超员:第 129+ 个线程的计数合并进 `threads[127]`(聚合桶,tid 记 0)。
 
 ### M11.3 事件日志
 ```c
 #define WMM_EVENT_RING 1024
-typedef struct { uint64_t ts; uint32_t type, tid; uintptr_t ptr, pc0, pc1; } wmm_event_t;
+typedef struct { uint64_t ts; uint32_t type, tid; uintptr_t ptr; uint32_t cls;
+                 uintptr_t pc0, pc1; } wmm_event_t;   /* 定义以 include/wmm.h 为准 */
 void wmm_event_log(uint32_t type, void *ptr);   /* 单生产者无锁,写指针原子++ */
 int  wmm_event_drain(wmm_event_t *buf, size_t n, size_t *got);
 ```
@@ -635,11 +715,16 @@ int  wmm_event_drain(wmm_event_t *buf, size_t n, size_t *got);
 ```
 0x000  magic "WMMST" + version(4+4)
 0x010  seqlock(uint64, 奇数=写入中)
-0x020  wmm_stats_t 主快照(固定大小,由 wmm_stats_t 布局决定)
-0x800  TOP N 采样表(256 项 × 32B)——M13 填
-0x4000 wmm_event_t 环(1024 × 32B)
+0x020  wmm_stats_t 主快照(sizeof==0x13B8,wmm.h 内 static_assert 锁死)
+0x1800 TOP N 采样表(256 项 × 32B = 0x2000;项 = {pc, bytes, count, reserved},
+       名字解析在监控端 addr2line)——M13 填
+0x4000 wmm_event_t 环(1024 × 48B = 0xC000;sizeof==48,static_assert 锁死)
+合计映射大小 0x10000(64KB)
 ```
-- 建:内存映射文件(`memfd_create` 或临时文件)+ `ftruncate(0x4000+1024*32)` + 映射;监控进程 `mmap` 同文件只读;
+- 建:内存映射文件(`memfd_create` 或临时文件)+ `ftruncate(0x10000)` + 映射;监控进程 `mmap` 同文件只读;
+  (勘误:① 原稿 TOP N 在 0x800 会被主快照区覆盖——wmm_stats_t 实占 0x13B8,故挪至 0x1800;
+   ② 原稿事件环按 32B/项计算有误——wmm_event_t 含两个 uintptr_t 调用点帧,实为 48B,
+   环 0xC000,映射总大小 0x10000;两处尺寸均已由 wmm.h 的 static_assert 锁死)
 - 后台线程每 1s `wmm_shm_publish()`:锁 seqlock → memcpy 快照 → 解锁。
 
 ### M12.2 seqlock 读端(监控进程/测试用)

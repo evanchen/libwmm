@@ -103,11 +103,11 @@ config.lg_page           返回页面 2^N            config.verbose  verbose
 | 编号 | 规格 | 要点 | 验收(自动化) |
 |---|---|---|---|
 | G1 | 对齐(指南 §4.4) | 返回值 16B 对齐(8B 类 8B) | 属性测试:随机 size 断言对齐 |
-| G2 | live 单点(§10.1) | per-class `live` 只在 bin 锁内改 | 测试钩子:每操作后 `Σlive[i]*size[i]==live_bytes` |
+| G2 | live 单点(§10.1) | per-class `live` 只在 bin 锁内改(= 应用持有+tcache) | 测试钩子:每操作后 `Σlive[i]*size[i]==live_bytes` |
 | G3 | 归属(§12) | 同指针不跨分配器 | CI 审计 + 冒烟 |
 | G4 | 自举(§15.1) | 元数据全走 mmap 专用区 | 代码审查 + 无递归分配 |
 | G5 | 无泄漏(§7.6) | 线程退出归还全部 tcache | 线程退出后 live 不变断言 |
-| SC1 | 尺寸类表(§4.2) | 36 bin + 199 大对象类,生成器导出 | 生成表与指南 §4.2 逐行一致 |
+| SC1 | 尺寸类表(§4.2) | 36 bin 表生成器导出;大对象按 §4.5 公式量化(等效 199 个页面倍数类,不生成表) | 生成表与指南 §4.2 逐行一致;公式抽样断言 |
 | SC2 | size2index(§4.4) | ≤4096 查表,否则公式;结果最小上界 | 属性测试:index 的 size ≥ 请求,且上一类 < 请求 |
 | SC3 | slab 页数(§4.3) | pgs=LCM(PAGE,reg)/PAGE | 生成表断言 1/2/3/5/7 |
 | SLAB1 | slab 布局(§5.2) | region = addr + regind*reg_size,不重叠全覆盖 | 单测遍历全部 region |
@@ -136,7 +136,7 @@ config.lg_page           返回页面 2^N            config.verbose  verbose
 ### P0 生成器与工程骨架
 
 **T0.1 `gen_sc.py` → 生成 `wmm_sc.h`**
-- 内容:size2index lookup 表(513 项)+ `bin_info[36]`(reg_size/pgs/slab_size/nregs)+ 大对象量化表
+- 内容:size2index lookup 表(513 项)+ `bin_info[36]`(reg_size/pgs/slab_size/nregs)+ large_min 常量(大对象量化走 §4.5 公式,不生成 199 项表)
 - DoD:脚本内断言与指南 §4.2 逐行一致;`SC1/SC3` 过
 
 **T0.2 构建骨架**

@@ -1,6 +1,8 @@
-/* wmm_phys.c —— 物理层:extent 地址序链/carve/合并/retained/dirty/purge
- * (M6/M10,见 doc/tasks.md §8/§12)
+/* wmm_phys.c —— 物理层:页的来去与合并
  *
- * 手写起点。M6:extent 结构 + 全量地址序双向链 + carve(MAP_FIXED 于堆区内)
- * + 合并 + 大对象路径;M10:purge 后台线程 + MADV_DONTNEED/FREE。
+ * 职责:extent(页对齐物理块)的地址序链与空闲链;取页(先空闲区
+ * 复用、不够再 MAP_FIXED 映射新页);释放时与相邻空闲块合并——
+ * 不合并则长期运行必然碎成页渣,这是物理层存在的第一理由;
+ * 大对象(整页分配)路径;后台线程按阈值向内核归还空闲页
+ * (madvise DONTNEED/FREE,运行期可切)。
  */

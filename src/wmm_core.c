@@ -1,7 +1,9 @@
-/* wmm_core.c —— slab/freelist/bin 状态机/页表登记/主路径/对齐分配
- * (M3/M4/M5,见 doc/tasks.md §5~§7)
+/* wmm_core.c —— 分配主路径
  *
- * 手写起点。按序完成:M3 slab 建立与 region 分配/释放、bin 状态机;
- * M4 size2index + 主路径(alloc/free/realloc/usable_size)+ free 反查;
- * M5 对齐分配三档。
+ * 职责:尺寸类查表;slab 的建立与对象取/还(空闲链);bin 状态机
+ * (热 slab 满了挂链、全空归还);页表登记与 free 时的反向查找;
+ * wmm_alloc/free/realloc/calloc/usable_size 与对齐分配的实现。
+ *
+ * 层次关系:本文件只管"对象 ←→ slab/bin"的世界;页从哪来、还给
+ * 谁、相邻块怎么合并是 wmm_phys.c 的事,两者以 extent 为交接单位。
  */

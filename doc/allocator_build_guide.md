@@ -281,7 +281,7 @@ static pte_t *g_page_table;   /* 大小 = 堆地址空间页数,mmap 分配 */
 ```
 
 - **小对象**:slab 的**每一页**的页表项都指向同一个 `slab_header_t`(8 字节,代价可接受)——`free(p)` 不需要知道对象落在第几页;
-- **大对象**:extent 首尾页 `tag=1` 指向 `extent_t*`;中间页指向**任一页**(free 时只用首项,§9);
+- **大对象**:extent 的**每一页**都登记同一 `extent_t*`(tag=1)——与 jemalloc emap 全页登记语义一致,`free(p)` 从任意页进入都能反查,归还时以 `extent->addr` 为基址整体回收;
 - 开销:1GB 堆 = 256K 页 × 8B = **2MB**;用二级结构按需分配可降到常驻少量页(Phase 4 优化)。
 
 ### 6.2 算法
@@ -357,8 +357,10 @@ void wmm_tcache_free(cache_bin_t *b, void *p) {
 ### 7.4 ncached_max 公式(`tcache.c:717-739`)
 
 ```
-ncached_max(szind):
-  if szind >= 36(大对象):        return 20            // TCACHE_NSLOTS_LARGE(tcache.h:67)
+ncached_max(szind):                                    // 仅小对象(szind 0..35)
+  // 本库第一版不缓存大对象:jemalloc 的 20 槽(TCACHE_NSLOTS_LARGE)属于
+  // "每个大对象类各一个 cache bin"的语境,剥离语境塞进单一混合槽,弹出
+  // 规格无法保证匹配请求;szind ≥ 36 一律直走物理层。
   candidate = nregs(szind) << 1                       // TCACHE_LG_NSLOTS_MUL=1
   if candidate 奇数: candidate++
   return clamp(candidate, 20, 200)                    // SMALL_MIN/MAX(tcache.h:65-66)
@@ -459,7 +461,7 @@ unsigned bin_fill(bin_t *b, szind_t i, unsigned want, void **out) {
         while (n < want && b->slabcur->nfree > 0)
             out[n++] = pop(b->slabcur);                    // 从链头连续 pop(freelist 批量天然高效)
     }
-    b->live += n;  b->ndalloc += n;                       // I2
+    b->live += n;                                          // I2(fill 即分配;原稿误写 ndalloc+=n,勘误)
     unlock(b);
     return n;
 }
@@ -542,7 +544,7 @@ wmm_free(大对象):
 | L2 大对象 | `live_large, live_large_bytes` | 大对象慢路径 | 原子或锁内 | 恒一致 |
 | L3 汇总 | `active_bytes, rss_est, high_water` | 物理层每次 mmap/madvise/munmap | 低频 | 恒一致 |
 
-**I2 的完整陈述**:`live[i]` 只由 bin 锁内的三个点修改(fill 加、慢释放减、直接分配加)。tcache 里的对象对 arena 而言仍"活着"(在应用手里),因此 tcache 填充/刷出不改变 `live`——只在刷出(真正 free)时减。**只要这条成立,`Σ live[i]*size[i]` 就是精确的"应用持有字节数"**,监控数据本身可信。
+**I2 的完整陈述(勘误版)**:`live[i]` 只在 bin 锁内、且只在 slab pop/push 处修改:fill 批量 pop 加 n、flush 批量 push 减 n、慢路径直接分配/释放 ±1。因此 **live = 应用持有 + tcache 缓存中**(jemalloc 同语义:fill 计入 nmalloc,flush 计入 ndalloc)。**只要这条成立,`Σ live[i]*size[i] == live_bytes` 恒等**(live_bytes 同口径),监控数据自身可信;属性测试断言为 `Σ live[i] − Σ tcache head[i] == 应用活指针数`,线程退出 flush 后 `Σ live` 回到基线(G5)。
 
 ### 10.2 快照结构
 
@@ -558,7 +560,7 @@ typedef struct {
     /* per-class(36 + 大对象): */
     struct { uint64_t live, ndalloc, size; } cls[37];
     /* per-thread(≤ 上限个): */
-    struct { uint64_t tid, alloc_bytes, free_bytes, alloc_cnt; } threads[NTHREADS_MAX];
+    struct { uint64_t tid, alloc_bytes, free_bytes, alloc_cnt; } threads[128];  /* 超员合并进 threads[127] */
     /* 事件环(§10.6)+ 采样 TOP N(§10.3) */
 } wmm_stats_t;
 ```
@@ -616,9 +618,9 @@ typedef struct { uint64_t ts; uint32_t type; uint32_t tid;
 偏移    字段                    说明
 0x000   magic "WMMST" + version  协议版本
 0x010   seqlock                 奇数=写入中(§11.2)
-0x020   wmm_stats_t 主快照       (epoch, 汇总, per-class, per-thread)
-0x800   采样 TOP N 表(256 项 × 32B: pc, bytes, count, name[16])
-0x4000  wmm_event_t 事件环(1024 × 32B)
+0x020   wmm_stats_t 主快照       (sizeof==0x13B8,static_assert 锁死)
+0x1800  采样 TOP N 表(256 项 × 32B: pc, bytes, count, reserved;名字在监控端 addr2line)
+0x4000  wmm_event_t 事件环(1024 × 48B)   /* 映射总大小 0x10000;两个结构尺寸由 wmm.h static_assert 锁死 */
 ```
 
 - 分配器持写端:后台聚合线程每 1s 更新一次(§10.3/§10.4 同线程);

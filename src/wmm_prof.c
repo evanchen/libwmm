@@ -1,5 +1,7 @@
-/* wmm_prof.c —— 调用点采样(M13,见 doc/tasks.md §15)
+/* wmm_prof.c —— 调用点采样
  *
- * 手写起点。frame-pointer 栈遍历(-fno-omit-frame-pointer)、线程环形缓冲、
- * 慢路径计数触发、后台聚合 TOP N。
+ * 职责:回答"内存是谁吃的"。慢路径分配按间隔采样,沿帧指针链
+ * 回溯栈(依赖 -fno-omit-frame-pointer 编译),记录到线程环形
+ * 缓冲;后台线程按采样权重聚合成"调用点 → 估算字节/次数",输出
+ * TOP N。默认关闭,开销与采样率成正比。
  */

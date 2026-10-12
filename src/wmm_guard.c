@@ -1,5 +1,8 @@
-/* wmm_guard.c —— guard/quarantine + 泄漏三档(M14,见 doc/tasks.md §16)
+/* wmm_guard.c —— 内存错误检测与泄漏告警
  *
- * 手写起点。默认关闭,运行期开关。poison/redzone、双释放/野指针事件、
- * C/B/A 三档泄漏检测(与 wmm_prof.c 联动)。
+ * 职责:poison(释放后填 0xBC,再分配时被改 = UAF 已发生)、
+ * redzone(对象前后放哨兵字节,踩哨兵 = 越界写)、quarantine
+ * (释放先进隔离区延迟复用,隔离期间被写 = UAF)、双释放/野指针
+ * (free 时页表反查直接暴露);以及泄漏三档:持续上涨告警、
+ * TOP N 增量对比、全量 dump。全部默认关闭,运行期开关。
  */

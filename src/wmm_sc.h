@@ -1,6 +1,7 @@
-/* wmm_sc.h —— 尺寸类表 + lookup 表(M1,见 doc/tasks.md §3)
+/* wmm_sc.h —— 尺寸类表 + 查表数组(由 gen/gen_sc.py 生成,勿手改)
  *
- * 由 gen/gen_sc.py 生成;生成前此文件为空占位。
- * 生成后:bin_info[36](reg_size/pgs/slab_size/nregs)+ wmm_lookup_tab[513],
- * 并与 doc/allocator_build_guide.md §4.2 逐行一致(SC1/SC3)。
+ * 生成内容:wmm_bin_info[36](每个尺寸类的对象大小/slab 页数/slab
+ * 大小/对象数)与 wmm_lookup_tab[513](4096 以下请求的查表)。
+ * 数值与 jemalloc 默认配置一致,正确性由生成器内置断言 + 专门的
+ * 尺寸类测试双重保证。生成前本文件为空占位。
  */

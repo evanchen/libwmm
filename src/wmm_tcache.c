@@ -1,6 +1,7 @@
-/* wmm_tcache.c —— cache_bin 快路径/批量填充/自适应 GC/线程退出
- * (M8/M9,见 doc/tasks.md §10/§11)
+/* wmm_tcache.c —— 线程缓存
  *
- * 手写起点。采用 head 索引版 cache_bin(wmm_internal.h 已定);
- * M8 快路径 + fill/flush + arena 批量填充;M9 GC 公式 + wmm_thread_exit(G5)。
+ * 职责:每线程、每尺寸类的对象栈;快路径分配(弹栈)/释放(压栈),
+ * 完全无锁;栈空时向 bin 批量补充、栈满或长时间未用时批量刷回;
+ * 自适应:补充量按实际用量翻倍/减半;线程退出时全部刷回并注销。
+ * 分配/释放的大多数流量在快路径终结,bin 锁只在批量时出现。
  */
