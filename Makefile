@@ -18,14 +18,22 @@ AR       = ar
 # -D_DEFAULT_SOURCE:-std=c11 是严格模式,glibc 会隐藏 MAP_ANONYMOUS /
 # MAP_NORESERVE / MADV_* 与部分 POSIX 声明(这些都在 _DEFAULT_SOURCE
 # 门下);该宏恢复发行版默认可见集,是 feature_test_macros 的标准姿势。
-CFLAGS_COMMON := -std=c11 -D_DEFAULT_SOURCE -fno-omit-frame-pointer \
+# -fPIC:同一套 .o 既进 libwmm.a 也进 libwmm.so,而共享库必须是位置
+# 无关代码——缺了它链接 .so 时报 R_X86_64_PC32 can not be used:非 PIC
+# 的对象把全局变量与函数地址全编成 PC 相对重定位,加载期无法改写
+# 只读代码段去补这个偏移。x86-64 的寻址本来就是 RIP 相对,PIC 几乎
+# 零开销,不值得为 .a 与 .so 维护两套目标目录。
+CFLAGS_COMMON := -std=c11 -D_DEFAULT_SOURCE -fPIC -fno-omit-frame-pointer \
                  -fno-builtin-malloc -pthread -Wall -Wextra -Iinclude -Isrc
 CFLAGS_DEBUG   := $(CFLAGS_COMMON) -O0 -g -fsanitize=address,undefined
 CFLAGS_RELEASE := $(CFLAGS_COMMON) -O2 -g
 
 SRC := $(wildcard src/*.c)
 
-HDRS := include/wmm.h src/wmm_internal.h src/wmm_sc.h
+# 目标文件除头文件外还依赖 Makefile 本身:改了编译选项而没有头文件
+# 变化时,依赖里没有 Makefile 就会复用过期的 .o——"加了 -fPIC 却还在
+# 链旧对象"这类诡异错误就是这么来的。
+HDRS := include/wmm.h src/wmm_internal.h src/wmm_sc.h Makefile
 
 BUILD_DEBUG   := build/debug
 BUILD_RELEASE := build/release
