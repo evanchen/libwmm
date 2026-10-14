@@ -15,8 +15,11 @@
 CC       = gcc
 AR       = ar
 
-CFLAGS_COMMON := -std=c11 -fno-omit-frame-pointer -fno-builtin-malloc \
-                 -pthread -Wall -Wextra -Iinclude -Isrc
+# -D_DEFAULT_SOURCE:-std=c11 是严格模式,glibc 会隐藏 MAP_ANONYMOUS /
+# MAP_NORESERVE / MADV_* 与部分 POSIX 声明(这些都在 _DEFAULT_SOURCE
+# 门下);该宏恢复发行版默认可见集,是 feature_test_macros 的标准姿势。
+CFLAGS_COMMON := -std=c11 -D_DEFAULT_SOURCE -fno-omit-frame-pointer \
+                 -fno-builtin-malloc -pthread -Wall -Wextra -Iinclude -Isrc
 CFLAGS_DEBUG   := $(CFLAGS_COMMON) -O0 -g -fsanitize=address,undefined
 CFLAGS_RELEASE := $(CFLAGS_COMMON) -O2 -g
 
@@ -52,12 +55,15 @@ $(BUILD_RELEASE)/libwmm.a: $(patsubst src/%.c,$(BUILD_RELEASE)/%.o,$(SRC))
 $(BUILD_RELEASE)/libwmm.so: $(patsubst src/%.c,$(BUILD_RELEASE)/%.o,$(SRC))
 	$(CC) -shared -o $@ $^ -lpthread
 
-# test:对 debug 库(带 sanitizer)编译并运行 tests/ 下的用例
+# test:对 debug 库(带 sanitizer)编译并运行 tests/ 下的全部用例。
+# 用例是白盒的:可直接包含 src/wmm_internal.h 检查内部状态;
+# 入口 tests/main.c 维护用例表,新增 tests/test_xxx.c 时在表中登记。
+TEST_SRC := $(wildcard tests/test_*.c)
 test: debug
-	@if [ -z "$(wildcard tests/test_*.c)" ]; then \
-	    echo "tests/: 暂无用例(骨架阶段)"; exit 0; \
-	fi
-	@echo "tests/ 用例接入是首个里程碑的一部分,尚未落地" && exit 1
+	@mkdir -p build/test
+	$(CC) $(CFLAGS_DEBUG) -o build/test/run tests/main.c $(TEST_SRC) \
+	    $(BUILD_DEBUG)/libwmm.a -lpthread
+	./build/test/run
 
 # bench:性能基准(与 glibc 对照);基准程序尚未实现
 bench: release

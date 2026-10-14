@@ -273,12 +273,17 @@ madvise(g_pte, 大小, MADV_NOHUGEPAGE)
   (THP=always 的机器),把"每次驻留 4KB"放大成"每次 2MB"。
 
 ### M2.3 初始化
-- 元数据区(base,仿 jemalloc `base.c`):mmap 一块(默认 4MB)做 bump 分配器,
-  `wmm_base_alloc()` 供 slab 头 / extent 结点分配,**只分配不回收**(I4;杜绝递归分配);
-- `g_bins[36]` 全零(锁用 `PTHREAD_MUTEX_INITIALIZER` 静态初始化,免运行时 init);
-- 记录 `g_heap_base / g_heap_cur`(bump 指针,M6 用);
-- 注册 `pthread_atfork` 三个钩子(先空实现,§15 指南坑 3 补全);
-- **I4 自举检查**:boot 过程中只允许 `mmap/munmap/madvise/memset`,禁止调用自身分配函数。
+- 元数据区(base,仿 jemalloc `base.c`):按 4MB 块 mmap、8B 对齐线性切割,
+  块尾不足一次请求则追加新块(大请求独占大块);`wmm_base_alloc()` 供
+  slab 头 / extent 结点分配,**只分配不回收**(I4;杜绝递归分配);
+- `g_bins[36]` 计数全零;36 把 bin 锁 + `g_ext_lock` + `g_threads_lock`
+  在 boot 内显式 `pthread_mutex_init`(不赌"零值即合法互斥量"的
+  可移植性,且 fork 后的 child 重建复用同一段做法);
+- 记录 `g_heap_base / g_heap_cur / g_heap_end`(实际窗口,供 M6 bump 与越界判据);
+- 注册 `pthread_atfork` 三个钩子并直接实现:prepare 按锁序冻结全部全局锁,
+  parent 原序反向解锁,child 全部重建(§15 指南坑 3);
+- **I4 自举检查**:boot 过程中只允许 `mmap/madvise/write` 类系统调用,
+  禁止调用自身分配函数。
 
 ### 自测清单(M2)
 - [ ] `wmm_boot` 后 `g_pte` 覆盖整个实际窗口、任意页首查为 0(零值来自内核

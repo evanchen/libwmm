@@ -4,6 +4,7 @@
 
 | 文件 | 覆盖(tasks.md 模块) | SPEC |
 |---|---|---|
+| test_boot.c | M2 启动:窗口/页表零页/幂等/base 分配器 | G4 |
 | test_sc.c | M1 尺寸类/查表 | SC1/SC2/SC3 |
 | test_slab.c | M3 slab + freelist + bin | SLAB1/2, AR1 |
 | test_pte.c | M4 页表登记/反查 | PTE1/2 |
@@ -18,5 +19,6 @@
 | test_guard.c | M14 guard/泄漏三档 | OBS3/4 |
 | test_wrap.c | M15 --wrap 集成 | G3 |
 
-统一入口:写一个 `test_main` 表(每个 test 文件一个函数),由 `tests/main.c` 汇总,
-`make test` 全部执行。
+统一入口:`tests/main.c` 维护用例表(每个用例文件导出 `int test_xxx(void)`,
+返回失败断言数,0 = 通过);用例是白盒的,可直接包含 `src/wmm_internal.h`。
+`make test` 编译并运行全部用例(链接 debug 库,ASan/UBSan 生效)。

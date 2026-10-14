@@ -25,7 +25,6 @@
 #define WMM_INTERNAL_H_INCLUDED
 
 #include "wmm.h"
-#include "wmm_sc.h"     /* 生成的只读尺寸类表(见下方 wmm_bin_info) */
 
 #include <pthread.h>
 #include <errno.h>
@@ -76,9 +75,10 @@ typedef struct {
     uint32_t nregs;       /* 每个 slab 的对象总数 = slab_size / reg_size */
 } wmm_bin_info_t;
 
-extern const wmm_bin_info_t wmm_bin_info[WMM_NBINS];  /* [0..35],生成器导出 */
-extern const uint8_t wmm_lookup_tab[513];             /* (size+7)>>3 → 尺寸类编号,
-                                                         仅对 size ≤ 4096 有效 */
+/* 尺寸类表本体:生成头在此处包含(必须在上方 typedef 与 WMM_NBINS 之后)。
+ * 表是 static const——每个编译单元各得一份只读副本(约 1KB),换来
+ * 编译器在快路径里看得见表内容、可常量折叠,且无跨 TU 符号。 */
+#include "wmm_sc.h"
 
 /* ==================== 页表:地址 → 所属对象 的反向映射 ====================
  *
