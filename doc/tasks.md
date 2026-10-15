@@ -303,9 +303,11 @@ madvise(g_pte, 大小, MADV_NOHUGEPAGE)
 ```c
 /* 把 [addr, addr+pgs*PAGE) 初始化为 slab。addr 必须页对齐。 */
 void wmm_slab_init(wmm_slab_t *sl, void *addr, szind_t i);
-/* 步骤: 1) memset 头部字段(szind/nfree=pgs*PAGE/reg_size... 由 bin_info 算);
+/* 步骤: 1) 头部字段逐个显式赋值(szind/nfree=nregs/free_head=0/链指针清空;
+            不用 memset 后覆盖——全字段显式赋值,新增字段漏赋一眼可见);
          2) 建立空闲链: free_head=0; 对 r=0..nregs-2: *(uint32_t*)(addr+r*reg_size) = r+1;
             最后一个 region 首字 = UINT32_MAX(链尾哨兵);
+            于是弹出序 = 编号升序 = 地址升序;
          3) 登记页表: 该 slab 的每一页 → {tag=0, ptr=sl}(PTE1)。 */
 ```
 
@@ -321,9 +323,11 @@ void  wmm_slab_free(wmm_slab_t *sl, void *p);
 
 ### M3.3 bin 状态机
 ```c
-void *wmm_bin_alloc(wmm_bin_t *b, szind_t i);    /* AR1 */
-void  wmm_bin_dalloc(wmm_bin_t *b, wmm_slab_t *sl, void *p);
-void  wmm_bin_slab_install(wmm_bin_t *b, wmm_slab_t *sl);  /* 新 slab 上任 */
+void *wmm_bin_alloc(wmm_bin_t *b);   /* AR1;b 的下标即类号,不另传 */
+bool  wmm_bin_dalloc(wmm_bin_t *b, wmm_slab_t *sl, void *p);
+   /* 返回真 = 该 slab 已全空并从 bin 摘除,调用方须归还其物理页 */
+void  wmm_bin_slab_install(wmm_bin_t *b, wmm_slab_t *sl);
+   /* 新 slab 上任;前提 slabcur==NULL(bin_alloc 返回 NULL 的路径已保证) */
 ```
 **bin_alloc 流程**(对照指南 §8.2):
 ```
@@ -333,15 +337,24 @@ void  wmm_bin_slab_install(wmm_bin_t *b, wmm_slab_t *sl);  /* 新 slab 上任 */
 4. 都没有 → 返回 NULL(调用方去 M6 取新页再 install)
 5. b->live++(G2)
 ```
-**bin_dalloc 流程**(对照指南 §8.4):
+**bin_dalloc 流程**(对照指南 §8.4;判据按 slab 归属,不能只看 nfree——
+热 slab 满(nfree==0)时仍占热位,直到下次 bin_alloc 才挂 full,若按
+"nfree==1 即满→非满"判,会对不在 full 链上的 slab 做摘除、清掉整条满链):
 ```
-1. sl->nfree++ 并压链
-2. 若 nfree==nregs(全空): 从所在结构摘除(slabcur 置 NULL / 从 nonfull 摘),
-   返回"可归还"标志 → 调用方交给 M6
-3. 若原在 full 链: 摘除, 按地址插入 nonfull 配对堆(堆顶=最低地址;仿 jemalloc
-   edata_heap,~50 行;开发期可先用有序双链,行为等价、插入 O(n),M7 前升级)
-4. b->live--(G2)
+1. wmm_slab_free 压链;b->live--(G2)
+2. sl == slabcur:留在热位;若 nfree==nregs → slabcur=NULL、curslabs--,
+   返回真(全空归还)
+3. 否则 nfree==nregs(全空退休):nregs==1 从 full 摘(这类分配即满、
+   释放即空,人在 full 链),其余从 nonfull 摘;curslabs--;返回真
+4. 否则 nfree==1(由满转非满;nonfull 成员释放前 nfree≥1、释放后≥2,
+   到不了 1,判据无歧义):摘 full,按地址序插入 nonfull;
+   返回假
+5. 其余:已在 nonfull,原地变空,返回假
 ```
+**nonfull 数据结构**:M3 落地为地址升序双链(nonfull_root=最低地址,
+slab 的 ph_prev/ph_next 承链);每个 bin 的非满 slab 通常个位数,
+O(n) 插入无压力。若 M7 压测证明它成为瓶颈,升级为 jemalloc edata_heap
+式配对堆——slab 结构的 ph_child 字段已预留,不必改布局。
 
 - **特例 nregs==1 的类(4096/8192/12288)**:分配即满、释放即空,**永不进入 nonfull**
   (指南 §4.2 注,仿 `bin.c:202`);上面的通用状态机天然覆盖,不要为它们写 nonfull 插入分支;
@@ -388,7 +401,7 @@ void *wmm_alloc(size_t size) {
     if (size == 0) size = 1;                  /* API1: glibc 语义 */
     if (size <= 14336) {  /* 小对象 */
         i = wmm_size2index(size);
-        p = wmm_bin_alloc(&g_bins[i], i);     /* M3.3;NULL → M6 取新页后重试 */
+        p = wmm_bin_alloc(&g_bins[i]);        /* M3.3;NULL → M6 取新页后重试 */
         /* 取到页后: wmm_slab_init + wmm_bin_slab_install + 再 alloc(至多一次) */
     } else {
         p = wmm_large_alloc(size);            /* M6 */

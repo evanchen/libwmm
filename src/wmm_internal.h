@@ -94,21 +94,21 @@ typedef struct {
 typedef struct wmm_slab_s wmm_slab_t;   /* 前向声明:页表原型引用 */
 
 /* 8 字节页表项;低 1 位 tag 区分指向 slab 还是 extent:
- *   tag=0 → wmm_slab_t*(小对象;slab 的每一页都登记同一指针)
- *   tag=1 → wmm_extent_t*(大对象;同样全页登记)
- *   raw==0 → 该页从未分配过。free 到这种地址 = 双释放/野指针,
- *            这就是检测的挂点,无需额外数据结构。
+ *   raw==0        → 该页从未分配过。free 到这种地址 = 双释放/野指针,
+ *                   这就是检测的挂点,无需额外数据结构。
+ *   raw 最低位=0  → slab 指针(小对象;slab 的每一页登记同一指针),
+ *                   即 raw = (uintptr_t)slab 头
+ *   raw 最低位=1  → extent 指针(大对象;同样全页登记),
+ *                   即 raw = (uintptr_t)extent 结点 | 1
  * 为什么一项两用而不是两张表:free 路径一次读出即可分派,且省一半
- * 元数据。位域 tag 声明在前,gcc x86-64 小端下落最低有效位;
- * 判空与整体比较用 raw。
+ * 元数据。tag 为什么不用位域:位域的读出类型要走整数提升,63 位宽
+ * 的字段在部分编译器上被窄化、触发指针转换告警;显式掩码
+ * (raw & 1 判 tag、raw & ~1 取指针)无平台差异。最低位能腾出来,
+ * 是因为 slab 头与 extent 结点都来自 base 区、至少 8 字节对齐。
  * 页表本体在初始化时一次 mmap——元数据绝不能从分配器自己拿,
  * 那时它还没建好。 */
 typedef union wmm_pte_u {
-    struct {
-        uintptr_t tag : 1;    /* 0 = slab,1 = extent */
-        uintptr_t ptr : 63;   /* 指向 slab 头或 extent 结点(来自 base 区) */
-    } s;
-    uintptr_t raw;            /* 整体读写;0 = 未分配 */
+    uintptr_t raw;            /* 整体读写;0 = 未分配;最低位 = tag */
 } wmm_pte_t;
 
 extern wmm_pte_t *g_pte;      /* 大小 = VA 窗口页数。mmap 后严禁 memset:
@@ -150,11 +150,16 @@ struct wmm_slab_s {
     /* ---- 挂链(以下三组链都在所属 bin 的锁内维护) ---- */
     wmm_slab_t *full_prev, *full_next;        /* 满双向链:满 slab 仍需 O(1)
                                                  摘除(释放使它由满转非满) */
-    wmm_slab_t *ph_prev, *ph_next, *ph_child; /* 非满 slab 的地址序配对堆
-                                                 (jemalloc edata_heap 同款,
-                                                 堆顶 = 最低地址;开发期可
-                                                 先退化成 ph_prev/ph_next
-                                                 有序双链,行为等价) */
+    wmm_slab_t *ph_prev, *ph_next, *ph_child; /* 非满 slab 集合的挂链。当前
+                                                 实现:ph_prev/ph_next 维护
+                                                 地址升序双向链,bin 的
+                                                 nonfull_root 指向最低地址,
+                                                 分配永远从它取(地址聚集,
+                                                 cache 局部性好);ph_child
+                                                 恒 NULL,预留——若 O(n) 的
+                                                 地址序插入真成为瓶颈,升级
+                                                 为 jemalloc edata_heap 式
+                                                 配对堆时启用它,不必改布局 */
     void       *ext;        /* 承载本 slab 的物理块(extent)。全空归还时
                                由此找到 extent 做相邻合并 */
 };
@@ -174,10 +179,11 @@ typedef struct {
                                     里找;满了才换人 */
     wmm_slab_t     *full_head;   /* 满 slab 双向链头。只用于 O(1) 摘除,
                                     不做查找 */
-    wmm_slab_t     *nonfull_root;   /* 非满 slab 的地址序配对堆根;分配永远
-                                    取堆顶(最低地址)——同批对象地址
-                                    聚集,cache 局部性好,低地址的 slab
-                                    也更容易先腾空整块归还 */
+    wmm_slab_t     *nonfull_root;   /* 非满 slab 地址升序链的头 = 最低地址
+                                    (链体在 slab 的 ph_prev/ph_next;
+                                    分配永远取它——同批对象地址聚集,
+                                    cache 局部性好,低地址的 slab 也
+                                    更容易先腾空整块归还) */
     /* ---- 观测计数(全部在本锁内更新,因此任意时刻恒自洽) ---- */
     uint64_t live;               /* 本类存活对象数,含各线程缓存里的——
                                     对象进缓存对 arena 而言仍算存活。
@@ -191,6 +197,27 @@ typedef struct {
 } wmm_bin_t;
 
 extern wmm_bin_t g_bins[WMM_NBINS];   /* 全局单 arena,初始化时全零 */
+
+/* slab 与 bin 操作(wmm_core.c)。
+ * 锁契约:以下函数自身不加锁,调用方必须已持有所属 bin 的锁——
+ * 上锁成本由调用方(主路径、tcache 批量)统一摊销。 */
+void  wmm_slab_init(wmm_slab_t *sl, void *addr, szind_t i);
+/* 把 [addr, addr+slab_size) 初始化为类 i 的 slab:建全量空闲链、
+ * 登记每一页的页表项。addr 页对齐由物理层保证,sl 头由调用方从
+ * base 区取得。ext 字段留空,物理层交接 extent 时填。 */
+void *wmm_slab_alloc(wmm_slab_t *sl);          /* 弹空闲链取对象;nfree==0
+                                                 调用即违反内部契约,断言失败 */
+void  wmm_slab_free(wmm_slab_t *sl, void *p);  /* 压链归还;nfree++ */
+void  wmm_bin_slab_install(wmm_bin_t *b, wmm_slab_t *sl);
+/* 新 slab 上任为 slabcur。前提:当前 slabcur==NULL——bin_alloc 返回
+ * NULL 的路径已保证(旧热 slab 已挂 full);违反即断言失败 */
+void *wmm_bin_alloc(wmm_bin_t *b);
+/* bin 慢路径分配。b 的下标即类号,slab 自带 szind,无须再传类号。
+ * NULL = 没有可用 slab:调用方去物理层取页,init + install 后
+ * 重试,至多一次。 */
+bool  wmm_bin_dalloc(wmm_bin_t *b, wmm_slab_t *sl, void *p);
+/* 归还对象并驱动状态转移。返回真 = 该 slab 已全空并已从 bin 摘除,
+ * 调用方须归还其物理页;curslabs 已减,bin 不再引用它 */
 
 /* ==================== 线程缓存:无锁快路径 ====================
  *

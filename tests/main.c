@@ -9,6 +9,7 @@
 #include <stddef.h>
 
 int test_boot(void);   /* 由 tests/test_boot.c 提供 */
+int test_slab(void);   /* 由 tests/test_slab.c 提供 */
 
 typedef int (*wmm_test_fn)(void);
 
@@ -17,6 +18,7 @@ static const struct {
     wmm_test_fn  fn;
 } g_tests[] = {
     { "boot", test_boot },
+    { "slab", test_slab },
 };
 
 int main(void) {

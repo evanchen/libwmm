@@ -5,6 +5,7 @@
 | 文件 | 覆盖(tasks.md 模块) | SPEC |
 |---|---|---|
 | test_boot.c | M2 启动:窗口/页表零页/幂等/base 分配器 | G4 |
+| test_slab.c | M3 slab 空闲链/页表登记/bin 状态机 | SLAB1/2, AR1, PTE1 |
 | test_sc.c | M1 尺寸类/查表 | SC1/SC2/SC3 |
 | test_slab.c | M3 slab + freelist + bin | SLAB1/2, AR1 |
 | test_pte.c | M4 页表登记/反查 | PTE1/2 |
