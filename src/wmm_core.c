@@ -15,6 +15,7 @@
 #include "wmm_internal.h"
 
 #include <assert.h>
+#include <string.h>
 
 /* ==================== 页表辅助 ====================
  *
@@ -230,6 +231,7 @@ bool wmm_bin_dalloc(wmm_bin_t *b, wmm_slab_t *sl, void *p) {
 
     wmm_slab_free(sl, p);
     b->live--;
+    b->ndalloc++;   /* 累计释放次数:一切归还对象的路径都经此,单点计数 */
 
     /* ---- 分支一:热位。怎么释放都留在热位,唯一例外是全空退休。
        注意不能按 nfree 推断它挂在哪——热 slab 满了(nfree==0)也仍在
@@ -274,4 +276,143 @@ bool wmm_bin_dalloc(wmm_bin_t *b, wmm_slab_t *sl, void *p) {
  * magic/shift,除法变乘移,省 ~20 周期);普通除法只在慢路径,不急。 */
 uint32_t wmm_div_regind(const void *p, const void *base, uint32_t reg_size) {
     return (uint32_t)(((uintptr_t)p - (uintptr_t)base) / reg_size);
+}
+
+/* ==================== 主路径:wmm_alloc 家族 ====================
+ *
+ * M4:单线程、无 tcache 的版本。tcache 落地(M8)后,这里变成
+ * "缓存耗尽/刷出"才走的慢路径,快路径在 wmm_tcache.c;本段
+ * 结构不变:查类 → bin 锁 → bin_alloc,NULL 则物理层供 slab
+ * 后重试(至多一次)。
+ *
+ * 大小对象在此分野:小对象走 bin(共享 slab),大对象走物理层
+ * (整页 extent)。分界线 14336/16384 之间的缝隙(14337..16383)
+ * 也走大对象路径——请求超过任何类的规格时,近似到页比近似到
+ * 7 页 slab 更省(见 wmm_internal.h 的 WMM_SMALL_MAXCLASS 注释)。 */
+
+void *wmm_alloc(size_t size) {
+    if (size == 0)
+        size = 1;   /* glibc 语义:size==0 当 1 处理,返回可释放指针 */
+
+    if (size > WMM_SMALL_MAXCLASS) {
+        wmm_extent_t *ext = wmm_phys_alloc_extent(size);
+        return ext != NULL ? ext->addr : NULL;
+    }
+
+    szind_t     i = wmm_size2index(size);
+    wmm_bin_t *b = &g_bins[i];
+
+    /* 慢路径全程持 bin 锁,包括物理层取页(mmap 在锁内)。v1 用
+       简单换正确:两个线程同时发现无 slab,不会各自造一个(那需要
+       "放锁取页、装回时发现别人已装"的让路逻辑)。代价是造 slab
+       期间本类其他分配排队;造 slab 每类低频,tcache 落地后更稀。 */
+    pthread_mutex_lock(&b->lock);
+    void *p = wmm_bin_alloc(b);
+    if (p == NULL) {
+        wmm_slab_t *sl = wmm_phys_alloc_slab(i);
+        if (sl != NULL) {
+            wmm_bin_slab_install(b, sl);
+            p = wmm_bin_alloc(b);   /* 必成功:全空 slab 至少弹出一个 */
+        }
+    }
+    pthread_mutex_unlock(&b->lock);
+    return p;
+}
+
+void wmm_free(void *p) {
+    if (p == NULL)
+        return;
+
+    /* 先验界再查表:窗口外的指针不属本分配器。混用 libc 分配器在
+       契约上是 UB,但 UB 不等于活该崩溃——给出诊断信息再返回,
+       服务还能带病跑完这一单(M14 起这里改写 0xBE 事件)。 */
+    if ((uintptr_t)p < (uintptr_t)g_heap_base ||
+        (uintptr_t)p >= (uintptr_t)g_heap_end) {
+        wmm_dprintf("free: %p out of heap window (not from wmm?)\n", p);
+        return;
+    }
+
+    wmm_slab_t *sl;
+    void       *ext;
+
+    if (wmm_pte_is_slab(p, &sl)) {
+        wmm_bin_t *b = &g_bins[sl->szind];
+        pthread_mutex_lock(&b->lock);
+        bool retire = wmm_bin_dalloc(b, sl, p);
+        pthread_mutex_unlock(&b->lock);
+
+        /* 退休在 bin 锁外执行:物理层只拿自己的锁,不与 bin 锁
+           嵌套。M4 单线程无虞;多线程时代"bin 摘除 → munmap"之间
+           的窗口由 tcache 刷出路径的锁纪律闭合(M8 处理)。 */
+        if (retire)
+            wmm_phys_free_slab(sl);
+        return;
+    }
+
+    if (wmm_pte_is_extent(p, &ext)) {
+        wmm_phys_free_extent((wmm_extent_t *)ext);
+        return;
+    }
+
+    /* raw==0:从未分配(或整块已退休)的地址——双释放/野指针。
+       什么也不做地返回:M14 起这里写 0xBE 事件并可能按配置隔离,
+       现在 dprintf 至少把问题打在现场。注意顺序:反查先于任何
+       对 p 的解引用,被回收过的页是 PROT_NONE,碰了就是段错误。 */
+    wmm_dprintf("free: %p not allocated (double free or wild pointer?)\n", p);
+}
+
+void *wmm_calloc(size_t n, size_t size) {
+    /* 乘法溢出即失败:glibc 同款语义,回绕出来的大小毫无意义 */
+    if (size != 0 && n > SIZE_MAX / size)
+        return NULL;
+
+    size_t bytes = n * size;
+    void *p = wmm_alloc(bytes);
+    if (p == NULL)
+        return NULL;
+
+    /* 为什么无条件 memset:新 slab 的页来自内核零页天然是零,但从
+       空闲链弹出的复用对象带着上一任的全部内容,不 memset 就是
+       信息泄漏。jemalloc 有"fresh slab 免清"的优化,代价是逐 slab
+       追踪"是否全新"的状态;小而精先要 correctness。 */
+    memset(p, 0, bytes);
+    return p;
+}
+
+void *wmm_realloc(void *p, size_t size) {
+    if (p == NULL)
+        return wmm_alloc(size);
+    if (size == 0) {
+        wmm_free(p);
+        return NULL;
+    }
+
+    size_t usable = wmm_usable_size(p);
+    if (size <= usable)
+        return p;   /* 原地:小对象本无尾巴可割;大对象不割页尾
+                       (jemalloc 的 extent split 属 M6,单独做收益小) */
+
+    void *q = wmm_alloc(size);
+    if (q == NULL)
+        return NULL;   /* 旧块保持有效:realloc 失败不丢数据 */
+
+    memcpy(q, p, usable < size ? usable : size);   /* 契约:min(旧可用, 新) */
+    wmm_free(p);
+    return q;
+}
+
+size_t wmm_usable_size(const void *p) {
+    if (p == NULL)
+        return 0;
+    if ((uintptr_t)p < (uintptr_t)g_heap_base ||
+        (uintptr_t)p >= (uintptr_t)g_heap_end)
+        return 0;   /* 不属本分配器:契约外输入,给 0 不给崩溃 */
+
+    wmm_slab_t *sl;
+    void       *ext;
+    if (wmm_pte_is_slab(p, &sl))
+        return wmm_bin_info[sl->szind].reg_size;
+    if (wmm_pte_is_extent(p, &ext))
+        return ((wmm_extent_t *)ext)->npages * WMM_PAGE;
+    return 0;
 }

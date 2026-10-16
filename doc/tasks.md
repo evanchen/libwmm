@@ -370,6 +370,11 @@ O(n) 插入无压力。若 M7 压测证明它成为瓶颈,升级为 jemalloc eda
 ## 6. M4 页表登记/反查 + 主路径 `src/wmm_core.c`(第二部分)
 
 **职责**:把 M3 的"slab 世界"接到 `wmm_alloc/wmm_free` 上(单线程、无 tcache,先跑通)。
+**附最小物理层** `src/wmm_phys.c`:主路径没有页源无法运行,而每个里程碑
+必须编译可测,故 M4 随身落地取页/还页的最小集(窗口 bump + 即时交还内核,
+含 extent 结点回收链);M6 在同一接口下升级为地址序链 + 相邻合并 + 阈值回收,
+主路径无感。并发补件:`wmm_base_alloc` 加锁(叶子锁,锁序 bins→ext→threads→base,
+fork prepare 同步跟进)。
 
 ### M4.1 页表辅助
 ```c
@@ -380,17 +385,24 @@ bool      wmm_pte_is_extent(const void *p, void **out_ext);
 ```
 **free 反查流程(PTE2)**:
 ```
-pte = g_pte[p>>12]
+pte = g_pte[p>>12]                /* 先验窗口界,再查表 */
 if raw==0        → 未分配地址,记事件(双释放/野指针,M14),返回
-if tag==1        → 大对象:交给 M6 wmm_extent_free
-else             → slab: wmm_slab_free(sl, p) → 视 nfree 决定是否 bin 归还(M3.3)
+if tag==1        → 大对象:交给 wmm_phys_free_extent
+else             → slab: bin 锁内 wmm_bin_dalloc(返回真 = 全空退休,
+                   锁外 wmm_phys_free_slab 还页)
 ```
 
 ### M4.2 size2index(主路径第一行)
 ```c
-static inline uint32_t wmm_size2index(size_t size) {
+static inline szind_t wmm_size2index(size_t size) {
     if (size <= 4096)  return wmm_lookup_tab[(size + 7) >> 3];
-    if (size <= 14336) return wmm_sc_lookup_large_small(size);   /* 36 项二分 */
+    if (size <= 14336) {  /* 4096 以上只有 8 个类:从类 29 起线性扫。
+                             最坏 8 次比较,比二分的区间收缩开销低;
+                             且以表为唯一权威——公式推导的常数在改
+                             生成参数时会静默错位,扫表永远跟表走 */
+        for (szind_t i = 29; i < WMM_NBINS; i++)
+            if (size <= wmm_bin_info[i].reg_size) return i;
+    }
     return WMM_INDEX_LARGE;
 }
 ```
@@ -399,27 +411,47 @@ static inline uint32_t wmm_size2index(size_t size) {
 ```c
 void *wmm_alloc(size_t size) {
     if (size == 0) size = 1;                  /* API1: glibc 语义 */
-    if (size <= 14336) {  /* 小对象 */
-        i = wmm_size2index(size);
-        p = wmm_bin_alloc(&g_bins[i]);        /* M3.3;NULL → M6 取新页后重试 */
-        /* 取到页后: wmm_slab_init + wmm_bin_slab_install + 再 alloc(至多一次) */
-    } else {
-        p = wmm_large_alloc(size);            /* M6 */
+    if (size > 14336) {                       /* 大对象:物理层整页 */
+        ext = wmm_phys_alloc_extent(size);
+        return ext ? ext->addr : NULL;
     }
+    i = wmm_size2index(size);  b = &g_bins[i];
+    /* 慢路径全程持 bin 锁(含物理层取页):v1 用简单换正确——两个
+       线程同时发现无 slab,不会各自造一个;造 slab 每类低频,可接受 */
+    lock(b->lock);
+    p = wmm_bin_alloc(b);                     /* M3.3 */
+    if (p == NULL) {
+        sl = wmm_phys_alloc_slab(i);          /* M4 最小物理层 */
+        if (sl) { wmm_bin_slab_install(b, sl); p = wmm_bin_alloc(b); }
+    }
+    unlock(b->lock);
     return p;
 }
-void  wmm_free(void *p)  { if (!p) return; wmm_pte 反查 → 小/大分派 }
+void  wmm_free(void *p)  { if (!p) return; 验界 → pte 反查 → 小/大分派 }
 void *wmm_realloc(void *p, size_t n) {
     if (!p) return wmm_alloc(n);
+    if (n == 0) { wmm_free(p); return NULL; }
     usize = wmm_usable_size(p);
     if (n <= usize) return p;                 /* 原地收缩,直接返回 */
-    q = wmm_alloc(n); memcpy(q, p, usize); wmm_free(p); return q;
+    q = wmm_alloc(n); if (!q) return NULL;    /* 失败不丢旧块 */
+    memcpy(q, p, min(usize, n)); wmm_free(p); return q;
 }
-size_t wmm_usable_size(const void *p) { pte 反查 → slab: bin_info[szind].reg_size; extent: npages*PAGE }
+void *wmm_calloc(size_t n, size_t size) {
+    if (size != 0 && n > SIZE_MAX / size) return NULL;   /* 溢出即失败 */
+    p = wmm_alloc(n * size); if (!p) return NULL;
+    memset(p, 0, n * size);
+    /* 无条件 memset:复用对象带上一任内容,不清零 = 信息泄漏 */
+}
+size_t wmm_usable_size(const void *p) {
+    if (!p) return 0;
+    验界 → pte 反查 → slab: bin_info[szind].reg_size; extent: npages*PAGE
+}
 ```
 
 ### M4.4 调试
-- `wmm_dprintf` 用于 boot/首错时打印;`MM_DEBUG` 宏包裹。
+- `wmm_dprintf` 用于 boot/首错(OOM、野指针/双释放诊断)时打印;
+  开关走运行期 `g_opt.verbose`(`wmm_ctl("config.verbose")` 可切)——
+  不设编译期宏,免重编,语义相同。
 
 ### 自测清单(M4)
 - [ ] API1 全过(§2 错误契约 4 条):size0、NULL、realloc 特例、usable_size≥请求;

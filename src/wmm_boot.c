@@ -73,6 +73,10 @@ wmm_opt_t g_opt = {
 
 static bool g_boot_done = false;   /* 幂等标志;契约保证只有单线程碰它 */
 
+/* base 区自身的锁(见文件尾 wmm_base_alloc)。叶子锁:持它期间
+ * 绝不拿其他锁;全库锁序里它排在最后(见 fork 三钩子注释)。 */
+static pthread_mutex_t g_base_lock = PTHREAD_MUTEX_INITIALIZER;
+
 /* 预留 VA 窗口:整段 PROT_NONE + MAP_NORESERVE,只占地址空间。
    返回窗口基址;全失败返回 NULL(此时 *size_out 小于下限,仅供日志)。
    为什么要重试:strict overcommit(vm.overcommit_memory=2)会把
@@ -150,9 +154,10 @@ void wmm_boot(void) {
  * fork 只把调用线程复制进子进程:此刻若别的线程持着某把锁,子进程里
  * 这把锁永远等不到释放。三步应对:
  *   prepare:fork 前置,按固定锁序(各 bin 锁 → g_ext_lock →
- *            g_threads_lock)拿住全部锁,即 freeze the world——
- *            fork 快照必须处在"没有分配器操作正在进行"的状态,
- *            因此 prepare 会一直阻塞到别的线程做完并放锁;
+ *            g_threads_lock → g_base_lock)拿住全部锁,即 freeze
+ *            the world——fork 快照必须处在"没有分配器操作正在
+ *            进行"的状态,因此 prepare 会一直阻塞到别的线程做完
+ *            并放锁;
  *   parent: 原序反向解锁,原样继续;
  *   child:  不解锁而是把所有锁重新 init——解锁动作依赖锁的内部状态,
  *            对"别人手里的锁"未必可行,重建才是唯一可移植的做法。
@@ -163,16 +168,20 @@ void wmm_boot(void) {
  * 其他线程的节点已成死节点,线程缓存落地后需在这里裁剪。
  *
  * 锁序约定:凡将来同时需要多把全局锁的新代码,必须沿用 prepare 的
- * 顺序,否则会与 fork 冻结互锁形成死锁。
+ * 顺序,否则会与 fork 冻结互锁形成死锁。base 锁必须排最后:持 bin
+ * 锁的路径(造 slab 切头部)会要 base 锁,若 prepare 先拿 base,
+ * 就与"持 bin 等 base"的线程互等。
  */
 void wmm_atfork_prepare(void) {
     for (size_t i = 0; i < WMM_NBINS; i++)
         (void)pthread_mutex_lock(&g_bins[i].lock);
     (void)pthread_mutex_lock(&g_ext_lock);
     (void)pthread_mutex_lock(&g_threads_lock);
+    (void)pthread_mutex_lock(&g_base_lock);
 }
 
 void wmm_atfork_parent(void) {
+    (void)pthread_mutex_unlock(&g_base_lock);
     (void)pthread_mutex_unlock(&g_threads_lock);
     (void)pthread_mutex_unlock(&g_ext_lock);
     for (size_t i = WMM_NBINS; i > 0; i--)
@@ -184,6 +193,7 @@ void wmm_atfork_child(void) {
         (void)pthread_mutex_init(&g_bins[i].lock, NULL);
     (void)pthread_mutex_init(&g_ext_lock, NULL);
     (void)pthread_mutex_init(&g_threads_lock, NULL);
+    (void)pthread_mutex_init(&g_base_lock, NULL);
 }
 
 /* ==================== wmm_dprintf:受限 printf,裸 write(2) 输出 ====================
@@ -314,11 +324,18 @@ struct wmm_base_block_s {
 
 static wmm_base_block_t *g_base_cur;   /* 正在切割的块;NULL = 还没建过 */
 
+/* 为什么要有锁:bin 锁只各管各的 bin,两个线程在不同 bin 里同时造
+ * slab 都会来 base 切头部,bump 指针无锁推进 = 两次分配拿到同一块。
+ * 叶子锁纪律:持锁期间绝不调用任何可能拿锁的代码(mmap/wmm_dprintf
+ * 都无锁),因此它可以安全嵌在任何持锁路径里(bin → base)。
+ * 静态 PTHREAD_MUTEX_INITIALIZER 是 POSIX 明确规定的常量初始化,
+ * 与"全零字节不是合法互斥量"的可移植性顾虑是两回事。 */
 void *wmm_base_alloc(size_t size) {
     size = (size + 7u) & ~(size_t)7;   /* 8 字节对齐(块头里只有 ≤8 字节成员) */
     if (size == 0)
         size = 8;                      /* 调用方不该要 0;给最小块而非 NULL */
 
+    pthread_mutex_lock(&g_base_lock);
     wmm_base_block_t *b = g_base_cur;
     if (b == NULL || size > b->cap - b->used) {
         /* 追加新块:容量取 max(默认 4MB, 本次需求)——单个大请求不会被
@@ -331,6 +348,7 @@ void *wmm_base_alloc(size_t size) {
         void *m = mmap(NULL, cap, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (m == MAP_FAILED) {
+            pthread_mutex_unlock(&g_base_lock);
             wmm_dprintf("fatal: metadata block mmap (%zu KB) failed, errno %d\n",
                         cap >> 10, errno);
             return NULL;   /* 元数据耗尽 = 分配器不可用,调用方按致命处理 */
@@ -344,5 +362,6 @@ void *wmm_base_alloc(size_t size) {
 
     char *p = (char *)b + WMM_BASE_HDR + b->used;
     b->used += size;
+    pthread_mutex_unlock(&g_base_lock);
     return p;
 }

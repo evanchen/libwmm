@@ -80,6 +80,23 @@ typedef struct {
  * 编译器在快路径里看得见表内容、可常量折叠,且无跨 TU 符号。 */
 #include "wmm_sc.h"
 
+/* size → 尺寸类编号(主路径第一行)。三段:
+ *   ≤4096  一步查表(绝大多数请求走这里);
+ *   ≤14336 只有 8 个类,从类 29 起线性扫:最坏 8 次比较,比二分的
+ *          区间收缩开销更低;更重要的是以表为唯一权威——若用公式
+ *          推导常数,改生成参数时会静默错位,扫表永远跟着表走;
+ *   再往上 = 大对象。查表上限以上、类 28(4096)必不能覆盖,故扫
+ *   从 29 起步。 */
+static inline szind_t wmm_size2index(size_t size) {
+    if (size <= WMM_LOOKUP_MAX)
+        return wmm_lookup_tab[(size + 7) >> 3];
+    if (size <= WMM_SMALL_MAXCLASS)
+        for (szind_t i = 29; i < WMM_NBINS; i++)
+            if (size <= wmm_bin_info[i].reg_size)
+                return i;
+    return WMM_INDEX_LARGE;
+}
+
 /* ==================== 页表:地址 → 所属对象 的反向映射 ====================
  *
  * free(p) 只拿到裸指针,必须回答"p 属于哪个 slab / 哪个大块"。
@@ -218,6 +235,38 @@ void *wmm_bin_alloc(wmm_bin_t *b);
 bool  wmm_bin_dalloc(wmm_bin_t *b, wmm_slab_t *sl, void *p);
 /* 归还对象并驱动状态转移。返回真 = 该 slab 已全空并已从 bin 摘除,
  * 调用方须归还其物理页;curslabs 已减,bin 不再引用它 */
+
+/* ==================== extent 与物理层(最小集,M6 升级) ====================
+ *
+ * extent = 一段连续页的记账单位(对应 jemalloc 的 extent 元数据)。
+ * 大对象整块就是一个 extent;小对象 slab 背后的页在 M6 也将挂上
+ * extent,以支持相邻空闲区间合并。当前最小集:取页走窗口 bump、
+ * 还页即时交还内核,不做合并与地址复用。
+ * 结点内存来自 base 区(base 只进不出);大对象生灭频繁,结点本体
+ * 经回收链复用——这与"base 区不回收"不矛盾:复用的是结点这个壳,
+ * 不是 base 的块。slab 头不参与复用:量级小得多(见 wmm_phys.c)。
+ */
+typedef struct wmm_extent_s wmm_extent_t;
+struct wmm_extent_s {
+    void         *addr;     /* 区间基址,页对齐 */
+    size_t        npages;   /* 区间页数 */
+    wmm_extent_t *next;     /* 结点回收链;M6 复用作地址序链 */
+};
+
+/* 物理层接口(wmm_phys.c)。
+ * 锁:g_ext_lock 保护窗口 bump 指针、结点回收链与 g_large 统计;
+ * 锁序 bin 锁 → g_ext_lock(与 fork prepare 一致)。 */
+wmm_slab_t   *wmm_phys_alloc_slab(szind_t i);
+/* 取 pgs 页 + slab 头(base 区)并完成 slab 初始化(含页表登记);
+ * 可在持有 bin 锁时调用。NULL = 窗口耗尽或元数据耗尽(OOM)。 */
+void          wmm_phys_free_slab(wmm_slab_t *sl);
+/* 整块 slab 退休:页交还内核、页表清零。必须在 bin 锁释放后调用
+ * (bin 已不引用它;物理层只拿自己的锁)。 */
+wmm_extent_t *wmm_phys_alloc_extent(size_t size);
+/* 大对象分配:页数向上取整,全页登记 tag=1。返回 extent(调用方用
+ * ext->addr 当对象地址);NULL = OOM。超窗口量级的请求在此挡下。 */
+void          wmm_phys_free_extent(wmm_extent_t *ext);
+/* 大对象释放:还页、清页表、更新 g_large 计数、结点入回收链。 */
 
 /* ==================== 线程缓存:无锁快路径 ====================
  *
