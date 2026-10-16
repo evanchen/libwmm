@@ -90,7 +90,12 @@ static void check_usable_exact(void) {
         if (p == NULL)
             continue;
         CHECK(wmm_usable_size(p) == t[k].want);
-        CHECK(((uintptr_t)p & 15u) == 0);
+        /* 对齐契约:16B;唯一例外是 8B 最小类(请求 ≤ 8,只保证 8B,
+           wmm.h 明文允许)——奇数号对象天然只有 8B 对齐 */
+        if (t[k].req > 8)
+            CHECK(((uintptr_t)p & 15u) == 0);
+        else
+            CHECK(((uintptr_t)p & 7u) == 0);
         p[t[k].req - 1] = 0x5A;   /* 请求的最后一个字节必须可写 */
         p[0] = 0xA5;
         wmm_free(p);
@@ -187,8 +192,10 @@ static void check_random_storm(void) {
                 sz = 1 + (rng() % 8192);
             void *p = wmm_alloc(sz);
             CHECK(p != NULL);          /* 64GB 窗口下风暴不可能 OOM */
-            CHECK(wmm_usable_size(p) >= sz);
-            CHECK(((uintptr_t)p & 15u) == 0);
+            size_t usable = wmm_usable_size(p);
+            CHECK(usable >= sz);
+            /* 同上:8B 类只保证 8B 对齐,其余一律 16B */
+            CHECK(((uintptr_t)p & 15u) == 0 || usable == 8);
             slot[s] = p;
             if (n_witness < WITNESS)
                 witness[n_witness++] = p;
