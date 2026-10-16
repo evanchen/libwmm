@@ -462,20 +462,40 @@ size_t wmm_usable_size(const void *p) {
 
 ## 7. M5 对齐分配 `src/wmm_core.c`(第三部分)
 
-**职责**:`wmm_posix_memalign / wmm_aligned_alloc`。**分三档,逐档实现**(指南 §4.4 的"免费对齐"思想):
+**职责**:`wmm_posix_memalign / wmm_aligned_alloc`。**分三档**(指南 §4.4 的
+"免费对齐"思想:能白拿的对齐绝不付过分配的代价):
 
 | 档 | 条件 | 做法 |
 |---|---|---|
-| 1 | `alignment ≤ 16` | 直接 `wmm_alloc(size)`(所有类 16 对齐,G1) |
-| 2 | `16 < alignment ≤ 4096` 且 `size ≤ 14336` | `rounded = (size + align-1) & ~(align-1)`;`wmm_alloc(rounded)`(指南 §4.4 的取整技巧,类对齐 ≥ align) |
-| 3 | `alignment > 4096` 或 `size > 14336` | 大对象过分配:`wmm_large_alloc(size + alignment)`,把返回基址向上对齐到 `alignment`;free 走页表反查 M6(M6 完成后本档才可用) |
+| 1 | `alignment ≤ 8` | 直接 `wmm_alloc(size)`(类 0 的对象 8B 对齐、类 1 起全部 16B 对齐,≤8 的 2 的幂白拿) |
+| 2 | `8 < alignment ≤ 4096` | `rounded = (size+align-1) & ~(align-1)`;`wmm_alloc(rounded)`(取整技巧;size 无上限——溢进大对象路径也是白拿:页对齐 ⊇ 任何 ≤4096 的 2 的幂,且 alignment 整除页大小,先取整再取页数与不取整相同,零浪费) |
+| 3 | `alignment > 4096` | 大对象过分配:`wmm_phys_alloc_extent(size+alignment)`,返回地址向上对齐;free/usable_size 走页表反查 extent(M4 最小物理层即可用,不必等 M6) |
 
-- **档 2 正确性依据**(写注释):所有 bin 类的 reg_size 是 16 的倍数,且 `rounded` 是 alignment 的倍数时,其上界类必为 alignment 的倍数(类边界在 16 整数倍上);
-- **边界**:`alignment` 非 2 的幂 → 返回 `EINVAL`;`size` 溢出 → `ENOMEM`;`posix_memalign` 失败返回错误码且 `*memptr=NULL`。
+**勘误(原表档 1)**:原条件 `alignment ≤ 16` 直接 `wmm_alloc(size)` 有洞——
+`alignment=16, size≤8` 落进 8B 类,奇数号对象只有 8B 对齐,违反契约。
+档 1 边界改为 8,16 这档走档 2 取整到 16B 类。
+
+- **档 2 依据(小对象路径)**:类规格形如 2^p×m(m 为奇数,最大 7),故
+  不是 alignment(=2^k)倍数的类最大为 7×2^(k−1)=3.5×2^k;而 2^k、2·2^k、
+  3·2^k 三者本身都是类。于是 alignment 的倍数 x 的最小上界类:x ≤ 3.5×2^k
+  时必是上述三者之一(上界即自身);更大时一切非倍数类都 < x,上界类必为
+  倍数。slab 基址页对齐,对象地址 = 基址 + 编号×规格 → 对齐成立;
+- **usable_size 配套修正**:对齐档 3 的 p 不在 extent 基址上,可用大小 =
+  映射末尾 − p(扣头部零头)。不扣则虚报,realloc 原地扩容分支会让应用
+  写穿映射末端;
+- **边界**:`alignment` 非 2 的幂(posix 另要求 ≥ sizeof(void*))→ EINVAL;
+  档 3 的 size+alignment 回绕与 alignment 超窗口 → ENOMEM;
+  `posix_memalign` 失败返回错误码且 `*memptr=NULL`(aligned_alloc 走
+  errno 语义;alignment==0 要单列——`0 & (0-1) == 0` 骗过幂检查)。
 
 ### 自测清单(M5)
-- [ ] 随机 `alignment∈{1,2,4,8,16,32,64,128,256,512,1024,4096} × size 随机`:返回值对齐;释放正确;
-- [ ] 非法 alignment、溢出用例返回码正确。
+- [ ] 档 2 依据穷举断言:16..4096 全部 2 的幂 × 全部倍数,最小上界类
+      规格 % alignment == 0(类表改坏立刻暴露);
+- [ ] 全档位 × 尺寸段(含 >4096 档)两 API 一致:对齐成立、usable ≥ 请求、
+      首尾字节可写、释放正确;档 3 白盒 usable 精确等于映射末尾 − p;
+- [ ] 错误码:非 2 的幂 / <sizeof(void*) / ==0 → EINVAL(两种 API 各自
+      语义),回绕与超窗口 → ENOMEM;档 1 边界(alignment=16 且 size≤8)
+      不落 8B 类。
 
 ---
 

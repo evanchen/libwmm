@@ -412,7 +412,96 @@ size_t wmm_usable_size(const void *p) {
     void       *ext;
     if (wmm_pte_is_slab(p, &sl))
         return wmm_bin_info[sl->szind].reg_size;
-    if (wmm_pte_is_extent(p, &ext))
-        return ((wmm_extent_t *)ext)->npages * WMM_PAGE;
+    if (wmm_pte_is_extent(p, &ext)) {
+        wmm_extent_t *e = (wmm_extent_t *)ext;
+        /* 减去头部零头:对齐分配的 p 不在 extent 基址上,可用大小 =
+           映射末尾 − p(普通大对象 p 即基址,零头为 0,同一公式)。
+           不减会把头部零头虚报进去,realloc 的原地扩容分支就会
+           让应用写穿映射末端。 */
+        return (size_t)((char *)e->addr + e->npages * WMM_PAGE - (char *)p);
+    }
     return 0;
+}
+
+/* ==================== 对齐分配 ====================
+ *
+ * 三档(指南的"免费对齐"思想:能白拿的对齐绝不付过分配的代价):
+ *   档 1 alignment ≤ 8:白拿。类 0 的对象 8B 对齐、类 1 起全部
+ *       16B 对齐,任何 ≤ 8 的 2 的幂天然满足。
+ *       边界为什么是 8 不是 16:alignment=16、size≤8 时若直接
+ *       wmm_alloc(size) 会落进 8B 类,奇数号对象只有 8B 对齐,
+ *       违反契约——16 这档必须走档 2 取整到 16B 类;
+ *   档 2 8 < alignment ≤ 4096(页大小):取整白拿。size 向上取整到
+ *       alignment 的倍数再走普通分配:
+ *       小对象路径的依据:类规格形如 2^p×m(m 为奇数,最大 7),
+ *       故不是 alignment(=2^k)倍数的类最大为 7×2^(k−1)=3.5×2^k;
+ *       而 2^k、2·2^k、3·2^k 三者本身都是类(组内成员恰有此形状,
+ *       16..8192 的全体 2 的幂亦在表)。于是 alignment 的倍数 x 的
+ *       最小上界类:x ≤ 3.5×2^k 时 x 只能是上述三者之一,上界即
+ *       自身;x 更大时一切非倍数类都 ≤ 3.5×2^k < x,上界类必为
+ *       alignment 的倍数。slab 基址页对齐(4096 是任何 ≤4096 的
+ *       2 的幂的倍数),对象地址 = 基址 + 编号×规格 → 对齐成立;
+ *       大对象路径(size 取整后 > 14336):返回页对齐地址,页对齐
+ *       ⊇ 任何 ≤4096 的 2 的幂对齐。且 alignment 整除页大小,先取
+ *       整到 alignment 再取整到页,页数与不取整时相同——零浪费;
+ *   档 3 alignment > 4096:唯一真付代价的档——过分配
+ *       size+alignment 字节,返回地址向上对齐。头部零头(基址到
+ *       对齐点)与页尾零头一并浪费,上限约 2×alignment;free 与
+ *       usable_size 走页表反查 extent(usable 已扣头部零头,见上),
+ *       与普通大对象同一条路,无须特殊记账。
+ */
+
+/* 对齐分配核心。调用方负责校验 alignment 是 2 的幂(两个公开 API
+   的校验条款不同:posix_memalign 额外要求 ≥ sizeof(void*))。 */
+static void *alloc_aligned(size_t alignment, size_t size) {
+    if (alignment <= 8)
+        return wmm_alloc(size);            /* 档 1:8B 对齐是全库下限 */
+
+    if (alignment <= WMM_PAGE) {           /* 档 2:取整白拿 */
+        size_t rounded = (size + alignment - 1) & ~(alignment - 1);
+        return wmm_alloc(rounded);
+    }
+
+    /* 档 3:过分配 + 基址对齐。加法先挡回绕——size 接近 SIZE_MAX 时
+       size+alignment 绕回小值会骗过页数取整;alignment 超过整个
+       VA 窗口的也没得谈。两者都按 OOM 上抛。 */
+    if (size > SIZE_MAX - alignment || alignment > WMM_HEAP_VA_SIZE)
+        return NULL;
+
+    wmm_extent_t *ext = wmm_phys_alloc_extent(size + alignment);
+    if (ext == NULL)
+        return NULL;
+
+    uintptr_t base = (uintptr_t)ext->addr;
+    return (void *)((base + alignment - 1) & ~(uintptr_t)(alignment - 1));
+}
+
+int wmm_posix_memalign(void **out, size_t alignment, size_t size) {
+    if (out == NULL)
+        return EINVAL;   /* 输出参数本身为空:调用方错误,无值可写 */
+    *out = NULL;         /* 失败路径统一置空:调用方无须先初始化 */
+
+    if (alignment < sizeof(void *) || (alignment & (alignment - 1)) != 0)
+        return EINVAL;
+
+    void *p = alloc_aligned(alignment, size);
+    if (p == NULL)
+        return ENOMEM;
+    *out = p;
+    return 0;
+}
+
+void *wmm_aligned_alloc(size_t alignment, size_t size) {
+    /* alignment==0 要单列:0 & (0−1) == 0,幂检查对它失效 */
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    void *p = alloc_aligned(alignment, size);
+    if (p == NULL) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    return p;
 }

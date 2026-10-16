@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <errno.h>
 
 static int g_fail;
 
@@ -172,6 +173,83 @@ static void check_defensive_free(void) {
     wmm_free(g_heap_cur);   /* bump 当前位置:在窗口内、从未映射 */
 }
 
+/* ---- M5:对齐分配(三档 + 错误码 + 档 2 不变量穷举) ---- */
+static void check_aligned(void) {
+    /* posix_memalign 契约错误码:非 2 的幂、小于 sizeof(void*)、
+       输出参数为空;失败时 *out 必须是 NULL */
+    void *m = (void *)0x1;
+    CHECK(wmm_posix_memalign(&m, 0, 100) == EINVAL && m == NULL);
+    CHECK(wmm_posix_memalign(&m, 3, 100) == EINVAL && m == NULL);
+    CHECK(wmm_posix_memalign(&m, 4, 100) == EINVAL && m == NULL);
+    CHECK(wmm_posix_memalign(&m, 24, 100) == EINVAL && m == NULL);
+    CHECK(wmm_posix_memalign(NULL, 16, 100) == EINVAL);
+
+    /* aligned_alloc 契约错误码:非 2 的幂(含 0——它骗过幂检查,
+       0 & (0-1) == 0),errno 语义 */
+    errno = 0;
+    CHECK(wmm_aligned_alloc(0, 100) == NULL && errno == EINVAL);
+    errno = 0;
+    CHECK(wmm_aligned_alloc(12, 100) == NULL && errno == EINVAL);
+    errno = 0;
+    CHECK(wmm_aligned_alloc(24, 100) == NULL && errno == EINVAL);
+
+    /* 档 3 的回绕挡板:size 接近 SIZE_MAX 时 size+alignment 会绕回
+       小值;挡不住就按小分配成功,挡住了应报 ENOMEM */
+    CHECK(wmm_posix_memalign(&m, (size_t)1 << 62, SIZE_MAX - 100) == ENOMEM);
+
+    /* 档 2 依据的穷举证明:16..4096 全部 2 的幂 alignment 的全部
+       倍数,最小上界类的规格必是 alignment 的倍数。类表一旦改坏
+       (或有人动了取整逻辑),这里立刻炸——比抽测可靠。 */
+    for (size_t a = 16; a <= WMM_PAGE; a <<= 1)
+        for (size_t x = a; x <= WMM_SMALL_MAXCLASS; x += a)
+            CHECK(wmm_bin_info[wmm_size2index(x)].reg_size % a == 0);
+
+    /* 全档位 × 尺寸段:对齐成立、可用量够、首尾字节可写、释放干净;
+       posix_memalign 同参数再走一遍,两个 API 行为必须一致 */
+    static const size_t aligns[] = { 1, 2, 4, 8, 16, 32, 64, 128, 256,
+                                     512, 1024, 2048, 4096, 8192,
+                                     65536, (size_t)1 << 20 };
+    static const size_t sizes[]  = { 1, 5, 8, 9, 17, 100, 4095, 4096,
+                                     4097, 14336, 14337, 65536, 300000 };
+
+    for (size_t ia = 0; ia < sizeof(aligns) / sizeof(aligns[0]); ia++) {
+        size_t a = aligns[ia];
+        for (size_t is = 0; is < sizeof(sizes) / sizeof(sizes[0]); is++) {
+            size_t s = sizes[is];
+
+            unsigned char *p = wmm_aligned_alloc(a, s);
+            CHECK(p != NULL);
+            CHECK(((uintptr_t)p & (a - 1)) == 0);
+            size_t usable = wmm_usable_size(p);
+            CHECK(usable >= s);
+            p[0] = 0x5A;
+            p[s - 1] = 0xA5;   /* 请求的首尾字节必须可写 */
+
+            /* 档 3 白盒:usable 必须精确等于"映射末尾 − p"(头部
+               零头已扣)。虚报头部的话 realloc 原地扩容会写穿末端 */
+            if (a > WMM_PAGE) {
+                void *ext;
+                CHECK(wmm_pte_is_extent(p, &ext));
+                wmm_extent_t *e = (wmm_extent_t *)ext;
+                CHECK((char *)p + usable ==
+                      (char *)e->addr + e->npages * WMM_PAGE);
+            }
+            wmm_free(p);
+
+            /* posix_memalign:< 8 的对齐按契约拒绝,其余与
+               aligned_alloc 同参数等价 */
+            if (a < 8) {
+                CHECK(wmm_posix_memalign(&m, a, s) == EINVAL && m == NULL);
+            } else {
+                CHECK(wmm_posix_memalign(&m, a, s) == 0);
+                CHECK(m != NULL && ((uintptr_t)m & (a - 1)) == 0);
+                CHECK(wmm_usable_size(m) >= s);
+                wmm_free(m);
+            }
+        }
+    }
+}
+
 /* ---- PTE2/G2:万次随机风暴 + 全量归还的零点核对 ---- */
 static void check_random_storm(void) {
     enum { SLOTS = 4096, WITNESS = 16 };
@@ -233,6 +311,7 @@ int test_api(void) {
     check_usable_exact();
     check_calloc();
     check_realloc();
+    check_aligned();
     check_defensive_free();
     check_random_storm();
 
