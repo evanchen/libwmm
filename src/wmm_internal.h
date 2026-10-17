@@ -236,37 +236,70 @@ bool  wmm_bin_dalloc(wmm_bin_t *b, wmm_slab_t *sl, void *p);
 /* 归还对象并驱动状态转移。返回真 = 该 slab 已全空并已从 bin 摘除,
  * 调用方须归还其物理页;curslabs 已减,bin 不再引用它 */
 
-/* ==================== extent 与物理层(最小集,M6 升级) ====================
+/* ==================== extent 与物理层 ====================
  *
  * extent = 一段连续页的记账单位(对应 jemalloc 的 extent 元数据)。
- * 大对象整块就是一个 extent;小对象 slab 背后的页在 M6 也将挂上
- * extent,以支持相邻空闲区间合并。当前最小集:取页走窗口 bump、
- * 还页即时交还内核,不做合并与地址复用。
- * 结点内存来自 base 区(base 只进不出);大对象生灭频繁,结点本体
- * 经回收链复用——这与"base 区不回收"不矛盾:复用的是结点这个壳,
- * 不是 base 的块。slab 头不参与复用:量级小得多(见 wmm_phys.c)。
+ * 全部 extent 挂在一条全局地址序双向链上(含在用的)。这条链是
+ * 对抗外部碎片的命脉:释放时链上 prev/next 就是物理邻居,合并
+ * O(1);分配 first-fit 沿链从低地址找第一个够大的空闲块复用,
+ * 窗口因此不会因"各处散落的小空闲块"而被迫无限增长。
+ *
+ * 状态三态:INUSE(服务中:承载 slab 或大对象)/ FREE_DIRTY(空闲,
+ * 物理页仍在映射里,复用零系统调用)/ FREE_RETAINED(空闲且物理页
+ * 已 madvise 归还内核,复用要吃缺页;由 purge(M10)产生,M6 不做
+ * 这条转换,枚举先定义齐是为了结构不用再动)。
+ *
+ * 为什么不另挂一条独立的 free 链:first-fit 直接扫地址序链过滤
+ * FREE 即可。jemalloc 用按大小分级的搜索树,那是多 arena、数十万
+ * extent 规模下的选择;我们单 arena、extent 千级,全扫是慢路径里
+ * 几十微秒的事,而省下的是一条链的全部插入/摘除代码和每结点 16
+ * 字节——小而精取后者。
+ *
+ * 结点内存:壳(extent_t 本体)经回收链复用——大对象生灭频繁,
+ * 逐块向 base 要新结点会把 base 区吃穿;复用的是结点这个壳,与
+ * "base 区只进不出"不矛盾。slab 头不复用:量级小得多(见
+ * wmm_phys.c 文件头)。
  */
-typedef struct wmm_extent_s wmm_extent_t;
-struct wmm_extent_s {
-    void         *addr;     /* 区间基址,页对齐 */
-    size_t        npages;   /* 区间页数 */
-    wmm_extent_t *next;     /* 结点回收链;M6 复用作地址序链 */
+enum {
+    WMM_EXT_INUSE         = 1,   /* 服务中(承载 slab 或大对象) */
+    WMM_EXT_FREE_DIRTY    = 2,   /* 空闲,物理页还在;复用零系统调用 */
+    WMM_EXT_FREE_RETAINED = 3,   /* 空闲,物理页已还内核(purge 产物) */
 };
 
+typedef struct wmm_extent_s wmm_extent_t;
+struct wmm_extent_s {
+    void         *addr;      /* 区间基址,页对齐 */
+    size_t        npages;    /* 区间页数 */
+    uint32_t      state;     /* WMM_EXT_*;0 非法(新结点必须显式赋值) */
+    wmm_extent_t *ar_prev;   /* 地址序双向链(全量,含 INUSE) */
+    wmm_extent_t *ar_next;
+    wmm_extent_t *next;      /* 结点回收链(g_ext_free_nodes,LIFO) */
+    wmm_slab_t   *slab;      /* 承载小对象 slab 时指向其头;大对象 NULL */
+};
+
+/* 物理层全局(wmm_boot.c 定义):地址序链头与脏页计数。
+ * 均在 g_ext_lock 内变更;导出给测试做白盒核对。 */
+extern wmm_extent_t *g_ar_head;      /* 地址序链头(最低地址);NULL = 空 */
+extern size_t        g_dirty_pages;  /* FREE_DIRTY 状态的总页数(purge 的依据) */
+
 /* 物理层接口(wmm_phys.c)。
- * 锁:g_ext_lock 保护窗口 bump 指针、结点回收链与 g_large 统计;
- * 锁序 bin 锁 → g_ext_lock(与 fork prepare 一致)。 */
+ * 锁:g_ext_lock 保护地址序链、窗口 bump、结点回收链、g_dirty_pages
+ * 与 g_large 统计;锁序 bin 锁 → g_ext_lock → base 锁(与 fork
+ * prepare 一致;base 为叶子锁)。 */
 wmm_slab_t   *wmm_phys_alloc_slab(szind_t i);
-/* 取 pgs 页 + slab 头(base 区)并完成 slab 初始化(含页表登记);
- * 可在持有 bin 锁时调用。NULL = 窗口耗尽或元数据耗尽(OOM)。 */
+/* 取 pgs 页(优先 first-fit 复用,否则窗口 bump)+ slab 头(base 区),
+ * 完成 slab 初始化、页表登记与 ext↔slab 双向接线。可在持有 bin 锁
+ * 时调用。NULL = 窗口耗尽或元数据耗尽(OOM)。 */
 void          wmm_phys_free_slab(wmm_slab_t *sl);
-/* 整块 slab 退休:页交还内核、页表清零。必须在 bin 锁释放后调用
- * (bin 已不引用它;物理层只拿自己的锁)。 */
+/* 整块 slab 退休:页入空闲(不清物理映射)、页表清零、向两侧合并。
+ * 必须在 bin 锁释放后调用(bin 已不引用它;物理层只拿自己的锁)。 */
 wmm_extent_t *wmm_phys_alloc_extent(size_t size);
-/* 大对象分配:页数向上取整,全页登记 tag=1。返回 extent(调用方用
- * ext->addr 当对象地址);NULL = OOM。超窗口量级的请求在此挡下。 */
+/* 大对象分配:页数向上取整,优先复用,全页登记 tag=1。返回 extent
+ * (调用方用 ext->addr 当对象地址);NULL = OOM。超窗口量级的请求
+ * 在此挡下。 */
 void          wmm_phys_free_extent(wmm_extent_t *ext);
-/* 大对象释放:还页、清页表、更新 g_large 计数、结点入回收链。 */
+/* 大对象释放:更新 g_large 计数、页入空闲、页表清零、向两侧合并、
+ * 结点壳入回收链。 */
 
 /* ==================== 线程缓存:无锁快路径 ====================
  *

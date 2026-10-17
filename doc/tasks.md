@@ -505,57 +505,65 @@ size_t wmm_usable_size(const void *p) {
 
 ### M6.1 extent 与地址序链
 ```c
+enum { WMM_EXT_INUSE = 1, WMM_EXT_FREE_DIRTY = 2, WMM_EXT_FREE_RETAINED = 3 };
 typedef struct wmm_extent_s {
     void       *addr;      /* 页对齐 */
     size_t      npages;
-    uint32_t    state;     /* WMM_EXT_FREE_DIRTY / FREE_RETAINED / INUSE */
+    uint32_t    state;     /* 上列三态;RETAINED 由 purge(M10)产生,M6 不做转换 */
     struct wmm_extent_s *ar_prev, *ar_next;  /* 全量地址序双向链(含 INUSE) */
-    struct wmm_extent_s *fl_prev, *fl_next;  /* 空闲链(仅 FREE 态) */
+    struct wmm_extent_s *next;               /* 结点壳回收链(g_ext_free_nodes,LIFO) */
     wmm_slab_t *slab;      /* 若承载小对象 slab;大对象为 NULL */
 } wmm_extent_t;
 ```
-- **单一地址序双向链**:carve 时插入、free 时原地改 state——**找邻居合并 = 链上 prev/next,O(1)**;
-- 空闲另挂一条 free 链(便于 first-fit 搜索);
-- extent 结点从 base 元数据区 `wmm_base_alloc`(M2.3)取;合并吞并或真正 munmap 后,
-  空结点挂全局单链 `g_ext_free_nodes` 复用——extent 随大对象频繁生灭,不复用会泄漏元数据。
+- **单一地址序双向链**:carve 时插入、free 时原地改 state——**找邻居合并 =
+  链上 prev/next,O(1)**。新 bump 尾插、分裂余段原位后插,都不需要扫描找位置;
+- **勘误(原设计"空闲另挂一条 free 链")**:已砍掉。first-fit 直接扫地址序链过滤
+  FREE——单 arena、extent 千级,全扫是慢路径几十微秒;省一条链的全部
+  插入/摘除代码与每结点 16 字节。jemalloc 的按大小分级搜索树是多 arena
+  数十万 extent 规模的选择,不剥离语境移植;
+- extent 结点壳从 base 取,合并吞并后挂 `g_ext_free_nodes` 复用;slab 头不复用
+  (生命与类流量同长,量级小;统计证伪则同款回收链照加)。
 
-### M6.2 carve(拿页)
-```c
-/* 优先序(指南 §9.2): 1) 空闲链 first-fit(够大)  2) 新 mmap(MAP_FIXED 到堆区内) */
-void *wmm_extent_get(size_t npages, uint32_t *state_out);
-```
-- first-fit:扫 free 链,找到 `npages 大` 的最小地址项;剩余部分(若有)留在链上;
-- 无可用 → `mmap(g_heap_cur, npages*PAGE, PROT_READ|WRITE,
-  MAP_FIXED|MAP_PRIVATE|MAP_ANONYMOUS)`(MAP_FIXED 到 boot 保留的 VA 窗口内),`g_heap_cur += npages*PAGE`;
-- 新映射 → 建 extent、插地址序链;
-- **失败**:堆区耗尽返回 NULL → `wmm_alloc` 返回 NULL(OOM 契约)。
+### M6.2 取页 extent_get(内部,已持 g_ext_lock)
+- first-fit:沿地址序链从最低地址找第一个 `state != INUSE 且 npages 足够` 的块;
+  命中则低段交付、余段(≥1 页)原位留在链上(继承原状态);元数据耗尽无法分裂
+  时整块交付(多给不损坏,只浪费);
+- 偏好低地址即期望行为:低地址先复用先腾空,高地址空闲块更容易保持大块连续;
+- 无命中 → 窗口 bump `mmap(g_heap_cur, …, MAP_FIXED)` 并尾插地址序链;
+- **失败**:窗口耗尽 → OOM 路径(dprintf 用量 + abort_oom),`wmm_alloc` 返回 NULL。
 
-### M6.3 释放与合并(核心)
-```c
-void wmm_extent_free(wmm_extent_t *e);   /* PHY1 */
-/* 1) 状态 → FREE_DIRTY;入 free 链;
-   2) 合并: 检查地址序链邻居(prev/next),
-      邻居 FREE 且 addr+npages 相接 → 吞并(更新 npages, 摘除邻居, 继续向两侧);
-   3) 若为 slab 承载页,先由 bin 摘除(全空 slab, M3.3)再走本函数; */
-```
+### M6.3 释放 extent_release(核心,PHY1)
+1. **页表立即清零**(raw=0):页表语义定为"当前归属"——不清零的话,复用窗口期
+   内的 double-free 会反查到还在空闲链上的 extent 并把它再 free 一遍,直接毁链;
+   清零后与"从未分配"统一为同一条诊断路径。**物理页不还**:FREE_DIRTY 复用零
+   系统调用,真正还物理页是 purge(M10,madvise)的事——这正是 jemalloc 攒
+   dirty 再批量还的动机;
+2. state → FREE_DIRTY,`g_dirty_pages += npages`;
+3. 合并:地址序链邻居 prev/next,空闲且地址相接 → 吞并(幸存结点页数扩张,
+   被吞结点壳入回收链),向两侧各推到头。dirty 计数页数守恒,合并不改它。
 
 ### M6.4 大对象路径
-```c
-void *wmm_large_alloc(size_t size);    /* npages = ceil(size/PAGE);
-                                          页表登记: 每页 {tag=1, ptr=extent}(PTE1 覆盖大对象) */
-void  wmm_large_free(void *p);         /* pte→extent→wmm_extent_free */
-```
-- 页表:extent **每一页**都登记同一 extent 指针(简化,`wmm_free` 任意页进入都可反查);free 时以 p 所在页的 extent 为准,整体归还;
-- **大对象 `live_large` 计数(M11 填)** 先占位。
+- `wmm_phys_alloc_extent(size)`:npages=ceil(size/PAGE),extent_get(优先复用),
+  **每一页**登记 `{tag=1, ptr=extent}`(任意页进入都可反查),g_large 统计
+  (live/live_bytes/ndalloc,g_ext_lock 内);
+- `wmm_phys_free_extent(ext)`:统计 → extent_release。size > WMM_HEAP_VA_SIZE
+  的回绕挡板在入口(接近 SIZE_MAX 的请求会绕过页数取整)。
 
-### M6.5 小对象与 extent 的接线(wmm_core 回调)
-- `wmm_bin_alloc` 返回 NULL 时:`e = wmm_extent_get(pgs)` → `wmm_slab_init(sl=e->addr, i)` → `e->slab=sl` → `wmm_bin_slab_install` → 重试;
-- `wmm_bin_dalloc` 返回"可归还"时 → `wmm_extent_free`。
+### M6.5 小对象与 extent 的接线(wmm_phys_alloc_slab/free_slab)
+- alloc:base 取 slab 头 → extent_get(pgs) → `wmm_slab_init(sl, e->addr, i)`
+  → `sl->ext=e; e->slab=sl` 双向接线 → 主路径 install;
+- free(slab 退休):由 `sl->ext` 找回 extent → extent_release。bin 摘除已在
+  bin 锁内完成,物理层只拿自己的锁(锁序 bin → ext → base)。
 
 ### 自测清单(M6)
-- [ ] PHY1:交替分配/释放固定大小后,`free 链上前 K 项` 的地址连续性 = 合并成功(RSS 不涨);
-- [ ] PHY3:大对象(≥16K)分配/释放、`usable_size` 为页面倍数、页表全页登记正确;
-- [ ] 随机混合(小+大)压力 5 分钟,`g_heap_cur` 增长有界(碎片被合并吸收)。
+- [ ] PHY1:奇偶交替释放 → 4 个独立空闲块;全释放 → 融成单个 128 页块;
+      复用取最低地址且 `g_heap_cur` 不前进(零新映射);
+- [ ] 分裂:5 页块上取 4 页 → 低段交付、余 1 页原位空闲,计数守恒;
+- [ ] 跨路径吸收:3 个 slab(9 页)退休 → 大对象恰要 9 页时复用同一地址;
+- [ ] PHY3:大对象每页页表登记同一 extent、usable 为页倍数、释放后全页 raw==0;
+- [ ] 结构不变量(每个检查点):地址序链严格递增、不重叠、双向互指、
+      `g_dirty_pages == Σ FREE 页数`;
+- [ ] 混合压力 ×2 重放(同种子同序列):第二遍 `g_heap_cur` 一页不前进。
 
 ---
 

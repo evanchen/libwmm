@@ -11,6 +11,7 @@
 int test_boot(void);   /* 由 tests/test_boot.c 提供 */
 int test_slab(void);   /* 由 tests/test_slab.c 提供 */
 int test_api(void);    /* 由 tests/test_api.c 提供 */
+int test_phys(void);   /* 由 tests/test_phys.c 提供 */
 
 typedef int (*wmm_test_fn)(void);
 
@@ -21,6 +22,7 @@ static const struct {
     { "boot", test_boot },
     { "slab", test_slab },
     { "api",  test_api },
+    { "phys", test_phys },
 };
 
 int main(void) {

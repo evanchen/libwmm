@@ -10,6 +10,7 @@
 | test_slab.c | M3 slab + freelist + bin | SLAB1/2, AR1 |
 | test_pte.c | M4 页表登记/反查 | PTE1/2 |
 | test_api.c | M4/M5 API 契约 | API1 |
+| test_phys.c | M6 合并/分裂/复用/重放 | PHY1/PHY3 |
 | test_oracle.c | M7 oracle 属性测试 | G1/G2, SC2, PTE2 |
 | test_stress.c | M7 多线程压力 | TC1, G2/G5, PHY1 |
 | test_tcache.c | M8/M9 快路径/GC/线程退出 | TC1~TC4, G5 |
