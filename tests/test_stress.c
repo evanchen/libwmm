@@ -250,13 +250,17 @@ static void *stress_thread(void *arg) {
     size_t      nslots = me->slots;
     long        fails = 0;
     long        n_live = 0;
-    uint64_t    st = 0x9E3779B97F4A7C15ULL
-                   + (uint64_t)(me->tid + 1) * 0x9E3779B97F4A7C15ULL;
+    /* rng 状态命名必须与槽位下标(start)拉开差距:首轮实跑踩过
+       "拷贝 oracle 的释放分支时把那边的槽位变量名 st 带过来,而这里
+       st 是 rng 状态"的碰撞,`row[st]` 拿 64 位随机数当数组下标,
+       语法检查全绿、运行时 UBSan pointer-overflow 当场拦截 */
+    uint64_t    rng_state = 0x9E3779B97F4A7C15ULL
+                          + (uint64_t)(me->tid + 1) * 0x9E3779B97F4A7C15ULL;
 
     for (int r = 0; r < WMM_STRESS_ROUNDS; r++) {
         for (size_t k = 0; k < me->round_steps; k++) {
-            uint32_t rr = rng_next(&st) & 3u;
-            size_t   start = rng_next(&st) % nslots;
+            uint32_t rr = rng_next(&rng_state) & 3u;
+            size_t   start = rng_next(&rng_state) % nslots;
 
             if (rr == 0) {              /* 分配:优先空槽;表满先腾位 */
                 int s = s_find(row, nslots, false, start);
@@ -268,26 +272,26 @@ static void *stress_thread(void *arg) {
                 }
                 if (s >= 0)
                     n_live += s_alloc(row, me->tid, (size_t)s,
-                                      gen_size(&st), &fails);
+                                      gen_size(&rng_state), &fails);
             } else if (rr <= 2) {       /* 释放:打中活槽才释放,空槽
                                            回退分配。打点而非扫描——
                                            扫描版成功率与占用率无关,
                                            占用率会被钉死在 0 附近
                                            (推导见 test_oracle.c);
                                            打点版均衡在 75% */
-                if (row[st].p != NULL)
-                    n_live += s_free(row, st, &fails);
+                if (row[start].p != NULL)
+                    n_live += s_free(row, start, &fails);
                 else
-                    n_live += s_alloc(row, me->tid, st,
-                                      gen_size(&st), &fails);
+                    n_live += s_alloc(row, me->tid, start,
+                                      gen_size(&rng_state), &fails);
             } else {                    /* realloc:优先活槽;表空改分配 */
                 int s = s_find(row, nslots, true, start);
                 if (s < 0)
                     n_live += s_alloc(row, me->tid, start,
-                                      gen_size(&st), &fails);
+                                      gen_size(&rng_state), &fails);
                 else
                     n_live += s_realloc(row, (size_t)s,
-                                        gen_size(&st), &fails);
+                                        gen_size(&rng_state), &fails);
             }
         }
         me->live_pub = (uint64_t)n_live;
@@ -382,12 +386,15 @@ int test_stress(void) {
             win_pin   = g_heap_cur;
         } else {
             /* 复用尖断言(纯分配器量,无 RSS 杂音):三阶段槽数/步数/
-               配比全同,阶段 2/3 的峰值需求必须落在阶段 1 足迹内;
-               1MB 预算只吸收并发调度的碎片抖动(部分填充 slab 的
-               数量随调度略有浮动)。复用失效的特征量级完全不同:每
-               阶段 GB 级分配流量,1% 漏复用就新增 20MB 以上足迹 */
+               配比全同,阶段 2/3 的峰值需求必须落在阶段 1 足迹内。
+               预算 8MB 吸收的是峰值需求的随机波动——活集合 ~384 指针
+               × 平均 ~55KB ≈ 21MB,占用率随机游走的峰谷差天然是
+               MB 级(oracle 单线程同分布实测 peak 442),两阶段的
+               峰值采样不可能逐字节重合。复用失效的特征量级完全不同:
+               每阶段 4~5GB 分配流量,1% 漏复用就新增 40MB 以上足迹,
+               与预算隔着一个数量级 */
             CHECK((char *)g_heap_cur - (char *)win_pin
-                      <= (ptrdiff_t)(WMM_PAGE * 256));
+                      <= (ptrdiff_t)(WMM_PAGE * 2048));
         }
         rss_last = rss_after;
     }
