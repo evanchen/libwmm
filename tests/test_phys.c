@@ -207,26 +207,30 @@ static void check_split(void) {
 static void check_slab_absorb(void) {
     drain_free_pool();
 
-    /* 600 个 48B(类 3,每 slab 3 页 256 对象)→ 恰 3 个 slab,
-       且 drain 后是相邻的新 bump */
+    /* 600 个 48B(类 3,每 slab 3 页 256 对象)→ 恰 3 个新 slab。
+       相邻性依据是"drain 后链上无空闲 → extent_get 只能窗口
+       bump → 三块页连续",与 bin3 的历史无关。bin 计数带着 api
+       组的历史(那些 slab 早已退休),断言一律用增量,不要求
+       全局史为零 */
+    uint64_t curslabs0 = g_bins[3].curslabs;
     unsigned char *objs[600];
     for (int k = 0; k < 600; k++) {
         objs[k] = wmm_alloc(48);
         CHECK(objs[k] != NULL);
     }
-    CHECK(g_bins[3].nslabs - g_bins[3].curslabs == 0);
-    CHECK(g_bins[3].curslabs == 3);
+    CHECK(g_bins[3].curslabs - curslabs0 == 3);   /* 恰 3 个新 slab 在管 */
 
     /* 第一个 slab 的基址:页表反查,不靠地址推算 */
     wmm_slab_t *sl = NULL;
     CHECK(wmm_pte_is_slab(objs[0], &sl));
     void *slab0 = sl->addr;
 
-    /* 全部释放:3 个 slab 退休,页融合成一个 9 页空闲块 */
+    /* 全部释放:3 个 slab 依次退休,页融合成一个 9 页空闲块 */
     for (int k = 0; k < 600; k++)
         wmm_free(objs[k]);
-    CHECK(g_bins[3].curslabs == 0);
-    CHECK(g_dirty_pages >= 9);
+    CHECK(g_bins[3].curslabs == curslabs0);   /* 全部退休,回到起点 */
+    CHECK(g_dirty_pages == 9);   /* drain 清零后本节恰退休 3 slab × 3 页;
+                                    释放之间无任何分配,计数无他源 */
 
     /* 大对象恰好要 9 页:必须复用 slab 腾出的页(零新映射) */
     void *cur_pre = g_heap_cur;
