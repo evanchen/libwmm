@@ -18,6 +18,9 @@
  * (512)三阶段恒定,峰值工作集相同;空闲页按设计留在映射里等复用
  * (真正还内核是 purge 阶段的事),所以期望形态是"涨到峰值后持平",
  * 不是回落。阶段间显著上台阶 = 释放页没有回到复用池,合并或复用失效。
+ * RSS 混着 ASan 影子页/线程栈等大量非分配器杂音,复用还有一道更尖
+ * 的白盒断言直接盯窗口 bump 指针:阶段 2/3 的容量与配比和阶段 1
+ * 全同,峰值需求必须落在阶段 1 已建立的足迹(加复用池)之内。
  */
 #include "wmm_internal.h"
 
@@ -266,13 +269,17 @@ static void *stress_thread(void *arg) {
                 if (s >= 0)
                     n_live += s_alloc(row, me->tid, (size_t)s,
                                       gen_size(&st), &fails);
-            } else if (rr <= 2) {       /* 释放:优先活槽;表空改分配 */
-                int s = s_find(row, nslots, true, start);
-                if (s < 0)
-                    n_live += s_alloc(row, me->tid, start,
-                                      gen_size(&st), &fails);
+            } else if (rr <= 2) {       /* 释放:打中活槽才释放,空槽
+                                           回退分配。打点而非扫描——
+                                           扫描版成功率与占用率无关,
+                                           占用率会被钉死在 0 附近
+                                           (推导见 test_oracle.c);
+                                           打点版均衡在 75% */
+                if (row[st].p != NULL)
+                    n_live += s_free(row, st, &fails);
                 else
-                    n_live += s_free(row, (size_t)s, &fails);
+                    n_live += s_alloc(row, me->tid, st,
+                                      gen_size(&st), &fails);
             } else {                    /* realloc:优先活槽;表空改分配 */
                 int s = s_find(row, nslots, true, start);
                 if (s < 0)
@@ -310,6 +317,12 @@ int test_stress(void) {
     g_live0 = total_live();
 
     size_t rss_first = 0, rss_last = 0;
+    void  *win_entry = g_heap_cur;   /* 进场 bump 指针:oracle 组全量
+                                        释放后复用池很大,阶段 1 的峰值
+                                        需求应基本落在池内;允许小量
+                                        补充,增量打印出来观察 */
+    void  *win_pin   = NULL;         /* 阶段 1 足迹:阶段 2/3 与它容量
+                                        全同,bump 不得再越此界 */
 
     for (size_t ph = 0;
          ph < sizeof g_stress_nthreads / sizeof g_stress_nthreads[0]; ph++) {
@@ -358,26 +371,38 @@ int test_stress(void) {
             fails += g_sarg[t].fails;
         g_fail += (int)fails;
 
-        printf("  phase %2d threads x %zu steps: %s, RSS %zu -> %zu KB\n",
+        printf("  phase %2d threads x %zu steps: %s, RSS %zu -> %zu KB, "
+               "window +%ld KB\n",
                n, (size_t)WMM_STRESS_PHASE_STEPS,
-               fails ? "FAIL" : "PASS", rss_before, rss_after);
+               fails ? "FAIL" : "PASS", rss_before, rss_after,
+               (long)(((char *)g_heap_cur - (char *)win_entry) >> 10));
 
-        if (ph == 0)
+        if (ph == 0) {
             rss_first = rss_after;
+            win_pin   = g_heap_cur;
+        } else {
+            /* 复用尖断言(纯分配器量,无 RSS 杂音):三阶段槽数/步数/
+               配比全同,阶段 2/3 的峰值需求必须落在阶段 1 足迹内;
+               1MB 预算只吸收并发调度的碎片抖动(部分填充 slab 的
+               数量随调度略有浮动)。复用失效的特征量级完全不同:每
+               阶段 GB 级分配流量,1% 漏复用就新增 20MB 以上足迹 */
+            CHECK((char *)g_heap_cur - (char *)win_pin
+                      <= (ptrdiff_t)(WMM_PAGE * 256));
+        }
         rss_last = rss_after;
     }
 
-    /* RSS 平稳:三阶段总步数与槽位总配额都固定,峰值工作集相同;
-       空闲页按设计留在映射里等复用(真正还内核是 purge 的事),
-       期望形态是"涨到峰值后持平"。容差 8MB 覆盖三样只增不减的
-       自然爬升——base 区 slab 头不复用(见 wmm_phys.c 文件头)、
-       线程栈、ASan 影子页——以及占用率随机演化的峰值波动。
-       复用失效的信号量级完全不同:每阶段约 1 万次大对象分配,
-       若释放页不回池,仅大对象头页每阶段就新增 40MB 触碰,叠加
-       slab 整页触碰,三阶段百 MB 量级——容差挡得住噪声,拦得住真错 */
+    /* RSS 平稳(粗粒度总检;复用的尖断言在上面盯窗口 bump):三阶段
+       总步数与槽位总配额都固定,峰值工作集相同;空闲页按设计留在
+       映射里等复用(真正还内核是 purge 的事),期望形态是"涨到峰值
+       后持平"。容差 20MB 的构成(首轮实测分解):每阶段新起 4/8/16
+       个线程,栈页与 ASan 线程登记/影子页在 join 后仍留驻 RSS,
+       跨阶段合计 ~8MB;再加占用率随机演化的峰值波动。复用失效的
+       信号量级完全不同——每阶段 GB 级分配流量,1% 漏复用就新增
+       20MB+ 触碰——容差挡得住噪声,拦得住真错 */
     CHECK(rss_first > 0);
-    CHECK(rss_last <= rss_first + 8192);
-    printf("  RSS plateau: first %zu KB, last %zu KB (tolerance 8192 KB)\n",
+    CHECK(rss_last <= rss_first + 20480);
+    printf("  RSS plateau: first %zu KB, last %zu KB (tolerance 20480 KB)\n",
            rss_first, rss_last);
 
     if (g_fail == 0)

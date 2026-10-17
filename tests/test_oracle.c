@@ -132,9 +132,8 @@ static size_t usable_wmm(void *p)   { return wmm_usable_size(p); }
 static size_t usable_glibc(void *p) { return malloc_usable_size(p); }
 
 /* 从 start 起环形找下一个"空"(want_live 假)或"活"(真)槽位。
-   操作配比 1:2:1(分配:释放:realloc)把均衡占用率钉在 0.5:
-   分配支占 1/4 步、释放支占 1/2 步,占用率再高释放就快于补充。
-   期望两三次探测即命中;找不到返回 -1。 */
+   占用均衡在 75%(推导见 run_mode),空/活槽位都不缺,期望两三次
+   探测即命中;找不到返回 -1。 */
 static int find_slot(bool want_live, size_t start) {
     for (size_t k = 0; k < WMM_ORACLE_SLOTS; k++) {
         size_t s = (start + k) % WMM_ORACLE_SLOTS;
@@ -260,9 +259,18 @@ static void run_checkpoint(const wmm_oops_t *o, size_t step,
 }
 
 /* 一轮完整模式:复位种子后跑满 STEPS 步。
- * 操作配比(rng 低两位):0 = 分配,1/2 = 释放,3 = realloc,占了
- * 一半的释放让占用率在 0.6 附近平衡——活指针数有涨有落,④ 对账的
- * 才是一个变化着的数,而不是恒等于槽数的常数。 */
+ * 操作配比(rng 低两位):0 = 分配,1/2 = 释放,3 = realloc。
+ * 占用率均衡点 q=3/4,推导:分配支每步期望 +1/4(未满必成功);
+ * 释放支打随机槽位,活则释放、空则改分配,期望 (1-2q)/2;realloc
+ * 净 0。合计 3/4 - q = 0。活指针数因此在 384 上下随机游走,④ 对账
+ * 的是一个宽变化区间上的数;每个十万步段从 0 爬回均衡,波峰波谷
+ * 反复压满。
+ * 释放为什么必须打"随机槽位"而不能"扫到任意活槽就释放"(首轮
+ * 实跑 peak live 20/512 暴露的坑):扫描版的成功率与占用率无关
+ * ——表非空必命中,期望净漂移恒 -1/4/步,占用率被钉死在 0 附近。
+ * churn 依然全覆盖,但活集合压力形同虚设,长活短活混杂的碎片
+ * 形态根本测不到;打点版成功率随占用率升高,负反馈天然形成,
+ * 均衡才是内点。 */
 static void run_mode(const wmm_oops_t *o) {
     g_rng = 0x9E3779B97F4A7C15ULL;   /* 两种模式同种子 = 同一条序列 */
     memset(g_slot, 0, sizeof g_slot);
@@ -295,14 +303,16 @@ static void run_mode(const wmm_oops_t *o) {
                 n_live += op_alloc(o, (size_t)s, sz);
                 n_a++;
             }
-        } else if (r <= 2) {             /* 释放:优先活槽;表空改分配 */
-            int s = find_slot(true, st);
-            if (s < 0) {
+        } else if (r <= 2) {             /* 释放:打中活槽才释放;打中
+                                            空槽回退分配(该槽必空,
+                                            直接用)。打点而非扫描,
+                                            均衡点推导见上 */
+            if (g_slot[st].p != NULL) {
+                n_live += op_free(o, st);
+                n_f++;
+            } else {
                 n_live += op_alloc(o, st, sz);
                 n_a++;
-            } else {
-                n_live += op_free(o, (size_t)s);
-                n_f++;
             }
         } else {                         /* realloc:优先活槽;表空改分配 */
             int s = find_slot(true, st);
