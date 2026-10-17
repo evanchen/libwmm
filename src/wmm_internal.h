@@ -246,7 +246,7 @@ bool  wmm_bin_dalloc(wmm_bin_t *b, wmm_slab_t *sl, void *p);
  *
  * 状态三态:INUSE(服务中:承载 slab 或大对象)/ FREE_DIRTY(空闲,
  * 物理页仍在映射里,复用零系统调用)/ FREE_RETAINED(空闲且物理页
- * 已 madvise 归还内核,复用要吃缺页;由 purge(M10)产生,M6 不做
+ * 已 madvise 归还内核,复用要吃缺页;由 purge 产生,当前版本不做
  * 这条转换,枚举先定义齐是为了结构不用再动)。
  *
  * 为什么不另挂一条独立的 free 链:first-fit 直接扫地址序链过滤

@@ -56,7 +56,7 @@ pthread_mutex_t g_ext_lock;    /* 物理层粗粒度锁(extent 链 + 大对象�
 wmm_large_stats_t g_large;     /* 大对象统计,与 g_ext_lock 同域 */
 
 wmm_extent_t *g_ar_head;       /* 物理层地址序链头;全部页面记账的根 */
-size_t        g_dirty_pages;   /* FREE_DIRTY 总页数;purge(M10)的依据 */
+size_t        g_dirty_pages;   /* FREE_DIRTY 总页数;purge 归还决策的依据 */
 
 wmm_tcache_t *g_threads;           /* 线程注册表链头;NULL = 还没有线程建过缓存 */
 pthread_mutex_t g_threads_lock;    /* 保护注册表链的增删 */

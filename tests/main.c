@@ -12,6 +12,8 @@ int test_boot(void);   /* 由 tests/test_boot.c 提供 */
 int test_slab(void);   /* 由 tests/test_slab.c 提供 */
 int test_api(void);    /* 由 tests/test_api.c 提供 */
 int test_phys(void);   /* 由 tests/test_phys.c 提供 */
+int test_oracle(void); /* 由 tests/test_oracle.c 提供 */
+int test_stress(void); /* 由 tests/test_stress.c 提供 */
 
 typedef int (*wmm_test_fn)(void);
 
@@ -19,10 +21,12 @@ static const struct {
     const char  *name;
     wmm_test_fn  fn;
 } g_tests[] = {
-    { "boot", test_boot },
-    { "slab", test_slab },
-    { "api",  test_api },
-    { "phys", test_phys },
+    { "boot",   test_boot },
+    { "slab",   test_slab },
+    { "api",    test_api },
+    { "phys",   test_phys },
+    { "oracle", test_oracle },
+    { "stress", test_stress },
 };
 
 int main(void) {

@@ -280,7 +280,7 @@ uint32_t wmm_div_regind(const void *p, const void *base, uint32_t reg_size) {
 
 /* ==================== 主路径:wmm_alloc 家族 ====================
  *
- * M4:单线程、无 tcache 的版本。tcache 落地(M8)后,这里变成
+ * 当前是单线程、无 tcache 的版本。tcache 落地后,这里变成
  * "缓存耗尽/刷出"才走的慢路径,快路径在 wmm_tcache.c;本段
  * 结构不变:查类 → bin 锁 → bin_alloc,NULL 则物理层供 slab
  * 后重试(至多一次)。
@@ -325,7 +325,7 @@ void wmm_free(void *p) {
 
     /* 先验界再查表:窗口外的指针不属本分配器。混用 libc 分配器在
        契约上是 UB,但 UB 不等于活该崩溃——给出诊断信息再返回,
-       服务还能带病跑完这一单(M14 起这里改写 0xBE 事件)。 */
+       服务还能带病跑完这一单(guard 检测落地后这里改写 0xBE 事件)。 */
     if ((uintptr_t)p < (uintptr_t)g_heap_base ||
         (uintptr_t)p >= (uintptr_t)g_heap_end) {
         wmm_dprintf("free: %p out of heap window (not from wmm?)\n", p);
@@ -342,8 +342,8 @@ void wmm_free(void *p) {
         pthread_mutex_unlock(&b->lock);
 
         /* 退休在 bin 锁外执行:物理层只拿自己的锁,不与 bin 锁
-           嵌套。M4 单线程无虞;多线程时代"bin 摘除 → munmap"之间
-           的窗口由 tcache 刷出路径的锁纪律闭合(M8 处理)。 */
+           嵌套。当前单线程无虞;多线程时代"bin 摘除 → munmap"之间
+           的窗口由 tcache 刷出路径的锁纪律闭合(tcache 落地时处理)。 */
         if (retire)
             wmm_phys_free_slab(sl);
         return;

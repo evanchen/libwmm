@@ -5,7 +5,7 @@
  *   取页 extent_get:first-fit 沿地址序链找第一个够大的空闲块切出
  *         (复用零系统调用);没有才从窗口 bump 处 mmap 新页;
  *   还页 extent_free:页表立即清零(raw=0),extent 转 FREE_DIRTY,
- *         物理页留在映射里(purge(M10)才真正还内核),然后沿地址
+ *         物理页留在映射里(攒够阈值由 purge 真正还内核),然后沿地址
  *         序链向两侧合并——相邻空闲区间永远融成一块,这就是对抗
  *         外部碎片的全部机关。
  *
@@ -195,7 +195,7 @@ static wmm_extent_t *extent_get(size_t npages) {
    进回收链。dirty 计数页数守恒(空闲段之间腾挪),合并不改它。 */
 static void extent_release(wmm_extent_t *e) {
     /* 页表清零:raw=0 即"当前无归属"。物理页留在映射里不动——
-       FREE_DIRTY 复用零系统调用,真正还物理页是 purge(M10)的事。 */
+       FREE_DIRTY 复用零系统调用,真正还物理页是 purge 的事。 */
     wmm_pte_t zero;
     zero.raw = 0;
     for (size_t pg = 0; pg < e->npages; pg++)
