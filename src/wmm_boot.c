@@ -57,6 +57,7 @@ wmm_large_stats_t g_large;     /* 大对象统计,与 g_ext_lock 同域 */
 
 wmm_extent_t *g_ar_head;       /* 物理层地址序链头;全部页面记账的根 */
 size_t        g_dirty_pages;   /* FREE_DIRTY 总页数;purge 归还决策的依据 */
+size_t        g_active_bytes;  /* 已投入服务的窗口字节(快照 active_bytes 的源) */
 
 wmm_tcache_t *g_threads;           /* 线程注册表链头;NULL = 还没有线程建过缓存 */
 pthread_mutex_t g_threads_lock;    /* 保护注册表链的增删 */
@@ -232,6 +233,10 @@ void wmm_atfork_child(void) {
        控制状态可能是"运行中"或"锁着"。重建为空闲,否则子进程
        调 bg.disable 会去 join 一个不存在的 tid */
     wmm_bg_child_reset();
+
+    /* 事件环锁同理:父进程里若正有线程持着它写事件,fork 出来的
+       子进程里这把锁就永远等不到释放——重建为未锁定 */
+    (void)pthread_mutex_init(&g_event_lock, NULL);
 
     /* 锁全部重建之后才能动 bin:死线程的缓存要刷回 bin,这是子进程
        里唯一会碰分配器结构的钩子动作。此刻独占执行 */

@@ -323,13 +323,29 @@ uint32_t wmm_div_regind(const void *p, const void *base, uint32_t reg_size) {
  * 也走大对象路径——请求超过任何类的规格时,近似到页比近似到
  * 7 页 slab 更省(见 wmm_internal.h 的 WMM_SMALL_MAXCLASS 注释)。 */
 
+/* 线程局部计数槽:计数器住在 tcache 块里。大对象路径可能还没建
+   过缓存(小对象路径会惰性建),这里补建一次;仍失败(元数据/窗口
+   耗尽)就放弃计数——统计口径允许瞬时偏差,不值得为计数影响分配 */
+static wmm_tcache_t *stats_slot(void) {
+    if (g_tcache == NULL)
+        wmm_thread_init();
+    return g_tcache;
+}
+
 void *wmm_alloc(size_t size) {
     if (size == 0)
         size = 1;   /* glibc 语义:size==0 当 1 处理,返回可释放指针 */
 
     if (size > WMM_SMALL_MAXCLASS) {
         wmm_extent_t *ext = wmm_phys_alloc_extent(size);
-        return ext != NULL ? ext->addr : NULL;
+        if (ext == NULL)
+            return NULL;
+        wmm_tcache_t *t = stats_slot();
+        if (t != NULL) {
+            t->t_alloc_bytes += ext->npages * WMM_PAGE;   /* 可用 = 页对齐 */
+            t->t_alloc_cnt++;
+        }
+        return ext->addr;
     }
 
     szind_t i = wmm_size2index(size);
@@ -345,8 +361,11 @@ void *wmm_alloc(size_t size) {
             wmm_tcache_fill(i, g_tcache->bins[i].nfill);
             p = wmm_tcache_alloc(i);
         }
-        if (p != NULL)
+        if (p != NULL) {
+            g_tcache->t_alloc_bytes += wmm_bin_info[i].reg_size;
+            g_tcache->t_alloc_cnt++;
             return p;
+        }
         /* 填充失败 = 窗口耗尽:慢路径只会同样失败。保留它,让 OOM
            的返回行为集中在一处,不因缓存有无而分叉 */
     }
@@ -369,6 +388,10 @@ void *wmm_alloc(size_t size) {
         }
     }
     pthread_mutex_unlock(&b->lock);
+    if (p != NULL && g_tcache != NULL) {
+        g_tcache->t_alloc_bytes += wmm_bin_info[i].reg_size;
+        g_tcache->t_alloc_cnt++;
+    }
     return p;
 }
 
@@ -377,10 +400,11 @@ void wmm_free(void *p) {
         return;
 
     /* 先验界再查表:窗口外的指针不属本分配器。混用 libc 分配器在
-       契约上是 UB,但 UB 不等于活该崩溃——给出诊断信息再返回,
-       服务还能带病跑完这一单(guard 检测落地后这里改写 0xBE 事件)。 */
+       契约上是 UB,但 UB 不等于活该崩溃——记事件、给诊断再返回,
+       服务还能带病跑完这一单。 */
     if ((uintptr_t)p < (uintptr_t)g_heap_base ||
         (uintptr_t)p >= (uintptr_t)g_heap_end) {
+        wmm_event_log(0xBE, p);   /* 野指针:根本不在窗口里 */
         wmm_dprintf("free: %p out of heap window (not from wmm?)\n", p);
         return;
     }
@@ -389,11 +413,15 @@ void wmm_free(void *p) {
     void       *ext;
 
     if (wmm_pte_is_slab(p, &sl)) {
+        size_t usize = wmm_bin_info[sl->szind].reg_size;
+
         /* 快路径:压进本线程缓存,不碰 bin 锁。缓存满时
            wmm_tcache_free 内部先部分刷出。线程尚未建过缓存
            (只释放、不分配)时直走慢路径——对象在慢路径逐个
            回链,计数口径不变 */
         if (g_tcache != NULL && g_tcache->enabled) {
+            g_tcache->t_free_bytes += usize;
+            g_tcache->t_free_cnt++;
             wmm_tcache_free(sl->szind, p);
             return;
         }
@@ -402,6 +430,10 @@ void wmm_free(void *p) {
         pthread_mutex_lock(&b->lock);
         bool retire = wmm_bin_dalloc(b, sl, p);
         pthread_mutex_unlock(&b->lock);
+        if (g_tcache != NULL) {
+            g_tcache->t_free_bytes += usize;
+            g_tcache->t_free_cnt++;
+        }
 
         /* 退休在 bin 锁外执行:物理层只拿自己的锁,不与 bin 锁
            嵌套。批量刷出路径同理——刷出时先把退休 slab 收集进
@@ -412,14 +444,21 @@ void wmm_free(void *p) {
     }
 
     if (wmm_pte_is_extent(p, &ext)) {
-        wmm_phys_free_extent((wmm_extent_t *)ext);
+        wmm_extent_t *e = (wmm_extent_t *)ext;
+        size_t bytes = e->npages * WMM_PAGE;
+        wmm_phys_free_extent(e);
+        if (g_tcache != NULL) {
+            g_tcache->t_free_bytes += bytes;
+            g_tcache->t_free_cnt++;
+        }
         return;
     }
 
     /* raw==0:从未分配(或整块已退休)的地址——双释放/野指针。
-       什么也不做地返回:M14 起这里写 0xBE 事件并可能按配置隔离,
-       现在 dprintf 至少把问题打在现场。注意顺序:反查先于任何
-       对 p 的解引用,被回收过的页是 PROT_NONE,碰了就是段错误。 */
+       记 0xBE 事件(带调用点与指针)后什么也不做地返回;隔离等
+       guard 功能落地后再按配置做。注意顺序:反查先于任何对 p 的
+       解引用,被回收过的页是 PROT_NONE,碰了就是段错误。 */
+    wmm_event_log(0xBE, p);
     wmm_dprintf("free: %p not allocated (double free or wild pointer?)\n", p);
 }
 

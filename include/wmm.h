@@ -191,7 +191,7 @@ int  wmm_ctl(const char *cmd, ...);
 int  wmm_stats_snapshot(wmm_stats_t *st);
 
 /* 从事件环取出至多 n 条写入 buf(取出即消费,环中不再可见),
- * 实际条数写入 *got(可为 0)。buf==NULL 或 n==0 返回 -1/EINVAL。 */
+ * 实际条数写入 *got(可为 0)。buf/got==NULL 或 n==0 返回 -1/EINVAL。 */
 int  wmm_event_drain(wmm_event_t *buf, size_t n, size_t *got);
 
 /* ==================== 布局锁(共享内存协议的线上格式) ====================

@@ -106,8 +106,7 @@ static void ar_unlink(wmm_extent_t *e) {
 
 /* 窗口内 bump 出 npages 可写页(已持 ext 锁)。
    窗口耗尽 = 撞人为上限,不是机器没内存:dprintf 把两个数都打
-   出来供区分;统计事件(0xDB)落地后在此追加。abort_oom 为真时
-   快速失败。 */
+   出来供区分,并记 0xDB OOM 事件。abort_oom 为真时快速失败。 */
 static void *window_map(size_t npages) {
     size_t bytes = npages * WMM_PAGE;
     if ((char *)g_heap_cur + bytes > (char *)g_heap_end) {
@@ -115,6 +114,7 @@ static void *window_map(size_t npages) {
         size_t win  = (size_t)((char *)g_heap_end - (char *)g_heap_base);
         wmm_dprintf("OOM: heap window exhausted, %zu MB in use (window %zu MB)\n",
                     used >> 20, win >> 20);
+        wmm_event_log(0xDB, NULL);   /* OOM:窗口耗尽(撞人为上限) */
         if (g_opt.abort_oom)
             abort();
         return NULL;
@@ -126,11 +126,13 @@ static void *window_map(size_t npages) {
         /* 窗口是自己的 VA,MAP_FIXED 失败基本只剩"内核整体内存
            耗尽"一种解释;同样按 OOM 上抛。 */
         wmm_dprintf("OOM: mmap %zu pages failed, errno %d\n", npages, errno);
+        wmm_event_log(0xDB, NULL);   /* OOM:mmap 失败 */
         if (g_opt.abort_oom)
             abort();
         return NULL;
     }
     g_heap_cur = (char *)p + bytes;
+    g_active_bytes += bytes;   /* 新页投入服务:计入 active */
     return p;
 }
 
@@ -180,6 +182,11 @@ static wmm_extent_t *extent_get(size_t npages) {
                    余段仍是 FREE_DIRTY、仍要计数;整块交付(恰合或分裂
                    失败)才减 old_npages。两者在恰合时相等。 */
                 g_dirty_pages -= split_done ? npages : old_npages;
+            } else {
+                /* RETAINED 块被切出:交付段重新投入服务(访问要吃
+                   缺页),计入 active;余段仍是 RETAINED,不动。 */
+                g_active_bytes += split_done ? npages * WMM_PAGE
+                                             : old_npages * WMM_PAGE;
             }
             return e;
         }
@@ -191,9 +198,11 @@ static wmm_extent_t *extent_get(size_t npages) {
         return NULL;
 
     wmm_extent_t *e = ext_node_get();
-    if (e == NULL)
+    if (e == NULL) {
+        wmm_event_log(0xDB, NULL);   /* OOM:extent 元数据耗尽 */
         return NULL;   /* 页已花掉但不追回:留在 bump 指针之后,
                           下次 bump 会越过它;纯浪费不损坏,极端场景 */
+    }
 
     e->addr   = addr;
     e->npages = npages;
@@ -227,14 +236,18 @@ static void extent_release(wmm_extent_t *e) {
     e->slab  = NULL;
     g_dirty_pages += e->npages;
 
-    /* 向低地址吞并。存活结点是 prev,状态归一到 DIRTY;
-       RETAINED 的页并入后重新计入 dirty。 */
+    /* 向低地址吞并。存活结点是 prev,状态归一到 DIRTY;RETAINED
+       的页并入后重新计入 dirty,同时重新投入服务(active)——否则
+       整块转 DIRTY 后,将来 purge 会把这块的页数从 active 里整块
+       扣掉,而其中 RETAINED 的部分从未加进过,账就对不上了。 */
     wmm_extent_t *prev = e->ar_prev;
     while (prev != NULL && prev->state != WMM_EXT_INUSE &&
            (char *)prev->addr + prev->npages * WMM_PAGE == (char *)e->addr) {
         wmm_extent_t *p2 = prev->ar_prev;
-        if (prev->state == WMM_EXT_FREE_RETAINED)
+        if (prev->state == WMM_EXT_FREE_RETAINED) {
             g_dirty_pages += prev->npages;
+            g_active_bytes += prev->npages * WMM_PAGE;
+        }
         prev->state = WMM_EXT_FREE_DIRTY;
         prev->npages += e->npages;
         ar_unlink(e);
@@ -244,13 +257,15 @@ static void extent_release(wmm_extent_t *e) {
     }
 
     /* 向高地址吞并。存活结点 e 已是 DIRTY,只需把 RETAINED 邻居
-       的页补进 dirty 计数。 */
+       的页补进 dirty 与 active 计数。 */
     wmm_extent_t *next = e->ar_next;
     while (next != NULL && next->state != WMM_EXT_INUSE &&
            (char *)e->addr + e->npages * WMM_PAGE == (char *)next->addr) {
         wmm_extent_t *n2 = next->ar_next;
-        if (next->state == WMM_EXT_FREE_RETAINED)
+        if (next->state == WMM_EXT_FREE_RETAINED) {
             g_dirty_pages += next->npages;
+            g_active_bytes += next->npages * WMM_PAGE;
+        }
         e->npages += next->npages;
         ar_unlink(next);
         ext_node_put(next);
@@ -264,8 +279,10 @@ wmm_slab_t *wmm_phys_alloc_slab(szind_t i) {
     const wmm_bin_info_t *bi = &wmm_bin_info[i];
 
     wmm_slab_t *sl = (wmm_slab_t *)wmm_base_alloc(sizeof(wmm_slab_t));
-    if (sl == NULL)
+    if (sl == NULL) {
+        wmm_event_log(0xDB, NULL);   /* OOM:slab 头元数据耗尽 */
         return NULL;
+    }
 
     pthread_mutex_lock(&g_ext_lock);
     wmm_extent_t *e = extent_get(bi->slab_size >> WMM_LG_PAGE);
@@ -298,6 +315,7 @@ wmm_extent_t *wmm_phys_alloc_extent(size_t size) {
        绝不会溢出;挡在上限之外,真把窗口用满的走正常 OOM 路径。 */
     if (size > WMM_HEAP_VA_SIZE) {
         wmm_dprintf("OOM: request %zu MB exceeds heap window\n", size >> 20);
+        wmm_event_log(0xDB, NULL);   /* OOM:请求本身超出窗口上限 */
         if (g_opt.abort_oom)
             abort();
         return NULL;
@@ -360,8 +378,11 @@ static size_t purge_dirty_locked(void) {
             continue;
         e->state = WMM_EXT_FREE_RETAINED;
         g_dirty_pages -= e->npages;
+        g_active_bytes -= e->npages * WMM_PAGE;   /* 物理页还给内核 */
         purged += e->npages;
     }
+    if (purged != 0)
+        wmm_event_log(0xDC, NULL);   /* 执行了一次物理内存回收 */
     return purged;
 }
 

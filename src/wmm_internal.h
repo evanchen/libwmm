@@ -283,10 +283,16 @@ struct wmm_extent_s {
     wmm_slab_t   *slab;      /* 承载小对象 slab 时指向其头;大对象 NULL */
 };
 
-/* 物理层全局(wmm_boot.c 定义):地址序链头与脏页计数。
- * 均在 g_ext_lock 内变更;导出给测试做白盒核对。 */
+/* 物理层全局(wmm_boot.c 定义):地址序链头、脏页计数、已投入服务页数。
+ * 均在 g_ext_lock 内变更;导出给测试做白盒核对。
+ * g_active_bytes = 窗口内已映射且物理页未被 purge 收回的字节
+ * (即"扣除 FREE_RETAINED 之后的全部分配+空闲页"),live ≤ active
+ * 恒成立,差值就是快照里的 frag_bytes。增长点:window_map 成功
+ * mmap、purge 出的 RETAINED 块被重新切出(页重新投入服务,重新
+ * 吃缺页);缩减点:purge 对 FREE_DIRTY 的 madvise 成功。 */
 extern wmm_extent_t *g_ar_head;      /* 地址序链头(最低地址);NULL = 空 */
 extern size_t        g_dirty_pages;  /* FREE_DIRTY 状态的总页数(purge 的依据) */
+extern size_t        g_active_bytes; /* 已投入服务的窗口字节数(见上) */
 
 /* 物理层接口(wmm_phys.c)。
  * 锁:g_ext_lock 保护地址序链、窗口 bump、结点回收链、g_dirty_pages
@@ -331,6 +337,26 @@ int  wmm_bg_stop(void);
 /* fork 子进程专用:后台线程不在子进程里存在,把控制锁/条件变量
  * 重建为空闲状态。由 wmm_atfork_child 在分配器锁重建后调用。 */
 void wmm_bg_child_reset(void);
+
+/* ==================== 统计与事件(wmm_stats.c) ====================
+ *
+ * 快照:合并各 bin 的 live/ndalloc(锁内读取,与 OBS1 恒等式同源)、
+ * 大对象与 active 页数(ext 锁)、各线程的局部计数(遍历 g_threads,
+ * 允许瞬时偏差)。线程表超过 128 行时第 129+ 个线程合并进
+ * threads[127](聚合桶,tid 记 0)——直方图有限,聚合一个桶也比
+ * 丢数据好。锁序与 fork prepare 一致:各 bin → ext → threads,
+ * 不与任何既有持锁路径构成环。
+ *
+ * 事件环:定长环形缓冲(1024 条),多生产者(任意线程的错误路径 +
+ * 后台线程的回收事件)写、wmm_event_drain 单消费者。事件低频
+ * (错误/回收路径),一把互斥锁就够:多生产者无锁环要 per-slot
+ * 就绪标记与读端幂等逻辑,复杂度换不来可测收益。环满覆盖最旧
+ * ——排障场景下"新事件比旧事件值钱"。
+ */
+/* 写一条事件(类型/指针),自动带时间戳、线程号、涉事尺寸类
+ * (尽力反查,未知为 0)与两帧调用点。低频路径专用。 */
+void wmm_event_log(uint32_t type, void *ptr);
+extern pthread_mutex_t g_event_lock;  /* 事件环互斥锁;fork 子进程重建 */
 
 /* ==================== 线程缓存:无锁快路径 ====================
  *

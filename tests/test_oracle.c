@@ -11,7 +11,13 @@
  *      白盒直读 g_bins / g_large / g_tcache——逐对象计数只在对应
  *      锁内增减,单线程下读数即精确值。缓存里的对象仍计 live(见
  *      wmm_internal.h 的计数纪律),所以等式左边要扣掉缓存这一层,
- *      剩下的才是"应用持有"。
+ *      剩下的才是"应用持有"。字节版同一等式:模型按每次分配实测的
+ *      usable 累计字节,逐步对账"Σ live*reg_size + 大对象字节 −
+ *      缓存字节"——live_bytes 的累加链因此被钉在模型观测上,这是
+ *      OBS1 恒等式的逐步版;快照路径自身的对账(快照 vs 直读)在
+ *      检查点与终局各取一次——快照要 37 把锁加 5KB 清零,每步做会
+ *      把 oracle 时长拉长数倍,而计数/字节两条逐步等式已经读的是
+ *      快照所读的同一批全局变量。
  *
  * 每步另有两条深检查,每次只碰几十个字节,抓的却是最难查的错:
  *   - 存储指纹:分配后往头 8 字节写本代指纹,释放前校验原样还在。
@@ -93,6 +99,27 @@ static uint64_t total_live(void) {
     return sum + g_large.live;
 }
 
+/* Σ live 的字节口径:直读全局重算,应与快照的 live_bytes 逐字节一致 */
+static uint64_t live_bytes_direct(void) {
+    uint64_t sum = 0;
+    for (int i = 0; i < WMM_NBINS; i++)
+        sum += g_bins[i].live * (uint64_t)wmm_bin_info[i].reg_size;
+    return sum + g_large.live_bytes;
+}
+
+/* 线程缓存里的对象字节数。与 wmm_tcache_cached_total 同口径同锁,
+   另把每类缓存对象折算成字节——"含缓存"的 live_bytes 对账要扣掉
+   这一层(见文件头 ④) */
+static uint64_t cached_bytes_total(void) {
+    uint64_t sum = 0;
+    pthread_mutex_lock(&g_threads_lock);
+    for (wmm_tcache_t *t = g_threads; t != NULL; t = t->next)
+        for (int i = 0; i < WMM_NBINS; i++)
+            sum += t->bins[i].head * (uint64_t)wmm_bin_info[i].reg_size;
+    pthread_mutex_unlock(&g_threads_lock);
+    return sum;
+}
+
 enum { WMM_ORACLE_SLOTS = 512, WMM_ORACLE_STEPS = 1000000,
        WMM_ORACLE_CKPT = 100000 };
 
@@ -105,6 +132,11 @@ typedef struct {
     uint64_t       tag;
 } wmm_oref_t;
 static wmm_oref_t g_slot[WMM_ORACLE_SLOTS];
+
+/* 模型活对象的 usable 字节累计(仅 wmm 模式维护):每次分配/释放按
+   实测 usable 增减,realloc 记新旧 usable 之差。对账见文件头 ④ 的
+   字节版——它把分配器的 live_bytes 累加链逐步钉在模型观测上 */
+static int64_t g_model_bytes;
 
 #define WMM_TAG_MAGIC 0x4F5241434C455277ULL   /* "ORACLEw" 化身常数 */
 
@@ -169,6 +201,8 @@ static int op_alloc(const wmm_oops_t *o, size_t s, size_t req) {
     }
     g_slot[s].p   = p;
     g_slot[s].req = req;
+    if (o->can_count)
+        g_model_bytes += (int64_t)u;   /* 字节版模型:按实测 usable 记账 */
     return 1;
 }
 
@@ -182,6 +216,8 @@ static int op_free(const wmm_oops_t *o, size_t s) {
         memcpy(&tag, g_slot[s].p, sizeof tag);
         CHECK(tag == g_slot[s].tag);   /* 指纹被毁 = 存储重复交付/被踩 */
     }
+    if (o->can_count)
+        g_model_bytes -= (int64_t)o->usable(g_slot[s].p);   /* 释放前取值 */
     o->free(g_slot[s].p);
     g_slot[s].p = NULL;
     return -1;
@@ -193,8 +229,10 @@ static int op_realloc(const wmm_oops_t *o, size_t s, size_t nreq) {
     size_t         oreq = g_slot[s].req;
     size_t         old_u = 0;
 
-    if (o->deep) {
+    if (o->deep || o->can_count)
         old_u = o->usable(old);   /* realloc 可能搬移,旧块信息先取 */
+
+    if (o->deep) {
         size_t fill = oreq < 128 ? oreq : 128;
         for (size_t k = 0; k < fill; k++)
             old[k] = pat_byte(g_slot[s].tag, k);
@@ -230,12 +268,25 @@ static int op_realloc(const wmm_oops_t *o, size_t s, size_t nreq) {
     }
     g_slot[s].p   = np;
     g_slot[s].req = nreq;
+    if (o->can_count)
+        g_model_bytes += (int64_t)u - (int64_t)old_u;
     return 0;
+}
+
+/* OBS1 快照钩子:取一次快照,与白盒直读逐项对账。快照口径与直读同为
+   "含线程缓存"(见 wmm_internal.h),两侧一致,无需扣缓存层 */
+static void obs1_snapshot_check(void) {
+    wmm_stats_t st;
+    CHECK(wmm_stats_snapshot(&st) == 0);
+    CHECK(st.live_bytes == live_bytes_direct());
+    CHECK(st.live_objects == total_live());
+    CHECK(st.active_bytes >= st.live_bytes);                  /* 口径不变式 */
+    CHECK(st.frag_bytes == st.active_bytes - st.live_bytes);
 }
 
 /* 收敛检查:全量 free → 全量 alloc → 全量 free,三段各自对账 */
 static void run_checkpoint(const wmm_oops_t *o, size_t step,
-                           long *n_live, uint64_t live0) {
+                           long *n_live, uint64_t live0, uint64_t live_bytes0) {
     int fail0 = g_fail;
 
     for (size_t s = 0; s < WMM_ORACLE_SLOTS; s++)
@@ -244,6 +295,8 @@ static void run_checkpoint(const wmm_oops_t *o, size_t step,
     if (o->can_count) {
         wmm_tcache_flush_all();            /* 缓存层剥掉,才谈得上归零 */
         CHECK(total_live() == live0);      /* 回到进场基线 = 无泄漏 */
+        CHECK(live_bytes_direct() == live_bytes0);   /* 字节口径同归 */
+        CHECK(g_model_bytes == 0);         /* 模型自身也要对得上 */
     }
 
     /* 无条件逐槽分配:抽取次数与状态无关,两引擎的检查点序列对齐 */
@@ -252,6 +305,10 @@ static void run_checkpoint(const wmm_oops_t *o, size_t step,
     if (o->can_count) {
         wmm_tcache_flush_all();
         CHECK(total_live() - live0 == WMM_ORACLE_SLOTS);   /* 拉满恰为槽数 */
+        /* 字节版:缓存已空,直接对模型累计。快照钩子取在满槽世界——
+           这是 live_bytes 最大、尺寸类分布最广的采样点 */
+        CHECK(live_bytes_direct() - live_bytes0 == (uint64_t)g_model_bytes);
+        obs1_snapshot_check();
     }
 
     for (size_t s = 0; s < WMM_ORACLE_SLOTS; s++)
@@ -283,6 +340,7 @@ static void run_checkpoint(const wmm_oops_t *o, size_t step,
 static void run_mode(const wmm_oops_t *o) {
     g_rng = 0x9E3779B97F4A7C15ULL;   /* 两种模式同种子 = 同一条序列 */
     memset(g_slot, 0, sizeof g_slot);
+    g_model_bytes = 0;
 
     /* 进场先刷空本线程缓存:④ 的基线 live0 里若混着缓存对象,
        "Σ live − 缓存"的对账从第一步起就偏。刷出只把对象从缓存
@@ -294,6 +352,7 @@ static void run_mode(const wmm_oops_t *o) {
        api/phys 之后,它们留下的计数史不归本测试管。绝对零只允许
        断在测试自己强制出来的状态上——那正是收敛检查在断的东西 */
     uint64_t live0 = o->can_count ? total_live() : 0;
+    uint64_t live_bytes0 = o->can_count ? live_bytes_direct() : 0;
     long     n_live = 0, peak = 0;
     uint64_t n_a = 0, n_f = 0, n_r = 0;
 
@@ -340,14 +399,18 @@ static void run_mode(const wmm_oops_t *o) {
             }
         }
 
-        if (o->can_count)                /* ④ 逐步对账:扣掉缓存层 */
+        if (o->can_count) {              /* ④ 逐步对账:扣掉缓存层 */
             CHECK(total_live() - live0 - wmm_tcache_cached_total()
                       == (uint64_t)n_live);
+            /* 字节版同一对账:live_bytes 的累加链逐步钉在模型实测上 */
+            CHECK(live_bytes_direct() - live_bytes0 - cached_bytes_total()
+                      == (uint64_t)g_model_bytes);
+        }
         if (n_live > peak)
             peak = n_live;
 
         if (step % WMM_ORACLE_CKPT == 0)
-            run_checkpoint(o, step, &n_live, live0);
+            run_checkpoint(o, step, &n_live, live0, live_bytes0);
     }
 
     /* 终局:全量释放后,世界必须与进场时一样空 */
@@ -358,6 +421,9 @@ static void run_mode(const wmm_oops_t *o) {
     if (o->can_count) {
         wmm_tcache_flush_all();
         CHECK(total_live() == live0);
+        CHECK(live_bytes_direct() == live_bytes0);   /* 字节口径同归基线 */
+        CHECK(g_model_bytes == 0);
+        obs1_snapshot_check();           /* 终局快照:与直读一致 */
     }
 
     printf("  %s mode: %d steps, %llu allocs / %llu frees / %llu reallocs, "
