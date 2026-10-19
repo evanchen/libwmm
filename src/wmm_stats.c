@@ -66,7 +66,20 @@ void wmm_event_log(uint32_t type, void *ptr) {
     }
 
     ev.pc0 = (uintptr_t)__builtin_return_address(0);   /* 事件点的调用者 */
+    /* 再上一帧。GCC 对非零参数无条件发 -Wframe-address:编译器不能
+       假设帧链一定可走,读上一帧可能踩空。本库构建的两套变体都强制
+       -fno-omit-frame-pointer,事件又只从库内与同标志编译的测试里
+       写,这一帧必然存在——所以在此把警告收窄成"已知安全的特例",
+       而不是改用手工帧遍历:后者要把 x86-64 的帧布局硬编码进来,
+       反而比编译器内建更脆。 */
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wframe-address"
+#endif
     ev.pc1 = (uintptr_t)__builtin_return_address(1);   /* 再上一帧 */
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
     pthread_mutex_lock(&g_event_lock);
     g_event_ring[g_event_tail] = ev;
