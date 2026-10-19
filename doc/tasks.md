@@ -886,6 +886,43 @@ void wmm_phys_purge_if_needed(void) {
 - [ ] PHY2:分配 1GB 再全 free,后台 2 秒内 `active_bytes`(M11 打点)回落、RSS 下降;
 - [ ] 线程生命周期:`wmm_ctl("bg.enable")` 启停正确,退出时 join。
 
+### 实现勘误(M10 落地时记)
+- **后台线程默认不启动**:boot 不建线程,首次 `wmm_ctl("bg.enable")`
+  才 `pthread_create`;`bg.disable` 置 stop 标志并 broadcast,
+  `pthread_join` 返回后线程确已退出。周期等待用 `CLOCK_REALTIME`
+  绝对时刻 + `pthread_cond_timedwait`,内层 while 吸收虚假唤醒且
+  不重置周期;1s 粒度下时钟跳变最多让某轮早到/晚到一次,不值得
+  为此引入 condattr 的单调时钟设置;
+- **purge 的遍历与 madvise 都在 `g_ext_lock` 内**:单 arena 下把
+  "移出链→解锁→批量回收→挂回"做对需要暂存数组与重挂逻辑,复杂度
+  换来的并发收益在千级 extent 上不成立;madvise 失败(返回非 0)
+  保持 FREE_DIRTY,下一轮重试,宁可多试不谎报;
+- **跨状态合并记账(引入 RETAINED 后的新不变量)**:释放的 DIRTY
+  块与 RETAINED 邻居合并时,存活结点状态归一到 FREE_DIRTY,被并
+  的 RETAINED 页数补回 `g_dirty_pages`(下轮重复 madvise 是空操作);
+  否则状态标签与计数脱节,`ar_check` 的页数守恒立刻失败,漏记的
+  页也永远逃过 purge;
+- **fork**:`prepare` 不拿 `g_bg_lock`——后台线程对分配器共享结构
+  的触碰全部在 `g_ext_lock` 内,已被冻结;`atfork child` 调
+  `wmm_bg_child_reset` 重建控制锁/条件变量并清零状态(子进程里
+  没有该线程,join 继承来的 tid 不可移植);
+- **extent 复用改两趟扫描**:先只在 FREE_DIRTY 里 first-fit(物理页
+  还在,复用零系统调用),没有再接受 FREE_RETAINED(复用要吃缺页)。
+  没有 purge 过的进程第一趟就是全集,行为与单趟一致;
+- **ctl 接线**:`purge` 同步回收;`bg.enable/disable` 启停;
+  `config.madvise_mode` 取 int 变参,只接受 MADV_DONTNEED/
+  MADV_FREE(否则 EINVAL),只影响之后的 purge。其余命令仍 ENOSYS。
+  测试只钉参数校验与模式切换:MADV_FREE 的物理回收效果依赖内核
+  版本,不做断言;后台线程随进程退出终止,显式 shutdown 走
+  bg.disable(join),不注册 atexit;
+- **自测落地**:PHY2 用 256×4MB=1GB 每页写过后同步 purge,断言
+  dirty 归零、页数守恒转 RETAINED、RSS 实测回落 ≥512MB、RETAINED
+  复用零新映射;另补"跨状态合并"白盒用例。后台线程用 32×4MB:
+  未启动等 1.3s 脏页不动 → enable(重复调用幂等)→ 2 秒内归零 →
+  disable(重复调用幂等)→ 停后再攒 128MB 等 1.3s 不动 → 再启清尾。
+  任务书的 `active_bytes` 断言待统计打点后补,M10 阶段以
+  `g_dirty_pages` + RSS 替代。
+
 ---
 
 ## 13. M11 统计与事件 `src/wmm_stats.c`

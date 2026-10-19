@@ -9,7 +9,12 @@
  *   结构不变量:地址序链严格递增、不重叠、双向指针互指、
  *         g_dirty_pages == Σ FREE 页数(每个检查点跑一遍);
  *   重放:混合压力序列跑两遍(同种子同序列),第二遍 g_heap_cur
- *         一页不前进 = 全部命中复用,碎片被合并吸收。
+ *         一页不前进 = 全部命中复用,碎片被合并吸收;
+ *   purge:1GB 脏页同步回收 → dirty 归零、页数守恒地转
+ *         RETAINED、RSS 实测回落、RETAINED 复用零新映射;
+ *   跨状态合并:RETAINED 邻居并进 DIRTY 块,整块重新按 DIRTY 记账;
+ *   后台线程:未启动不动、启用后 2 秒内按阈值回收、停后不再动,
+ *         重复启停幂等。
  *
  * 确定性策略:api/slab 用例留下的空闲 extent 会让 first-fit 落点
  * 不可预测,所以每个子测试先 drain_free_pool——每次按"当前最大
@@ -29,6 +34,8 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <time.h>
+#include <sys/mman.h>
 
 static int g_fail;
 
@@ -291,6 +298,224 @@ static void check_replay(void) {
     ar_check();
 }
 
+/* ==================== purge 与后台线程 ==================== */
+
+static void sleep_ms(long ms) {
+    struct timespec ts;
+    ts.tv_sec  = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000L;
+    (void)nanosleep(&ts, NULL);
+}
+
+/* RSS(KB):statm 的 resident 字段以页计。返回 0 = 读失败,调用点的
+ * 断言会显式失败,而不是让 RSS 检查静默失去意义。 */
+static size_t rss_kb(void) {
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (f == NULL)
+        return 0;
+    long total = 0, resident = 0;
+    int  n     = fscanf(f, "%ld %ld", &total, &resident);
+    fclose(f);
+    if (n != 2 || resident < 0)
+        return 0;
+    return (size_t)resident * (WMM_PAGE / 1024);
+}
+
+/* 启用后台线程后 g_dirty_pages 有第二个写者,白盒读数要拿锁 */
+static size_t dirty_pages_locked(void) {
+    pthread_mutex_lock(&g_ext_lock);
+    size_t n = g_dirty_pages;
+    pthread_mutex_unlock(&g_ext_lock);
+    return n;
+}
+
+/* ---- PHY2:同步 purge 把脏页还给内核 ----
+ * 三件事分别证明:账本(dirty 归零、页数守恒转 RETAINED)、物理
+ * 事实(RSS 实测回落,不是只改状态),以及回收后的页仍可零系统
+ * 调用复用。1GB 的量按任务书取;断言只依赖"远大于 dirty_max",
+ * 测试机内存紧张时改 NB 即可。 */
+static void check_purge(void) {
+    drain_free_pool();
+
+    enum { NB = 256 };
+    static unsigned char *blk[NB];
+    const size_t BSZ = 4u << 20;              /* 256 × 4MB = 1GB */
+
+    for (int k = 0; k < NB; k++) {
+        blk[k] = wmm_alloc(BSZ);
+        CHECK(blk[k] != NULL);
+        if (k > 0)
+            CHECK(blk[k] == blk[k - 1] + BSZ);   /* drain 后只能窗口 bump */
+    }
+    /* 触碰每一页:没写过的匿名页驻留在共享零页上,没有 RSS 可回收,
+       RSS 断言就失去意义 */
+    for (int k = 0; k < NB; k++)
+        memset(blk[k], 0xA5, BSZ);
+
+    for (int k = 0; k < NB; k++)
+        wmm_free(blk[k]);
+
+    size_t dirty0 = g_dirty_pages;
+    CHECK(dirty0 * WMM_PAGE > g_opt.dirty_max);
+
+    size_t rss0 = rss_kb();
+    CHECK(rss0 != 0);
+
+    CHECK(wmm_ctl("purge") == 0);
+
+    CHECK(g_dirty_pages == 0);
+    size_t retained = 0;
+    for (wmm_extent_t *e = g_ar_head; e != NULL; e = e->ar_next) {
+        CHECK(e->state != WMM_EXT_FREE_DIRTY);   /* 全部离开 DIRTY */
+        if (e->state == WMM_EXT_FREE_RETAINED)
+            retained += e->npages;
+    }
+    CHECK(retained == dirty0);    /* 页数守恒:一张不少地转 RETAINED */
+    ar_check();
+
+    /* RSS 至少回落一半(512MB):进程其余活动会带来噪声,留足余量 */
+    size_t rss1 = rss_kb();
+    CHECK(rss1 != 0);
+    CHECK(rss1 + (512u << 10) <= rss0);
+
+    /* RETAINED 复用:整块 1GB 恰好命中最低地址,零新映射;RETAINED
+       本来就不在 dirty 账上,复用这一步也不得改变计数 */
+    void *cur_pre = g_heap_cur;
+    void *again = wmm_alloc((size_t)NB * BSZ);
+    CHECK(again == blk[0]);
+    CHECK(g_heap_cur == cur_pre);
+    CHECK(g_dirty_pages == 0);
+    wmm_free(again);
+    CHECK(g_dirty_pages == dirty0);   /* 重新释放 = 重新计入脏页 */
+    ar_check();
+
+    /* madvise 方式开关:非法值 EINVAL,合法值只切模式。MADV_FREE 的
+       物理效果(立即回落与否)由内核版本决定,不在测试里钉;切完
+       恢复默认,后续用例的 RSS 断言依赖 DONTNEED */
+    CHECK(wmm_ctl("config.madvise_mode", -1) == -1);
+    CHECK(errno == EINVAL);
+    CHECK(wmm_ctl("config.madvise_mode", MADV_FREE) == 0);
+    CHECK(g_opt.madvise_mode == MADV_FREE);
+    CHECK(wmm_ctl("config.madvise_mode", MADV_DONTNEED) == 0);
+    CHECK(g_opt.madvise_mode == MADV_DONTNEED);
+}
+
+/* ---- 跨状态合并:RETAINED 邻居并进 DIRTY 块必须重新记账 ----
+ * 状态标签与 dirty 计数必须同步;漏记的页既让页数守恒断言失效,
+ * 也会永远逃过后续 purge。 */
+static void check_merge_across_states(void) {
+    drain_free_pool();
+
+    unsigned char *A = wmm_alloc(4 * WMM_PAGE);
+    unsigned char *B = wmm_alloc(4 * WMM_PAGE);
+    unsigned char *C = wmm_alloc(4 * WMM_PAGE);
+    CHECK(A != NULL && B != NULL && C != NULL);
+    CHECK(B == A + 4 * WMM_PAGE && C == B + 4 * WMM_PAGE);
+
+    wmm_free(A);
+    wmm_free(C);
+    CHECK(g_dirty_pages == 8);
+    CHECK(wmm_ctl("purge") == 0);
+    CHECK(g_dirty_pages == 0);        /* A、C 转 RETAINED,B 仍 INUSE */
+
+    /* B 释放:两侧都是 RETAINED,合并后整块必须改标 DIRTY 且
+       12 页全部回到 dirty 计数 */
+    wmm_free(B);
+    CHECK(g_dirty_pages == 12);
+
+    size_t        nfree = 0;
+    wmm_extent_t *only  = NULL;
+    for (wmm_extent_t *e = g_ar_head; e != NULL; e = e->ar_next)
+        if (e->state != WMM_EXT_INUSE) {
+            nfree++;
+            only = e;
+        }
+    CHECK(nfree == 1);
+    CHECK(only != NULL && only->addr == A && only->npages == 12);
+    CHECK(only != NULL && only->state == WMM_EXT_FREE_DIRTY);
+    ar_check();
+
+    /* 曾 RETAINED 的 8 页被重复 madvise 一次(空操作),整块转 RETAINED */
+    CHECK(wmm_ctl("purge") == 0);
+    CHECK(g_dirty_pages == 0);
+    ar_check();
+}
+
+/* ---- 后台线程:启停幂等 + 阈值触发 + 停后不再动 ----
+ * 时间预算:两段"等一个巡检周期"各 1.3s,回收轮询上限 2s。
+ * 128MB 足以越过默认 8MB 阈值,不必像 PHY2 上 1GB。 */
+static void check_bg_lifecycle(void) {
+    drain_free_pool();
+
+    enum { NB = 32 };
+    static unsigned char *blk[NB];
+    const size_t BSZ = 4u << 20;              /* 32 × 4MB = 128MB */
+
+    /* ---- 停用状态:脏页攒着不动 ---- */
+    for (int k = 0; k < NB; k++) {
+        blk[k] = wmm_alloc(BSZ);
+        CHECK(blk[k] != NULL);
+        memset(blk[k], 0x5A, BSZ);
+    }
+    for (int k = 0; k < NB; k++)
+        wmm_free(blk[k]);
+
+    size_t dirty0 = g_dirty_pages;
+    CHECK(dirty0 * WMM_PAGE > g_opt.dirty_max);
+
+    sleep_ms(1300);                        /* > 一个巡检周期 */
+    CHECK(dirty_pages_locked() == dirty0); /* 没启动就不许自动回收 */
+
+    CHECK(wmm_ctl("bg.disable") == 0);     /* 未运行:停 = 无操作 */
+
+    /* ---- 启用:2 秒内按阈值回收 ---- */
+    size_t rss0 = rss_kb();
+    CHECK(rss0 != 0);
+    CHECK(wmm_ctl("bg.enable") == 0);
+    CHECK(wmm_ctl("bg.enable") == 0);      /* 重复启动幂等 */
+
+    int polls = 0;
+    while (dirty_pages_locked() != 0 && polls < 40) {
+        sleep_ms(50);
+        polls++;
+    }
+    CHECK(polls < 40);                     /* 2 秒内必须回收完 */
+    CHECK(dirty_pages_locked() == 0);
+
+    size_t rss1 = rss_kb();
+    CHECK(rss1 != 0);
+    CHECK(rss1 + (32u << 10) <= rss0);     /* 128MB 脏页至少回落 32MB */
+
+    /* ---- 停止:返回即 join 完成;再停幂等 ---- */
+    CHECK(wmm_ctl("bg.disable") == 0);
+    CHECK(wmm_ctl("bg.disable") == 0);
+
+    /* 停后不再自动回收:再攒 128MB,等一个周期应原样 */
+    for (int k = 0; k < NB; k++) {
+        blk[k] = wmm_alloc(BSZ);
+        CHECK(blk[k] != NULL);
+    }
+    for (int k = 0; k < NB; k++)
+        wmm_free(blk[k]);
+
+    size_t dirty1 = dirty_pages_locked();
+    CHECK(dirty1 * WMM_PAGE > g_opt.dirty_max);
+    sleep_ms(1300);
+    CHECK(dirty_pages_locked() == dirty1);
+
+    /* 收尾:再启一次清掉脏页并停线程,后续组看到默认(未运行)状态 */
+    CHECK(wmm_ctl("bg.enable") == 0);
+    polls = 0;
+    while (dirty_pages_locked() != 0 && polls < 40) {
+        sleep_ms(50);
+        polls++;
+    }
+    CHECK(dirty_pages_locked() == 0);
+    CHECK(wmm_ctl("bg.disable") == 0);
+
+    ar_check();
+}
+
 int test_phys(void) {
     g_fail = 0;
     wmm_boot();
@@ -308,6 +533,9 @@ int test_phys(void) {
     check_split();
     check_slab_absorb();
     check_replay();
+    check_purge();
+    check_merge_across_states();
+    check_bg_lifecycle();
 
     g_tcache->enabled = true;   /* 后续组(oracle/stress)要用缓存 */
 

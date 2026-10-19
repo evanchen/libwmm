@@ -249,9 +249,11 @@ unsigned wmm_bin_fill(wmm_bin_t *b, szind_t i, unsigned want, void **out);
  * 窗口因此不会因"各处散落的小空闲块"而被迫无限增长。
  *
  * 状态三态:INUSE(服务中:承载 slab 或大对象)/ FREE_DIRTY(空闲,
- * 物理页仍在映射里,复用零系统调用)/ FREE_RETAINED(空闲且物理页
- * 已 madvise 归还内核,复用要吃缺页;由 purge 产生,当前版本不做
- * 这条转换,枚举先定义齐是为了结构不用再动)。
+ * 物理页仍在映射里,复用零系统调用)/ FREE_RETAINED(空闲,物理页
+ * 已被 purge 的 madvise 交还内核,复用仍走同一条 first-fit,只是
+ * 第一次访问要吃缺页,不需要新 mmap)。
+ * 两种空闲状态合并时整块归 DIRTY:RETAINED 邻居的页数补回 dirty
+ * 计数(见 wmm_phys.c extent_release)——状态标签与计数必须一致。
  *
  * 为什么不另挂一条独立的 free 链:first-fit 直接扫地址序链过滤
  * FREE 即可。jemalloc 用按大小分级的搜索树,那是多 arena、数十万
@@ -304,6 +306,31 @@ wmm_extent_t *wmm_phys_alloc_extent(size_t size);
 void          wmm_phys_free_extent(wmm_extent_t *ext);
 /* 大对象释放:更新 g_large 计数、页入空闲、页表清零、向两侧合并、
  * 结点壳入回收链。 */
+
+/* ==================== purge 与后台线程 ====================
+ *
+ * purge = 把 FREE_DIRTY 的物理页经 madvise 交还内核(方式由
+ * g_opt.madvise_mode 定),状态转 FREE_RETAINED。页面仍留在映射里,
+ * 复用它走普通 first-fit,不产生新 mmap。
+ *   purge_now        无视阈值,立即扫全部 DIRTY(ctl "purge" 用);
+ *   purge_if_needed  后台线程每 1s 调一次:脏页总字节超过
+ *                    g_opt.dirty_max 才扫。
+ * madvise 失败保持 DIRTY,下一轮再试。MADV_FREE 模式下内核延迟
+ * 回收,状态语义是"内核可随时收回",不承诺内容已丢。
+ *
+ * 后台线程默认不启动(boot 不建线程),wmm_ctl("bg.enable"/
+ * "bg.disable") 显式启停;stop 会 join,返回后线程确实已退出。
+ * 启停必须由同一个控制线程发起(与 config 命令同纪律),不做并发
+ * 启停的引用计数。创建失败返回 -1/errno=rc:没有后台线程只是不
+ * 自动回收,分配器照常工作,不属于启动期契约设施。
+ */
+void wmm_phys_purge_if_needed(void);
+void wmm_phys_purge_now(void);
+int  wmm_bg_start(void);
+int  wmm_bg_stop(void);
+/* fork 子进程专用:后台线程不在子进程里存在,把控制锁/条件变量
+ * 重建为空闲状态。由 wmm_atfork_child 在分配器锁重建后调用。 */
+void wmm_bg_child_reset(void);
 
 /* ==================== 线程缓存:无锁快路径 ====================
  *

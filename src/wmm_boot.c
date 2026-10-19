@@ -228,6 +228,11 @@ void wmm_atfork_child(void) {
     (void)pthread_mutex_init(&g_threads_lock, NULL);
     (void)pthread_mutex_init(&g_base_lock, NULL);
 
+    /* fork 只复制调用线程,后台线程在子进程里不存在;继承来的
+       控制状态可能是"运行中"或"锁着"。重建为空闲,否则子进程
+       调 bg.disable 会去 join 一个不存在的 tid */
+    wmm_bg_child_reset();
+
     /* 锁全部重建之后才能动 bin:死线程的缓存要刷回 bin,这是子进程
        里唯一会碰分配器结构的钩子动作。此刻独占执行 */
     wmm_tcache_child_cleanup();

@@ -177,7 +177,9 @@ void wmm_atfork_child(void);
  *   gc                        强制全部线程的缓存收缩
  *   bg.enable/disable         启动/停止后台线程(回收+聚合)
  *   config.lg_page            查询页大小(2^N)
- *   config.madvise_mode       切换内核回收方式(DONTNEED/FREE)
+ *   config.madvise_mode       切换内核回收方式,变参为 int
+ *                             (MADV_DONTNEED / MADV_FREE),只影响
+ *                             之后的 purge;非法值返回 -1/EINVAL
  *   config.verbose            调试输出开关
  * 返回 0 成功;未知命令返回 -1 并置 errno=EINVAL;
  * 命令已登记但功能未实现返回 -1 并置 errno=ENOSYS。
