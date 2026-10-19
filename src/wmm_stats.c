@@ -132,15 +132,21 @@ int wmm_stats_snapshot(wmm_stats_t *st) {
     }
 
     /* 2) 大对象与 active 页数:同一把 ext 锁内读取,与"live 恒等式"
-       共享同一个事实来源。 */
+       共享同一个事实来源。锁内只读一次到局部变量,cls[] 与两个汇总
+       共用同一份读数:若解锁后再读一次 g_large,cls[36] 和
+       live_objects 就取自两个瞬间,并发分配/释放大对象时恒等式
+       "Σ cls[i].live == live_objects" 会破——快照的每个字段可以各取
+       各的瞬间,但被同一个恒等式绑在一起的字段必须同源。 */
     pthread_mutex_lock(&g_ext_lock);
-    st->cls[WMM_NBINS].live    = g_large.live;
+    uint64_t large_live  = g_large.live;
+    uint64_t large_bytes = g_large.live_bytes;
+    st->cls[WMM_NBINS].live    = large_live;
     st->cls[WMM_NBINS].ndalloc = g_large.ndalloc;
     st->cls[WMM_NBINS].size    = 0;                 /* 大对象大小不一 */
     st->active_bytes           = g_active_bytes;
     pthread_mutex_unlock(&g_ext_lock);
-    live_bytes += g_large.live_bytes;
-    live_objs  += g_large.live;
+    live_bytes += large_bytes;
+    live_objs  += large_live;
 
     st->live_bytes   = live_bytes;
     st->live_objects = live_objs;
