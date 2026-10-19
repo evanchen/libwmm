@@ -235,6 +235,10 @@ void *wmm_bin_alloc(wmm_bin_t *b);
 bool  wmm_bin_dalloc(wmm_bin_t *b, wmm_slab_t *sl, void *p);
 /* 归还对象并驱动状态转移。返回真 = 该 slab 已全空并已从 bin 摘除,
  * 调用方须归还其物理页;curslabs 已减,bin 不再引用它 */
+unsigned wmm_bin_fill(wmm_bin_t *b, szind_t i, unsigned want, void **out);
+/* tcache 批量填充:一次持 bin 锁连弹 want 个写入 out,返回实收数
+ * (小于 want = 窗口/元数据耗尽)。i 是 b 的下标:bin 结构不记录
+ * 自身类号,没有新 slab 可取时要用它向物理层要页 */
 
 /* ==================== extent 与物理层 ====================
  *
@@ -346,6 +350,10 @@ struct wmm_tcache_s {
     uint32_t      tid;          /* 线程号缓存,事件与快照直接用 */
     bool          enabled;      /* 本线程缓存开关;关掉则直走 bin——
                                    给"怀疑缓存导致问题"的调试留后门 */
+    size_t        map_size;     /* 整块映射的字节数 = 本结构 + 各栈数组。
+                                   线程退出按创建时的长度 munmap;重算
+                                   会把"容量常量将来可变"变成一处静默
+                                   地雷 */
     /* ---- 线程局部计数(唯一写者 = 本线程,非原子) ---- */
     uint64_t      t_alloc_bytes;   /* 累计分配字节(按可用大小计) */
     uint64_t      t_free_bytes; /* 累计释放字节 */
@@ -371,6 +379,40 @@ struct wmm_tcache_s {
 extern _Thread_local wmm_tcache_t *g_tcache;  /* 惰性创建;NULL = 本线程尚未建 */
 extern wmm_tcache_t *g_threads;               /* 线程注册表链头 */
 extern pthread_mutex_t g_threads_lock;
+extern pthread_key_t   g_tcache_key;          /* 线程退出析构键,wmm_boot 注册一次;
+                                                 静态哨兵 -1 = 尚未注册:boot 注册
+                                                 失败即 abort,分配路径再见到 -1
+                                                 按"没先 boot 或内存损坏"同样致命 */
+
+/* ncached_max 公式 clamp(2*nregs, 20, 200) 的两端(实现见 wmm_tcache.c):
+ * 下界保证小类一次填充的批量粒度足够摊销锁开销;上界把单线程缓存的
+ * 无界膨胀钉死——线程多时,每线程的缓存都是实数。 */
+#define WMM_TCACHE_NCACHED_MIN 20u
+#define WMM_TCACHE_NCACHED_MAX 200u
+
+/* 线程缓存操作(wmm_tcache.c)。同步模型:快路径只碰本线程的块,
+ * 零锁零原子;填充/刷出持目标 bin 锁批量搬运;注册表增删持
+ * g_threads_lock。缓存中的对象仍计入所属 bin 的 live(见 wmm_bin_t
+ * 的计数纪律),所以任何时刻 Σ live = 应用持有 + 全部线程缓存。 */
+void     wmm_tcache_fill(szind_t i, unsigned want);
+/* 仅在 head==0 时调用:一次持 bin 锁从 arena 搬 want 个进栈,
+ * 实收数封顶 ncached_max - head */
+void     wmm_tcache_flush(szind_t i, unsigned n);
+/* 从栈底(最冷端)刷 n 个回 bin;退休 slab 放锁后交物理层 */
+void     wmm_tcache_flush_all(void);
+/* 本线程全类刷空、缓存块保留:收敛核对与线程退出前的共用步骤 */
+void    *wmm_tcache_alloc(szind_t i);
+void     wmm_tcache_free(szind_t i, void *p);
+/* 快路径弹栈/压栈。alloc 返回 NULL = 缓存空,调用方去填充;
+ * free 在缓存满时先部分刷出再压,保住热对象的 LIFO 局部性 */
+uint64_t wmm_tcache_cached_total(void);
+/* Σ 全部线程缓存的对象数。heads 由各线程无锁写,本函数只在全体
+ * 静止时刻(屏障汇合、单线程)给出精确值;锁保护的是注册表链 */
+void     wmm_tcache_child_cleanup(void);
+/* fork 子进程侧:死线程节点刷空缓存后 munmap,注册表只留调用线程。
+ * 由 wmm_atfork_child 在所有锁重建后调用 */
+void     wmm_tcache_thread_destructor(void *val);
+/* pthread 键析构;显式 exit 之后再触发是空操作(幂等) */
 
 /* ==================== 全局状态(初始化时定死) ==================== */
 

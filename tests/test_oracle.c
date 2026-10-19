@@ -7,10 +7,11 @@
  *   ② usable_size(p) ≥ 当初请求;
  *   ③ 释放只打集合里的指针:模型 free 后立即摘除,双释放没有
  *      "合法发生"的通道;释放侧的计数错误(少减一次)由 ④ 当场揪出;
- *   ④ Σ 各 bin live + 大对象 live == 模型活指针数。白盒直读
- *      g_bins / g_large——逐对象计数只在对应锁内增减,单线程下
- *      读数即精确值;进线程缓存后该语义不变(缓存中的对象仍计
- *      live,见 wmm_internal.h 的计数纪律)。
+ *   ④ Σ 各 bin live + 大对象 live − Σ 线程缓存 head == 模型活指针数。
+ *      白盒直读 g_bins / g_large / g_tcache——逐对象计数只在对应
+ *      锁内增减,单线程下读数即精确值。缓存里的对象仍计 live(见
+ *      wmm_internal.h 的计数纪律),所以等式左边要扣掉缓存这一层,
+ *      剩下的才是"应用持有"。
  *
  * 每步另有两条深检查,每次只碰几十个字节,抓的却是最难查的错:
  *   - 存储指纹:分配后往头 8 字节写本代指纹,释放前校验原样还在。
@@ -21,7 +22,9 @@
  *
  * 每 10 万步一次收敛检查:全量 free → Σ live 必须回到进场基线
  * (无泄漏语义);全量 alloc → Σ live 应恰好等于槽数;再全量 free
- * 复位,下一个十万步从空世界起步,波峰波谷反复压。
+ * 复位,下一个十万步从空世界起步,波峰波谷反复压。核对前先刷空
+ * 本线程缓存——缓存对象会把 Σ live 抬在基线上方,而收敛检查问的
+ * 恰是"应用持有的部分归零没有"。
  *
  * glibc 对照模式:同一条随机序列(同种子、同代码路径 = 同一串随机
  * 数)再喂给真 malloc 家族跑一遍,验证的是行为兼容——同样的一百万
@@ -238,20 +241,26 @@ static void run_checkpoint(const wmm_oops_t *o, size_t step,
     for (size_t s = 0; s < WMM_ORACLE_SLOTS; s++)
         if (g_slot[s].p != NULL)
             *n_live += op_free(o, s);
-    if (o->can_count)
+    if (o->can_count) {
+        wmm_tcache_flush_all();            /* 缓存层剥掉,才谈得上归零 */
         CHECK(total_live() == live0);      /* 回到进场基线 = 无泄漏 */
+    }
 
     /* 无条件逐槽分配:抽取次数与状态无关,两引擎的检查点序列对齐 */
     for (size_t s = 0; s < WMM_ORACLE_SLOTS; s++)
         *n_live += op_alloc(o, s, gen_size());
-    if (o->can_count)
+    if (o->can_count) {
+        wmm_tcache_flush_all();
         CHECK(total_live() - live0 == WMM_ORACLE_SLOTS);   /* 拉满恰为槽数 */
+    }
 
     for (size_t s = 0; s < WMM_ORACLE_SLOTS; s++)
         if (g_slot[s].p != NULL)
             *n_live += op_free(o, s);
-    if (o->can_count)
+    if (o->can_count) {
+        wmm_tcache_flush_all();
         CHECK(total_live() == live0);      /* 复位:下一循环空世界起步 */
+    }
 
     if (o->can_count && g_fail == fail0)
         printf("  checkpoint at step %zu: free 0 / full %d / free 0, OK\n",
@@ -274,6 +283,12 @@ static void run_checkpoint(const wmm_oops_t *o, size_t step,
 static void run_mode(const wmm_oops_t *o) {
     g_rng = 0x9E3779B97F4A7C15ULL;   /* 两种模式同种子 = 同一条序列 */
     memset(g_slot, 0, sizeof g_slot);
+
+    /* 进场先刷空本线程缓存:④ 的基线 live0 里若混着缓存对象,
+       "Σ live − 缓存"的对账从第一步起就偏。刷出只把对象从缓存
+       搬回 slab,不创造也不销毁;glibc 模式无缓存,不会走到这里 */
+    if (o->can_count)
+        wmm_tcache_flush_all();
 
     /* ④ 的对账基线取进场快照而非绝对零:本文件跑在 boot/slab/
        api/phys 之后,它们留下的计数史不归本测试管。绝对零只允许
@@ -325,8 +340,9 @@ static void run_mode(const wmm_oops_t *o) {
             }
         }
 
-        if (o->can_count)                /* ④ 逐步对账 */
-            CHECK(total_live() - live0 == (uint64_t)n_live);
+        if (o->can_count)                /* ④ 逐步对账:扣掉缓存层 */
+            CHECK(total_live() - live0 - wmm_tcache_cached_total()
+                      == (uint64_t)n_live);
         if (n_live > peak)
             peak = n_live;
 
@@ -339,8 +355,10 @@ static void run_mode(const wmm_oops_t *o) {
         if (g_slot[s].p != NULL)
             n_live += op_free(o, s);
     CHECK(n_live == 0);                  /* 模型自身也要对得上 */
-    if (o->can_count)
+    if (o->can_count) {
+        wmm_tcache_flush_all();
         CHECK(total_live() == live0);
+    }
 
     printf("  %s mode: %d steps, %llu allocs / %llu frees / %llu reallocs, "
            "peak live %ld\n",

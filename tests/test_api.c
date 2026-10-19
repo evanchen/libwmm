@@ -8,10 +8,16 @@
  *         小/大分界(14336/14337)、大对象页对齐取整(100000→102400);
  *   calloc:溢出返回 NULL、复用对象必须重新清零(防信息泄漏);
  *   防御性释放:nregs==1 类与大对象的双释放(页表已清零,走
- *         raw==0 分支)、窗口外野指针、窗口内未映射页——都不许崩溃;
+ *         raw==0 分支)、窗口外野指针、窗口内未映射页——都不许崩溃。
+ *         双释放检测依赖"对象已回 slab",而 tcache 快路径只把对象
+ *         压栈、页表登记保持,第二次 free 会被静默再收一次——这是
+ *         所有 tcache 实现共同的盲区(glibc 同款),检测归 guard 模块。
+ *         本组负路径因此临时关缓存,专测慢路径的诊断;
  *   PTE2 + G2 零点:万次随机分配/释放风暴后全部归还,36 个 bin 的
  *         live/curslabs/链指针全零、大对象计数全零、抽 witness 指针
- *         查页表已清登记。
+ *         查页表已清登记。风暴的归还是两段:应用先全量 free(对象
+ *         落进本线程缓存),再 wmm_thread_exit 把缓存刷回 arena——
+ *         零点只在"应用持有与缓存都空"之后才有意义。
  */
 #include "wmm_internal.h"
 
@@ -155,13 +161,22 @@ static void check_realloc(void) {
 
 /* ---- 防御性释放:三种非法指针都不许把进程带走 ---- */
 static void check_defensive_free(void) {
+    /* 双释放的诊断依赖"对象已经回到 slab、页表登记已清"(慢路径上
+       nregs==1 的类释放即整块退休,再 free 走 raw==0 分支)。tcache
+       快路径把对象压在栈上、页表保持登记,第二次 free 会被它静默
+       再收一次——glibc tcache 同款盲区,检测归 guard 模块。本组临时
+       关缓存,让负路径落到慢路径:测的是诊断契约,不是缓存 */
+    wmm_thread_init();
+    bool saved = g_tcache->enabled;
+    g_tcache->enabled = false;
+
     /* nregs==1 的类:释放即整块退休 + 页表清零,再释放走 raw==0 */
     void *p = wmm_alloc(4096);
     CHECK(p != NULL);
     wmm_free(p);
-    wmm_free(p);          /* M14 起写 0xBE 事件;现在 dprintf 后返回 */
+    wmm_free(p);          /* guard 落地后写 0xBE 事件;现在 dprintf 后返回 */
 
-    /* 大对象同理 */
+    /* 大对象同理(大对象本就不进缓存,开关无关) */
     void *l = wmm_alloc((size_t)1 << 20);
     CHECK(l != NULL);
     wmm_free(l);
@@ -171,6 +186,8 @@ static void check_defensive_free(void) {
     int on_stack = 0;
     wmm_free(&on_stack);
     wmm_free(g_heap_cur);   /* bump 当前位置:在窗口内、从未映射 */
+
+    g_tcache->enabled = saved;
 }
 
 /* ---- M5:对齐分配(三档 + 错误码 + 档 2 不变量穷举) ---- */
@@ -280,12 +297,15 @@ static void check_random_storm(void) {
         }
     }
 
-    /* 全部释放:一切 slab 走到全空退休、一切 extent 归还 */
+    /* 全部释放分两段:应用 free 的对象先落进本线程缓存,再由线程
+       退出把缓存刷回 arena——两段都做完,slab 才会全空退休、extent
+       才会归还 */
     for (int s = 0; s < SLOTS; s++)
         if (slot[s] != NULL)
             wmm_free(slot[s]);
+    wmm_thread_exit();   /* 刷空缓存 + 从注册表摘除 + munmap 缓存块 */
 
-    /* G2 的全零特例:live 恒等式此刻两边都是 0 */
+    /* G2 的全零特例:live 恒等式此刻两边都是 0(应用持有与缓存皆空) */
     for (szind_t i = 0; i < WMM_NBINS; i++) {
         CHECK(g_bins[i].live == 0);
         CHECK(g_bins[i].curslabs == 0);

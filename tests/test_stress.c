@@ -6,7 +6,11 @@
  *
  * 结构:4/8/16 线程三个阶段。每阶段总步数(20 万)与槽位总配额
  * (512)都固定、按线程均分,分 20 轮,每轮结束屏障汇合对一次账:
- *   Σ 各线程模型活指针数 == Σ bins live + 大对象 live(相对进场基线)
+ *   Σ bins live + 大对象 live − Σ 线程缓存 head == Σ 各线程模型活指针数
+ * (左右两边都相对进场基线)。缓存项必须扣:每个线程的 free 先落进
+ * 自己的栈,bin 的 live 仍计着它,而模型已不再持有——④ 的对账在
+ * 有缓存的世界里就是这条带负号的等式。屏障静止时各线程停在原地、
+ * 缓存块不消失,cached_total 读到的就是精确值。
  * 对账必须靠屏障而不是"偶尔看一眼":活着的线程随时在改计数,只有
  * 全体静止的瞬间,全局 Σ 与模型 Σ 的等式才有意义。
  *
@@ -235,13 +239,14 @@ static int s_realloc(wmm_oref_t *row, size_t s, size_t nreq, long *pf) {
 }
 
 /* 屏障静止时刻的全局对账:Σ 各线程模型数 == Σ 分配器计数(相对
-   进场基线)。tid==0 专属执行,其余线程停在第二道屏障上——
-   计数没有可变窗口,读数即精确值 */
+   进场基线)再扣掉停在各线程缓存里的对象。tid==0 专属执行,其余
+   线程停在第二道屏障上——计数没有可变窗口,读数即精确值;缓存
+   块也一样,线程停在屏障上就不会有新的压栈/弹出 */
 static void barrier_check(int nthreads, long *pf) {
     uint64_t model = 0;
     for (int t = 0; t < nthreads; t++)
         model += g_sarg[t].live_pub;
-    SCHECK(pf, total_live() - g_live0 == model);
+    SCHECK(pf, total_live() - g_live0 - wmm_tcache_cached_total() == model);
 }
 
 static void *stress_thread(void *arg) {
@@ -301,10 +306,13 @@ static void *stress_thread(void *arg) {
         barrier_wait(&g_bar);
     }
 
-    /* 阶段收尾:全量释放,清零后再全局对一次账(并发下的无泄漏) */
+    /* 阶段收尾:全量释放 + 刷空本线程缓存,清零后再全局对一次账
+       (并发下的无泄漏)。刷缓存让终点的"归零"不依赖对账公式里
+       的缓存修正项:对象真的回到了 slab,下面的窗口断言才有意义 */
     for (size_t s = 0; s < nslots; s++)
         if (row[s].p != NULL)
             n_live += s_free(row, s, &fails);
+    wmm_tcache_flush_all();
     me->live_pub = 0;
     barrier_wait(&g_bar);
     if (me->tid == 0)
@@ -318,6 +326,11 @@ static void *stress_thread(void *arg) {
 int test_stress(void) {
     g_fail = 0;
     wmm_boot();
+
+    /* 基线之前先刷空主线程缓存:本组主线程不分配,但前序组可能
+       留下缓存对象;基线里混着它们的话,每次对账的缓存修正项都会
+       多算一份主线程的存量 */
+    wmm_tcache_flush_all();
     g_live0 = total_live();
 
     size_t rss_first = 0, rss_last = 0;

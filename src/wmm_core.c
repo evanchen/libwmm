@@ -9,7 +9,8 @@
  *
  * 并发纪律(全库不变量 2"计数单点"):bin 的 live 计数只在持该 bin 锁
  * 的路径里增减,因此"Σ live[i]*size[i] == live_bytes"在任何观测时刻
- * 精确成立;tcache 的批量填充/刷出路径今后也必须遵守同一条纪律。
+ * 精确成立;tcache 的批量填充/刷出同样只经 wmm_bin_alloc/dalloc 这
+ * 两个单点,不在缓存路径另立计数——缓存中的对象因此仍计 live。
  */
 
 #include "wmm_internal.h"
@@ -271,6 +272,38 @@ bool wmm_bin_dalloc(wmm_bin_t *b, wmm_slab_t *sl, void *p) {
     return false;
 }
 
+/* ==================== 批量填充(tcache 慢路径的供应端) ====================
+ *
+ * 一次持锁连续弹 want 个,而不是让 tcache 逐对象回来上锁——这是
+ * jemalloc"批量搬运"思路的最小实现:填满一张缓存只有一次锁开销,
+ * 单对象快路径由此彻底无锁。
+ *
+ * 计数语义与逐个分配完全一致:wmm_bin_alloc 内部逐对象 live++,
+ * 这里不另计。取页也在锁内完成(新 slab 的安装必须与 bin 状态机
+ * 同一临界区),与 wmm_alloc 慢路径同一做法:简单换正确。
+ * 返回实际填充数;小于 want 只可能是窗口或元数据耗尽(OOM)。 */
+
+unsigned wmm_bin_fill(wmm_bin_t *b, szind_t i, unsigned want, void **out) {
+    unsigned n = 0;
+
+    pthread_mutex_lock(&b->lock);
+    while (n < want) {
+        void *p = wmm_bin_alloc(b);
+        if (p == NULL) {
+            wmm_slab_t *sl = wmm_phys_alloc_slab(i);
+            if (sl == NULL)
+                break;                 /* OOM:能填多少算多少 */
+            wmm_bin_slab_install(b, sl);
+            p = wmm_bin_alloc(b);      /* 必成功:全空 slab 至少弹出一个 */
+            if (p == NULL)
+                break;                 /* 内部契约被破坏;防御性退出 */
+        }
+        out[n++] = p;
+    }
+    pthread_mutex_unlock(&b->lock);
+    return n;
+}
+
 /* 对象编号除法:regind = (p − base)/reg_size。
  * 独立成函数便于将来集中换成 jemalloc 同款的魔术数乘法(预计算
  * magic/shift,除法变乘移,省 ~20 周期);普通除法只在慢路径,不急。 */
@@ -280,10 +313,10 @@ uint32_t wmm_div_regind(const void *p, const void *base, uint32_t reg_size) {
 
 /* ==================== 主路径:wmm_alloc 家族 ====================
  *
- * 当前是单线程、无 tcache 的版本。tcache 落地后,这里变成
- * "缓存耗尽/刷出"才走的慢路径,快路径在 wmm_tcache.c;本段
- * 结构不变:查类 → bin 锁 → bin_alloc,NULL 则物理层供 slab
- * 后重试(至多一次)。
+ * 小对象走两级通道:先问线程缓存(无锁弹栈),缓存空才落到这里的
+ * bin 慢路径;快路径代码在 wmm_tcache.c。本段结构保持平实:
+ * 查类 → bin 锁 → bin_alloc,NULL 则物理层供 slab 后重试(至多一次)。
+ * 缓存建不出来或本线程显式关掉缓存时,本段就是完整的兜底通道。
  *
  * 大小对象在此分野:小对象走 bin(共享 slab),大对象走物理层
  * (整页 extent)。分界线 14336/16384 之间的缝隙(14337..16383)
@@ -299,13 +332,33 @@ void *wmm_alloc(size_t size) {
         return ext != NULL ? ext->addr : NULL;
     }
 
-    szind_t     i = wmm_size2index(size);
+    szind_t i = wmm_size2index(size);
+
+    /* ---- 快路径:线程缓存 ---- */
+    if (g_tcache == NULL)
+        wmm_thread_init();   /* 惰性建块;建不出来就直走慢路径 */
+    if (g_tcache != NULL && g_tcache->enabled) {
+        void *p = wmm_tcache_alloc(i);
+        if (p == NULL) {
+            /* 缓存空:一次批量填充,再弹一个。填充目标 nfill 由后续
+               的自适应逻辑维护,首版固定为容量的一半 */
+            wmm_tcache_fill(i, g_tcache->bins[i].nfill);
+            p = wmm_tcache_alloc(i);
+        }
+        if (p != NULL)
+            return p;
+        /* 填充失败 = 窗口耗尽:慢路径只会同样失败。保留它,让 OOM
+           的返回行为集中在一处,不因缓存有无而分叉 */
+    }
+
+    /* ---- 慢路径:bin ---- */
     wmm_bin_t *b = &g_bins[i];
 
     /* 慢路径全程持 bin 锁,包括物理层取页(mmap 在锁内)。v1 用
        简单换正确:两个线程同时发现无 slab,不会各自造一个(那需要
        "放锁取页、装回时发现别人已装"的让路逻辑)。代价是造 slab
-       期间本类其他分配排队;造 slab 每类低频,tcache 落地后更稀。 */
+       期间本类其他分配排队;批量填充把一次造 slab 摊到整批请求上,
+       这类排队已经稀到不必优化 */
     pthread_mutex_lock(&b->lock);
     void *p = wmm_bin_alloc(b);
     if (p == NULL) {
@@ -336,14 +389,23 @@ void wmm_free(void *p) {
     void       *ext;
 
     if (wmm_pte_is_slab(p, &sl)) {
+        /* 快路径:压进本线程缓存,不碰 bin 锁。缓存满时
+           wmm_tcache_free 内部先部分刷出。线程尚未建过缓存
+           (只释放、不分配)时直走慢路径——对象在慢路径逐个
+           回链,计数口径不变 */
+        if (g_tcache != NULL && g_tcache->enabled) {
+            wmm_tcache_free(sl->szind, p);
+            return;
+        }
+
         wmm_bin_t *b = &g_bins[sl->szind];
         pthread_mutex_lock(&b->lock);
         bool retire = wmm_bin_dalloc(b, sl, p);
         pthread_mutex_unlock(&b->lock);
 
         /* 退休在 bin 锁外执行:物理层只拿自己的锁,不与 bin 锁
-           嵌套。当前单线程无虞;多线程时代"bin 摘除 → munmap"之间
-           的窗口由 tcache 刷出路径的锁纪律闭合(tcache 落地时处理)。 */
+           嵌套。批量刷出路径同理——刷出时先把退休 slab 收集进
+           本地数组,放锁后逐个交物理层(见 wmm_tcache.c)。 */
         if (retire)
             wmm_phys_free_slab(sl);
         return;

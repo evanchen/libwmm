@@ -17,6 +17,12 @@
  * INUSE,新分配必是窗口 bump(地址连续可预知),断言才能写死。
  * drain 块从不写入:mmap 匿名页不碰就驻留在共享零页上,抽干不耗
  * 物理内存。
+ *
+ * tcache 开关:本组的断言全部依赖"释放即回 slab、全空即退休"的
+ * 即时性(curslabs 计数、dirty 页数、重放的零新映射)。线程缓存会
+ * 把释放先压在栈上,对象仍计存活、slab 不退休,确定性世界就没了。
+ * 因此本组开始时建一个空缓存并整体关掉 enabled,组尾恢复——本组
+ * 测的是物理层与 bin 状态机,缓存行为归 oracle/stress/tcache 三组。
  */
 #include "wmm_internal.h"
 
@@ -289,12 +295,21 @@ int test_phys(void) {
     g_fail = 0;
     wmm_boot();
 
+    /* 关缓存,理由见文件头。先 exit 丢掉前序组可能留在缓存里的
+       对象,再建一个本组的空缓存并禁用——wmm_alloc/free 回到
+       M7 的直通路径 */
+    wmm_thread_exit();
+    wmm_thread_init();
+    g_tcache->enabled = false;
+
     ar_check();            /* api 用例遗留:结构应已完好 */
     check_large_pte();
     check_merge();
     check_split();
     check_slab_absorb();
     check_replay();
+
+    g_tcache->enabled = true;   /* 后续组(oracle/stress)要用缓存 */
 
     if (g_fail == 0)
         printf("  all phys checks passed\n");

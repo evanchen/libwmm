@@ -62,6 +62,13 @@ wmm_tcache_t *g_threads;           /* 线程注册表链头;NULL = 还没有线�
 pthread_mutex_t g_threads_lock;    /* 保护注册表链的增删 */
 _Thread_local wmm_tcache_t *g_tcache;  /* 本线程缓存指针;每线程零初始化 */
 
+/* 线程退出析构键。静态哨兵 (pthread_key_t)-1 = 尚未注册;boot 注册失败
+   即终止,所以分配路径上再看到 -1,只可能是没先 boot 或内存损坏,同样
+   按致命处理。正常路径由 pthread 在线程退出时回调
+   wmm_tcache_thread_destructor。定义放在这里而不是 wmm_tcache.c,
+   与其余全局状态同点核对初始化纪律。 */
+pthread_key_t g_tcache_key = (pthread_key_t)-1;
+
 /* 运行期选项:静态初始化即默认值,在任何 wmm_ctl("config.*") 之前就位。
    特意不做成"boot 时赋值":测试可以在 wmm_boot 之前改这里(如把
    verbose 置真)来观察 boot 自身的日志。 */
@@ -137,12 +144,33 @@ void wmm_boot(void) {
     (void)pthread_mutex_init(&g_ext_lock, NULL);
     (void)pthread_mutex_init(&g_threads_lock, NULL);
 
+    /* 线程退出析构键:缓存块按线程 mmap,这个键是"线程退出时把缓存还
+       回 arena"的唯一自动通道。没有它,线程池里每轮增删线程都会把整块
+       缓存连同其中对象永久滞留在 live 账上——线程已不存在,应用也无法
+       替它调 wmm_thread_exit,分配器的资源生命周期失去闭环。这种失败
+       没有可接受的降级形态:与窗口/页表失败同一处置,就地终止,不带
+       着已破的不变量继续跑。键值在 tcache_create 里写入(块指针只作
+       "建过缓存"的非 NULL 标记),回调以 g_tcache 为准——显式 exit 之后
+       它为 NULL,自动回调与显式回收并存而不重复清理 */
+    if (pthread_key_create(&g_tcache_key, wmm_tcache_thread_destructor) != 0) {
+        wmm_dprintf("fatal: pthread_key_create for thread-cache destructor "
+                    "failed, thread caches cannot be reclaimed at exit\n");
+        abort();   /* wmm_boot 返回 void,初始化失败只能就地终止 */
+    }
+
     /* ---- 4) fork 钩子 ---- */
+    /* fork 安全也是对外契约的一部分:prepare 持住全部锁、child 重建锁
+       并清理幽灵缓存,三者缺一,多线程程序 fork 出的子进程就可能带着
+       别的线程持有的锁继续跑——死锁发生在应用代码深处,现场与根因隔
+       着整条调用链,正是"带着未知状态跑"。注册失败没有降级形态,与
+       上面几步同一处置 */
     int rc = pthread_atfork(wmm_atfork_prepare, wmm_atfork_parent,
                             wmm_atfork_child);
-    if (rc != 0)
-        wmm_dprintf("warning: pthread_atfork failed (%d), fork safety disabled\n",
-                    rc);
+    if (rc != 0) {
+        wmm_dprintf("fatal: pthread_atfork failed (%d), cannot guarantee "
+                    "fork safety\n", rc);
+        abort();
+    }
 
     if (g_opt.verbose)
         wmm_dprintf("boot ok: heap window %zu MB at %p, page table %zu MB, "
@@ -165,10 +193,12 @@ void wmm_boot(void) {
  *   child:  不解锁而是把所有锁重新 init——解锁动作依赖锁的内部状态,
  *            对"别人手里的锁"未必可行,重建才是唯一可移植的做法。
  *
- * 其余线程的缓存块随线程在子进程中消失(内存映射还在,它们缓存的
- * 对象计入存活而无人归还——fork 语义使然,不是本库泄漏)。当前线程的
- * g_tcache 与全部堆内存在子进程里完好,无需处理;但 g_threads 链上
- * 其他线程的节点已成死节点,线程缓存落地后需在这里裁剪。
+ * 其余线程的缓存块:子进程里把死节点刷空(缓存中的对象还回 bin,
+ * 否则这些对象永远达不到全空退休、无人归还)并整块 munmap,注册表
+ * 只留调用线程——见 wmm_tcache_child_cleanup。死线程仍被应用持有的
+ * 指针(不在缓存里的那些)随线程消失,计入存活而无人归还,fork
+ * 语义使然,不是本库泄漏。当前线程的 g_tcache 与全部堆内存在子进程
+ * 里完好。
  *
  * 锁序约定:凡将来同时需要多把全局锁的新代码,必须沿用 prepare 的
  * 顺序,否则会与 fork 冻结互锁形成死锁。base 锁必须排最后:持 bin
@@ -197,6 +227,10 @@ void wmm_atfork_child(void) {
     (void)pthread_mutex_init(&g_ext_lock, NULL);
     (void)pthread_mutex_init(&g_threads_lock, NULL);
     (void)pthread_mutex_init(&g_base_lock, NULL);
+
+    /* 锁全部重建之后才能动 bin:死线程的缓存要刷回 bin,这是子进程
+       里唯一会碰分配器结构的钩子动作。此刻独占执行 */
+    wmm_tcache_child_cleanup();
 }
 
 /* ==================== wmm_dprintf:受限 printf,裸 write(2) 输出 ====================
