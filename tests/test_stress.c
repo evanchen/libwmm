@@ -23,8 +23,11 @@
  * (真正还内核是 purge 阶段的事),所以期望形态是"涨到峰值后持平",
  * 不是回落。阶段间显著上台阶 = 释放页没有回到复用池,合并或复用失效。
  * RSS 混着 ASan 影子页/线程栈等大量非分配器杂音,复用还有一道更尖
- * 的白盒断言直接盯窗口 bump 指针:阶段 2/3 的容量与配比和阶段 1
- * 全同,峰值需求必须落在阶段 1 已建立的足迹(加复用池)之内。
+ * 的白盒断言直接盯窗口 bump 指针:阶段 2/3 的槽数/步数/配比和阶段 1
+ * 全同,峰值需求必须落在阶段 1 已建立的足迹(加复用池)之内——唯一
+ * 随线程数增长的容量项是线程缓存(每线程每类最多囤 ncached_max 个,
+ * 大类被 min 钳到 20 个,14336B 类单类就 280KB),预算按
+ * (线程数−阶段 1 线程数) × 每线程缓存容量上限 显式计入。
  */
 #include "wmm_internal.h"
 
@@ -90,6 +93,18 @@ static uint64_t total_live(void) {
     for (int i = 0; i < WMM_NBINS; i++)
         sum += g_bins[i].live;
     return sum + g_large.live;
+}
+
+/* 单线程缓存的容量上限(字节):Σ ncached_max × reg_size,从真实建出的
+   缓存块读而不是重抄公式——公式或表若改,预算自动跟随。它是窗口复用
+   断言预算的第二笔:第一笔(8MB)钉的是占用率随机游走,这一笔钉的是
+   随线程数增长的缓存容量。实测全类合计约 2.1MB/线程 */
+static size_t tcache_capacity_bytes(void) {
+    size_t sum = 0;
+    for (int i = 0; i < WMM_NBINS; i++)
+        sum += (size_t)g_tcache->bins[i].ncached_max
+             * wmm_bin_info[i].reg_size;
+    return sum;
 }
 
 /* /proc/self/statm 第二项 = 常驻页数;读不到返回 0(对照断言兜底) */
@@ -327,10 +342,14 @@ int test_stress(void) {
     g_fail = 0;
     wmm_boot();
 
-    /* 基线之前先刷空主线程缓存:本组主线程不分配,但前序组可能
-       留下缓存对象;基线里混着它们的话,每次对账的缓存修正项都会
-       多算一份主线程的存量 */
+    /* 主线程缓存块先建好再刷空。刷空:本组主线程不分配,但前序组可能
+       留下缓存对象,基线里混着它们的话,每次对账的缓存修正项都会多算
+       一份存量。建好:窗口预算的缓存容量项要从真实块上读 */
+    wmm_thread_init();
+    CHECK(g_tcache != NULL);
     wmm_tcache_flush_all();
+    size_t tcache_cap = tcache_capacity_bytes();
+    printf("  per-thread tcache capacity: %zu KB\n", tcache_cap >> 10);
     g_live0 = total_live();
 
     size_t rss_first = 0, rss_last = 0;
@@ -400,14 +419,22 @@ int test_stress(void) {
         } else {
             /* 复用尖断言(纯分配器量,无 RSS 杂音):三阶段槽数/步数/
                配比全同,阶段 2/3 的峰值需求必须落在阶段 1 足迹内。
-               预算 8MB 吸收的是峰值需求的随机波动——活集合 ~384 指针
-               × 平均 ~55KB ≈ 21MB,占用率随机游走的峰谷差天然是
-               MB 级(oracle 单线程同分布实测 peak 442),两阶段的
-               峰值采样不可能逐字节重合。复用失效的特征量级完全不同:
-               每阶段 4~5GB 分配流量,1% 漏复用就新增 40MB 以上足迹,
-               与预算隔着一个数量级 */
+               预算两笔账,分别钉两个容量输入:
+               ① 8MB 波动基数——活集合 ~384 指针 × 平均 ~55KB ≈ 21MB,
+                  占用率随机游走的峰谷差天然是 MB 级(oracle 单线程同
+                  分布实测 peak 442),两阶段的峰值采样不可能逐字节重合;
+               ② 缓存容量差——线程缓存是唯一随线程数增长的容量项,
+                  阶段 2/3 比阶段 1 多出的线程各带一份上限(实测 ~2.1MB,
+                  尺寸分布 15% 落在 4097..14335,这些类 nregs≤4、全部
+                  被 min 钳到 20,一次填充就抓 10 个大对象)。无 tcache
+                  时代的 8MB 定额没有这笔账,首轮 16 线程实跑 +12.5MB
+                  当场击穿——不是复用失效,是断言漏钉了容量输入。
+               复用失效的特征量级完全不同:每阶段 4~5GB 分配流量,1%
+               漏复用就新增 40MB 以上足迹,仍与全预算隔着一个数量级 */
+            size_t budget = (size_t)WMM_PAGE * 2048
+                          + (size_t)(n - g_stress_nthreads[0]) * tcache_cap;
             CHECK((char *)g_heap_cur - (char *)win_pin
-                      <= (ptrdiff_t)(WMM_PAGE * 2048));
+                      <= (ptrdiff_t)budget);
         }
         rss_last = rss_after;
     }
@@ -417,9 +444,11 @@ int test_stress(void) {
        映射里等复用(真正还内核是 purge 的事),期望形态是"涨到峰值
        后持平"。容差 20MB 的构成(首轮实测分解):每阶段新起 4/8/16
        个线程,栈页与 ASan 线程登记/影子页在 join 后仍留驻 RSS,
-       跨阶段合计 ~8MB;再加占用率随机演化的峰值波动。复用失效的
-       信号量级完全不同——每阶段 GB 级分配流量,1% 漏复用就新增
-       20MB+ 触碰——容差挡得住噪声,拦得住真错 */
+       跨阶段合计 ~8MB;再加占用率随机演化的峰值波动与线程缓存驻留
+       (缓存对象循环复用窗口内同一批页,RSS 增量与窗口增量同量级,
+       精确账在窗口断言里)。复用失效的信号量级完全不同——每阶段
+       GB 级分配流量,1% 漏复用就新增 20MB+ 触碰——容差挡得住噪声,
+       拦得住真错 */
     CHECK(rss_first > 0);
     CHECK(rss_last <= rss_first + 20480);
     printf("  RSS plateau: first %zu KB, last %zu KB (tolerance 20480 KB)\n",
