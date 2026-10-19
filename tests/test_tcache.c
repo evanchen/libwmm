@@ -1,20 +1,25 @@
-/* test_tcache.c —— M8 线程缓存用例(白盒:直接读缓存水位与注册表)
+/* test_tcache.c —— M8/M9 线程缓存用例(白盒:直接读缓存水位与注册表)
  *
- * 覆盖(tasks.md M8 自测清单 + 快路径的边界行为):
+ * 覆盖(tasks.md M8/M9 自测清单 + 快路径的边界行为):
  *   TC1 命中率:单线程对同一尺寸连续分配 10 万次,命中缓存的比例
  *         ≥ 90%。命中判据是白盒的——每次分配前后比较目标 bin 的
  *         head:水位恰好降一格 = 弹栈命中;空栈后先涨到 nfill-1 =
  *         填充事件。只看"分配成功"区分不了快慢路径:慢路径也能
  *         成功,只有水位轨迹能证明对象确实来自缓存。
- *   TC2 容量:任何时刻 head ≤ ncached_max;缓存满时释放按 3/4 比例
- *         部分刷出(head 落到 ncm/4 再压入新对象);low_water ≤ head
- *         恒成立。
+ *   TC2 容量与满栈 GC:任何时刻 head ≤ ncached_max、low_water ≤ head
+ *         恒成立;满栈释放先跑 GC(留 retain = 用量×1.25 或种子 2),
+ *         热 bin 退回 3/4 部分刷出兜底——落点按 GC 公式重放精确断言。
+ *   TC3 偶尔用一次的类:填充后晾着不动,显式 GC 把驻留压回 retain
+ *         (used==0 → 2 个种子;used>0 → used×1.25),head ≤ retain。
  *   容量公式:每类 ncached_max == clamp(2*nregs, 20, 200),
- *         nfill == ncached_max/2,栈数组紧贴结构体、按类顺序排布,
- *         各段长度之和与 map_size 精确相等。
+ *         nfill == ncached_max/2(创建态),栈数组紧贴结构体、按类
+ *         顺序排布,各段长度之和与 map_size 精确相等。
  *   线程注册表与退出:工作线程首次分配时建缓存并挂链;pthread 析构
  *         在线程返回时把缓存刷回 bin、摘链、munmap——缓存对象数、
  *         全局 live、注册表节点数三项都回到进场基线。
+ *   G5 千次线程增删:1000 个线程反复创建/退出,Σ live、缓存总量、
+ *         注册表节点全部回到基线,RSS 无量级漂移(粗检,精确账在
+ *         stress 窗口预算)。
  *   关闭开关:enabled=false 时分配/释放直走 bin,缓存水位纹丝不动。
  *   跨线程释放:从未分配过的线程 free 别的线程的对象,走慢路径直接
  *         归还,不为自己建缓存,也不碰原线程的栈。
@@ -27,6 +32,8 @@
  *
  * 每个用例自清自净:进场先 wmm_tcache_flush_all 把主线程缓存剥空,
  * 出场再刷一次并对回进场 live,组与组之间互不继承缓存状态。
+ * 需要确定性的组(TC2/TC3)先把 gc_evt/gc_next 归零,关掉事件轮转
+ * 的噪声,让 GC 只由本用例显式触发。
  */
 #include "wmm_internal.h"
 
@@ -166,20 +173,31 @@ static void check_hit_rate(void) {
     CHECK(total_live() == base);
 }
 
-/* ---- TC2:容量上限与满栈刷出 ----
- * 先攒满一批对象再逐个释放:缓冲会反复从 ncm/4 涨到 ncm、
- * 触发"刷 3/4 再压一个"。每步都核对水位,满栈事件的落点按
- * 公式精确断言——这是部分刷出策略唯一的直接证据。 */
+/* ---- TC2:容量上限与满栈 GC ----
+ * 先攒满一批对象再逐个释放:缓冲会反复涨到 ncm,触发 M9 的满栈
+ * GC(先按 retain 公式刷、热 bin 退回 3/4 兜底)再压一个。每步
+ * 核对水位;满栈事件的落点由测试自己按 GC 公式重放,精确断言——
+ * GC 是 M9 新增的行为,公式若改,这里同步改,落点仍然钉得住。
+ *
+ * 重放要点:lw_tracked 镜像真实的 low_water。真实 low_water 只在
+ * 两处变:弹栈时取 min(快路径,释放阶段没有弹栈),刷出时重置为
+ * 刷后 head(tcache_flush_bins 与 GC 都这么做)。释放阶段只有刷出
+ * 会动它,所以 lw_tracked 在满栈事件之间恒等于真实值。
+ * 事件轮转先归零:轮转 GC 落在别的 bin(下一个目标固定为 0),不
+ * 掺和本用例的确定性。 */
 static void check_head_capacity(void) {
     enum { NOBJ = 300, BIN_SIZE = 64 };
     uint64_t base = flush_baseline();
     szind_t  bin  = wmm_size2index(BIN_SIZE);
     wmm_cache_bin_t *cb = &g_tcache->bins[bin];
-    unsigned ncm    = cb->ncached_max;
-    unsigned nflush = 0;
+    unsigned ncm       = cb->ncached_max;
+    unsigned lw_tracked = 0;   /* 重放用的 low_water 镜像 */
+    unsigned nflush    = 0;
     static void *o[NOBJ];
 
     CHECK(cb->head == 0);
+    g_tcache->gc_evt  = 0;
+    g_tcache->gc_next = 0;
 
     for (int k = 0; k < NOBJ; k++) {
         o[k] = wmm_alloc(BIN_SIZE);
@@ -187,6 +205,7 @@ static void check_head_capacity(void) {
         CHECK(cb->head <= ncm);           /* TC2:分配侧不越顶 */
         CHECK(cb->low_water <= cb->head);
     }
+    /* 分配阶段把缓存吃空过多次,low_water 钉在 0——重放从这起算 */
 
     for (int k = 0; k < NOBJ; k++) {
         unsigned before = cb->head;
@@ -196,15 +215,68 @@ static void check_head_capacity(void) {
         CHECK(cb->low_water <= cb->head);
 
         if (before == ncm) {
-            /* 满栈释放:刷掉 3/4,栈上留 1/4,再压入这一个 */
-            CHECK(cb->head == ncm / 4 + 1);
+            /* 满栈:GC 按 retain 公式刷出;用量顶到容量时 GC 全留,
+               退回 3/4 部分刷出兜底,落点 = target + 1 */
+            unsigned used   = ncm - lw_tracked;
+            unsigned retain = (used == 0) ? 2 : used + (used >> 2);
+            if (retain > ncm)
+                retain = ncm;
+            unsigned target = (retain == ncm) ? (ncm / 4) : retain;
+            CHECK(cb->head == target + 1);
+            lw_tracked = target;          /* 刷出把水位重置到 target */
             nflush++;
         } else {
             CHECK(cb->head == before + 1);
+            if (lw_tracked > cb->head)    /* 释放阶段 head 只涨,不触发 */
+                lw_tracked = cb->head;
         }
     }
     /* NOBJ 大于任何一类的容量,满栈事件必然发生 */
     CHECK(nflush >= 1);
+
+    wmm_tcache_flush_all();
+    CHECK(total_live() == base);
+}
+
+/* ---- TC3:偶尔用一次的类,GC 压回 retain ----
+ * 白盒构造:冷 bin 先填充一批(填充把 low_water 抬到新水位),然后
+ * 晾着——不再弹栈,GC 看到的 used==0,retain 缩到种子 2,整批压回;
+ * 再构造"用过一点"的场景(弹掉一半再放回),used>0 时 retain =
+ * used×1.25,刷出的落点不多不少。事件轮转归零,GC 只由本用例触发。 */
+static void check_gc_occasional(void) {
+    enum { BIN_SIZE = 4096 };              /* nregs=1, ncm=20 的最小类 */
+    uint64_t base = flush_baseline();
+    szind_t  bin  = wmm_size2index(BIN_SIZE);
+    wmm_cache_bin_t *cb = &g_tcache->bins[bin];
+    void    *o[WMM_TCACHE_NCACHED_MAX];
+
+    CHECK(cb->head == 0);
+    g_tcache->gc_evt  = 0;
+    g_tcache->gc_next = 0;
+
+    /* 场景 A:完全没用过——填充后原样晾着 */
+    unsigned nf = cb->nfill;
+    wmm_tcache_fill(bin, nf);              /* head = nf, low_water = nf */
+    CHECK(cb->head == nf);
+    wmm_tcache_gc(bin);
+    CHECK(cb->head == 2);                  /* used==0 → 留 2 个种子 */
+    CHECK(cb->head <= 2);                  /* TC3:head ≤ retain */
+
+    /* 场景 B:用过一点。弹栈把 low_water 压到 nf2−half,放回不碰它,
+       GC 看到 used == half,retain = half×1.25,刷到刚好 retain */
+    wmm_tcache_fill(bin, cb->nfill);
+    unsigned nf2  = cb->head;
+    unsigned half = nf2 / 2;
+    CHECK(half > 0);
+    for (unsigned k = 0; k < half; k++)
+        o[k] = wmm_tcache_alloc(bin);
+    for (unsigned k = 0; k < half; k++)
+        wmm_tcache_free(bin, o[k]);
+    wmm_tcache_gc(bin);
+    unsigned used   = nf2 - (nf2 - half);  /* = half */
+    unsigned retain = used + (used >> 2);
+    CHECK(cb->head == retain);             /* 刷到 retain,不多不少 */
+    CHECK(cb->head <= retain);             /* TC3 */
 
     wmm_tcache_flush_all();
     CHECK(total_live() == base);
@@ -300,6 +372,82 @@ static void check_thread_lifecycle(void) {
     CHECK(tc_nodes() == nodes0);
     CHECK(wmm_tcache_cached_total() == 0);
     CHECK(total_live() == base);
+}
+
+/* ---- RSS 粗检读数:statm 第二个字段是物理驻留页数 ---- */
+static size_t rss_kb(void) {
+    long total = 0, resident = 0;
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (f == NULL)
+        return 0;
+    if (fscanf(f, "%ld %ld", &total, &resident) != 2)
+        resident = 0;
+    fclose(f);
+    return (size_t)resident * (sysconf(_SC_PAGESIZE) >> 10);
+}
+
+/* ---- G5:千次线程创建/退出 ----
+ * 每个线程分配一小批、释放一半,另一半留给 pthread 析构刷回——
+ * 缓存块随线程退出整块 munmap。千次下来,live / 缓存总量 / 注册表
+ * 节点必须全部回到基线,一个块都不许漏。RSS 只做粗检:线程栈与
+ * ASan 记账有各自开销(glibc 还留一个小栈缓存),量级级漂移才叫
+ * 失败;精确的内存账在 stress 的窗口预算里。 */
+typedef struct {
+    unsigned err;
+} churn_arg_t;
+
+static void *churn_worker(void *arg) {
+    churn_arg_t *a = (churn_arg_t *)arg;
+    void *a64[8], *b4k[4];
+    unsigned err = 0;
+
+    wmm_thread_init();
+    if (g_tcache == NULL)
+        err |= 1u;
+    for (int k = 0; k < 8; k++) {
+        a64[k] = wmm_alloc(64);
+        if (a64[k] == NULL)
+            err |= 2u;
+    }
+    for (int k = 0; k < 4; k++) {
+        b4k[k] = wmm_alloc(4096);
+        if (b4k[k] == NULL)
+            err |= 4u;
+    }
+    for (int k = 0; k < 4; k++)
+        wmm_free(a64[k]);
+    for (int k = 0; k < 2; k++)
+        wmm_free(b4k[k]);
+    /* 剩余对象留在缓存里,返回时由 pthread 析构统一刷空 + munmap */
+    a->err = err;
+    return NULL;
+}
+
+static void check_thread_churn(void) {
+    enum { NCHURN = 1000 };
+    uint64_t base   = flush_baseline();
+    int      nodes0 = tc_nodes();
+    size_t   rss0   = rss_kb();
+    churn_arg_t a;
+
+    for (int k = 0; k < NCHURN; k++) {
+        a.err = 0;
+        pthread_t th;
+        if (pthread_create(&th, NULL, churn_worker, &a) != 0) {
+            printf("  FAIL @%d: pthread_create at %d\n", __LINE__, k);
+            g_fail++;
+            return;
+        }
+        CHECK(pthread_join(th, NULL) == 0);
+        CHECK(a.err == 0);
+    }
+
+    CHECK(tc_nodes() == nodes0);              /* G5:注册表回到基线 */
+    CHECK(wmm_tcache_cached_total() == 0);    /* 每块都经析构刷空 */
+    CHECK(total_live() == base);              /* Σ live 分毫不差 */
+
+    size_t rss1 = rss_kb();
+    CHECK(rss1 <= rss0 + 20480);              /* 粗检:20MB 容差内不漂 */
 }
 
 /* ---- 关闭开关:直通慢路径 ---- */
@@ -573,7 +721,9 @@ int test_tcache(void) {
     check_capacity_formula();
     check_hit_rate();
     check_head_capacity();
+    check_gc_occasional();
     check_thread_lifecycle();
+    check_thread_churn();
     check_disabled_path();
     check_cross_thread_free();
     check_fork_single_thread();

@@ -4,7 +4,7 @@
  * 压栈即释放,不碰任何锁(对应 jemalloc tcache.c / cache_bin.c 的
  * 裁剪版;这里用 head 索引栈替代其"低 16 位指针水位"技巧,语义等价,
  * 快路径同样只有一次比较)。bin 锁只在三种批量时刻出现:缓存空时
- * 填充、缓存满时部分刷出、线程退出/收敛核对时全量刷出。
+ * 填充、缓存满时 GC/部分刷出、线程退出/收敛核对时全量刷出。
  *
  * 缓存块跟线程同生命周期:首次分配惰性创建,一次 mmap 整块
  * [wmm_tcache_t 结构 | 36 个栈数组],线程退出整块 munmap。
@@ -23,6 +23,12 @@
  * 最后一个缓存对象上退休:nfree 要涨到 nregs,要求该 slab 的全部
  * 对象都在空闲链上,自然包括此刻批次里尚未归还的那些;等最后一个
  * 也归还时才退休,之后批次里不再有它的对象。
+ *
+ * M9 起满栈不再只按固定比例刷出,而是先跑 GC:用 (head − low_water)
+ * 估计"上次 GC 以来真正消耗了多少",retain = 用量×1.25(完全没动
+ * 过就留 2 个种子),把驻留压到贴近真实需求——偶尔用一次的类囤到
+ * 天荒地老的问题由此根治。GC 同时承担自适应填充:nfill 随低水位
+ * 信号增减,细节见 tcache_gc_bin 处的注释。
  */
 
 #define _GNU_SOURCE   /* gettid 的 unistd.h 声明在 __USE_GNU 门下,而
@@ -82,6 +88,8 @@ static bool tcache_create(void) {
     t->t_free_bytes  = 0;
     t->t_alloc_cnt   = 0;
     t->t_free_cnt    = 0;
+    t->gc_evt        = 0;
+    t->gc_next       = 0;
 
     /* 栈数组紧跟在结构体后。结构体 8 字节对齐且尺寸是 8 的倍数,
        所以每个栈数组都天然满足指针数组的对齐要求 */
@@ -213,6 +221,73 @@ void wmm_tcache_flush_all(void) {
             tcache_flush_bins(g_tcache, i, g_tcache->bins[i].head);
 }
 
+/* ==================== GC 与自适应填充 ====================
+ *
+ * 目标:把每个 bin 的驻留压到"最近真实消耗"附近,而不是放任囤积到
+ * 容量顶。衡量工具是 low_water——自上次 GC 以来 head 到过的最低点,
+ * 快路径每次弹栈都会更新它,所以它永远免费。
+ *
+ * retain 公式:used = head − low_water 是这段窗口里真正被弹走、消耗
+ * 掉的对象数。没动过(used==0)留 2 个当种子,省得下一次分配立刻回
+ * 慢路径;用过的留"用量 + 25% 余量",封顶容量——需求涨缓存跟着涨,
+ * 需求落缓存跟着落,GC 因此对"偶尔用一次的类"和"热类"一视同仁地
+ * 给出各自合适的驻留。
+ *
+ * nfill 自适应与 GC 共享同一个信号:low_water==0 说明这段窗口里缓存
+ * 被完整吃空过——供不应求,填充量翻倍(封顶容量一半);否则说明
+ * 供应盖过了消耗,减半(下限 2)。这就是"GC 后减半、连续填满翻倍"
+ * 的落地:填满事件本身无法直接观测,"曾经到过 0"是它的白盒等价物,
+ * 和 jemalloc 按低水位调 fill-div 是同构的。
+ *
+ * 两个触发点:
+ *   a) 满栈释放——见 wmm_tcache_free,先 GC 再压栈;
+ *   b) 释放事件轮转——每 WMM_TCACHE_GC_EVERY 次 free 对一个 bin 跑
+ *      GC,轮转覆盖所有类。计数器放释放路径而非"每 N 次分配":
+ *      囤积只发生在释放侧,分配只会把 head 往下推,自然瘦身。
+ *
+ * 快照纪律:used 与 starved 必须先于任何刷出读取——tcache_flush_bins
+ * 会把 low_water 重置成新 head,拿不到旧水位。 */
+
+static void tcache_gc_bin(szind_t i) {
+    wmm_cache_bin_t *cb = &g_tcache->bins[i];
+    unsigned ncached = cb->head;
+
+    if (ncached == 0)
+        return;   /* 空缓存没东西可刷,也没有用量可读 */
+
+    bool     starved       = (cb->low_water == 0);
+    unsigned used_since_gc = ncached - cb->low_water;
+
+    if (used_since_gc == 0) {
+        if (ncached > 2)
+            wmm_tcache_flush(i, ncached - 2);   /* 没动过:留 2 个种子 */
+    } else {
+        unsigned retain = used_since_gc + (used_since_gc >> 2);
+        if (retain > cb->ncached_max)
+            retain = cb->ncached_max;
+        if (ncached > retain)
+            wmm_tcache_flush(i, ncached - retain);
+    }
+
+    if (starved) {                 /* 被完整吃空过:供不应求,加大填充 */
+        unsigned nf = (unsigned)cb->nfill << 1;
+        unsigned cap = (unsigned)(cb->ncached_max >> 1);
+        cb->nfill = (uint16_t)(nf > cap ? cap : nf);
+    } else if (cb->nfill > 2) {    /* 供应过剩:减半,别一次填太多 */
+        cb->nfill = (uint16_t)(cb->nfill >> 1);
+    }
+
+    cb->low_water = cb->head;   /* 水位重置:下一轮从现在的存量算起。
+                                   刷出分支里 flush 已重置过,这里补齐
+                                   无刷出分支,保证 GC 周期语义一致 */
+}
+
+void wmm_tcache_gc(szind_t i) {
+    if (g_tcache == NULL)
+        return;
+    tcache_gc_bin(i);
+}
+
 /* ==================== 快路径 ====================
  *
  * 两个函数只被本线程调用,零锁零原子:head 是唯一游标,栈数组是
@@ -232,13 +307,26 @@ void *wmm_tcache_alloc(szind_t i) {
 void wmm_tcache_free(szind_t i, void *p) {
     wmm_cache_bin_t *cb = &g_tcache->bins[i];
 
-    /* 满了先按 3/4 比例部分刷出(留 1/4 在栈上),再压新的对象。
-       全刷会让下一次分配立刻回慢路径;留四分之一保住了热对象的
-       LIFO 局部性,又给后续释放腾出整批的余量 */
-    if (cb->head == cb->ncached_max)
-        tcache_flush_bins(g_tcache, i,
-                          (unsigned)(cb->ncached_max - cb->ncached_max / 4));
+    /* 满栈先 GC:retain 公式算出的驻留目标比固定留 1/4 更贴近真实
+       用量。热 bin(用量顶到容量、GC 全留)无处可刷,原样压栈会越顶,
+       退回 M8 的 3/4 部分刷出兜底——保证栈位、head 永不越过容量 */
+    if (cb->head == cb->ncached_max) {
+        tcache_gc_bin(i);
+        if (cb->head == cb->ncached_max)
+            tcache_flush_bins(g_tcache, i,
+                              (unsigned)(cb->ncached_max - cb->ncached_max / 4));
+    }
     cb->stack[cb->head++] = p;
+
+    /* 释放事件轮转:囤积只发生在释放侧,计数器放这里。每 N 次 free
+       对一个轮转 bin 跑 GC,让"偶尔用一次"的类也有机会被压回 retain。
+       多出来的快路径代价只有一条普通计数器自增 + 一次比较 */
+    if (++g_tcache->gc_evt >= WMM_TCACHE_GC_EVERY) {
+        g_tcache->gc_evt = 0;
+        szind_t bin = g_tcache->gc_next;
+        g_tcache->gc_next = (uint8_t)((bin + 1) % WMM_NBINS);
+        tcache_gc_bin(bin);
+    }
 }
 
 /* ==================== 填充 ====================

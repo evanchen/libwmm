@@ -359,6 +359,15 @@ struct wmm_tcache_s {
     uint64_t      t_free_bytes; /* 累计释放字节 */
     uint32_t      t_alloc_cnt;  /* 累计分配次数 */
     uint32_t      t_free_cnt;   /* 累计释放次数 */
+
+    /* ---- GC 状态(唯一写者 = 本线程,非原子) ---- */
+    uint32_t      gc_evt;      /* 释放事件计数:每 WMM_TCACHE_GC_EVERY 次
+                                  free 触发一轮轮转 GC。囤积只发生在释放
+                                  侧(分配只会把 head 往下推),计数器放
+                                  在 free 路径,快路径只多一条自增 */
+    uint8_t       gc_next;     /* 轮转游标:下次事件 GC 要处理的 bin 号,
+                                  0..35 循环——让"偶尔用一次"的类也有
+                                  机会被压回 retain */
     wmm_cache_bin_t bins[WMM_NBINS + 1];  /* [0..35] = 各小对象类的缓存;
                                              [36] 预留。
                                              大对象刻意不做线程缓存:所有
@@ -389,6 +398,10 @@ extern pthread_key_t   g_tcache_key;          /* 线程退出析构键,wmm_boot 
  * 无界膨胀钉死——线程多时,每线程的缓存都是实数。 */
 #define WMM_TCACHE_NCACHED_MIN 20u
 #define WMM_TCACHE_NCACHED_MAX 200u
+#define WMM_TCACHE_GC_EVERY 256u   /* 释放事件轮转间隔:每这么多次 free
+                                      轮转 GC 一个 bin。36 个 bin 全轮
+                                      一遍 ≈ 9.2K 次 free,任何偶尔用
+                                      的类都等得起这个观察窗口 */
 
 /* 线程缓存操作(wmm_tcache.c)。同步模型:快路径只碰本线程的块,
  * 零锁零原子;填充/刷出持目标 bin 锁批量搬运;注册表增删持
@@ -401,6 +414,10 @@ void     wmm_tcache_flush(szind_t i, unsigned n);
 /* 从栈底(最冷端)刷 n 个回 bin;退休 slab 放锁后交物理层 */
 void     wmm_tcache_flush_all(void);
 /* 本线程全类刷空、缓存块保留:收敛核对与线程退出前的共用步骤 */
+void     wmm_tcache_gc(szind_t i);
+/* 对当前线程缓存的一个 bin 跑 GC:按 retain 公式(用量+25% 或种子 2)
+ * 刷出富余,并按低水位信号自适应 nfill。满栈触发与事件轮转共用;
+ * 白盒测试直调(TC3),将来的 wmm_ctl("gc") 也走它 */
 void    *wmm_tcache_alloc(szind_t i);
 void     wmm_tcache_free(szind_t i, void *p);
 /* 快路径弹栈/压栈。alloc 返回 NULL = 缓存空,调用方去填充;
