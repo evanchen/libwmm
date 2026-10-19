@@ -181,6 +181,11 @@ void wmm_atfork_child(void);
  *                             (MADV_DONTNEED / MADV_FREE),只影响
  *                             之后的 purge;非法值返回 -1/EINVAL
  *   config.verbose            调试输出开关
+ *   shm.create                创建共享监控区,变参为 const char *
+ *                             文件路径;成功后可被任意进程只读
+ *                             mmap 该文件读快照与事件环,后台线程
+ *                             每秒刷新。路径非法返回 -1 并透传 errno;
+ *                             本进程已创建过返回 -1/EEXIST
  * 返回 0 成功;未知命令返回 -1 并置 errno=EINVAL;
  * 命令已登记但功能未实现返回 -1 并置 errno=ENOSYS。
  */
@@ -195,7 +200,9 @@ int  wmm_stats_snapshot(wmm_stats_t *st);
 int  wmm_event_drain(wmm_event_t *buf, size_t n, size_t *got);
 
 /* ==================== 布局锁(共享内存协议的线上格式) ====================
- * 调整任一观测结构前,必须同步升监控协议版本号。
+ * 调整任一观测结构前,必须同步升监控协议版本号(当前值见
+ * src/wmm_shm.h 的 WMM_SHM_VERSION):监控进程与库是两个可独立
+ * 升级的二进制,版本号是它们之间唯一的兼容性判据。
  * 0x13B8 = 5048 = 8 字节汇总头 + 37×24 直方图 + 128×32 线程表。
  * 0x30 = 48 字节事件记录。 */
 _Static_assert(sizeof(wmm_stats_t) == 0x13B8, "wmm_stats_t layout is frozen (SHM ABI)");

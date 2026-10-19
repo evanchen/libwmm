@@ -6,14 +6,15 @@
  * 扩展通道。
  *
  * 已接线:stats.snapshot、stats.per_class、purge、bg.enable/disable、
- * config.madvise_mode。其余命令已登记、返回 ENOSYS,随各子系统
- * 实现逐条接入。分发对 15 项做线性扫描:控制命令不在热路径,
- * 不值得上哈希。约定:返回 0 成功;未知命令 -1/EINVAL;已登记
- * 未实现 -1/ENOSYS。
+ * config.madvise_mode、shm.create。其余命令已登记、返回 ENOSYS,
+ * 随各子系统实现逐条接入。分发对 16 项做线性扫描:控制命令不在
+ * 热路径,不值得上哈希。约定:返回 0 成功;未知命令 -1/EINVAL;
+ * 已登记未实现 -1/ENOSYS。
  *
  * 变参约定:带参数的命令由处理函数按自己的 ABI 取 va_arg;整型
  * 实参按 C 默认提升取 int(如 config.madvise_mode 传 MADV_* 常量),
- * 指针实参直接取指针(如 stats.* 传 wmm_stats_t *)。
+ * 指针实参直接取指针(如 stats.* 传 wmm_stats_t *,shm.create 传
+ * const char * 路径)。
  *
  * 本文件只做分发,不做业务;禁止任何内部分配(与库其余部分同约)。
  */
@@ -114,6 +115,16 @@ static int ctl_madvise_mode(const char *cmd, va_list ap)
     return 0;
 }
 
+/* 创建共享监控区:变参为 const char * 文件路径。命令名带参数而
+ * 不是分成 shm.create/shm.path 两条,是因为路径就是这条命令的
+ * 全部参数,多一条命令只多一个状态。失败原样透传 errno。 */
+static int ctl_shm_create(const char *cmd, va_list ap)
+{
+    (void)cmd;
+    const char *path = va_arg(ap, const char *);
+    return wmm_shm_create(path);
+}
+
 static const wmm_ctl_cmd_t g_ctl_cmds[] = {
     { "stats.snapshot",      ctl_stats_snapshot, "取统计快照(同步合并各线程计数)" },
     { "stats.per_class",     ctl_stats_per_class, "取按尺寸类的直方图" },
@@ -130,6 +141,7 @@ static const wmm_ctl_cmd_t g_ctl_cmds[] = {
     { "config.lg_page",      ctl_enosys,        "查询页大小 2^N" },
     { "config.madvise_mode", ctl_madvise_mode,  "切换内核回收方式 DONTNEED/FREE" },
     { "config.verbose",      ctl_enosys,        "调试输出开关" },
+    { "shm.create",          ctl_shm_create,    "创建共享监控区(参数:文件路径)" },
 };
 
 int wmm_ctl(const char *cmd, ...)

@@ -238,6 +238,10 @@ void wmm_atfork_child(void) {
        子进程里这把锁就永远等不到释放——重建为未锁定 */
     (void)pthread_mutex_init(&g_event_lock, NULL);
 
+    /* 共享监控区:子进程撤掉写映射、放弃写权。父子若同时发布,
+       seqlock 序号交错,读者会拼出从未存在过的快照 */
+    wmm_shm_child_reset();
+
     /* 锁全部重建之后才能动 bin:死线程的缓存要刷回 bin,这是子进程
        里唯一会碰分配器结构的钩子动作。此刻独占执行 */
     wmm_tcache_child_cleanup();

@@ -33,7 +33,7 @@ SRC := $(wildcard src/*.c)
 # 目标文件除头文件外还依赖 Makefile 本身:改了编译选项而没有头文件
 # 变化时,依赖里没有 Makefile 就会复用过期的 .o——"加了 -fPIC 却还在
 # 链旧对象"这类诡异错误就是这么来的。
-HDRS := include/wmm.h src/wmm_internal.h src/wmm_sc.h Makefile
+HDRS := include/wmm.h src/wmm_internal.h src/wmm_sc.h src/wmm_shm.h Makefile
 
 BUILD_DEBUG   := build/debug
 BUILD_RELEASE := build/release

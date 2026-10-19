@@ -332,8 +332,8 @@ static size_t dirty_pages_locked(void) {
 /* ---- PHY2:同步 purge 把脏页还给内核 ----
  * 三件事分别证明:账本(dirty 归零、页数守恒转 RETAINED)、物理
  * 事实(RSS 实测回落,不是只改状态),以及回收后的页仍可零系统
- * 调用复用。1GB 的量按任务书取;断言只依赖"远大于 dirty_max",
- * 测试机内存紧张时改 NB 即可。 */
+ * 调用复用。NB×4MB 这个量级取的是"远大于 dirty_max",断言只依赖
+ * 这一点;测试机内存紧张时改 NB 即可。 */
 static void check_purge(void) {
     drain_free_pool();
 

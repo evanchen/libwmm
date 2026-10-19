@@ -32,14 +32,13 @@
 
 /* ==================== 事件环 ==================== */
 
-#define WMM_EVENT_RING 1024u
-
 static wmm_event_t   g_event_ring[WMM_EVENT_RING];
 static unsigned      g_event_head;   /* 读游标:下一条待消费;head==tail = 空 */
 static unsigned      g_event_tail;   /* 写游标:下一个写入位 */
+static uint64_t      g_event_total;  /* 累计写入条数(只增);与写游标同锁更新 */
 pthread_mutex_t      g_event_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static uint64_t mono_ns(void) {
+uint64_t wmm_mono_ns(void) {
     struct timespec ts;
     (void)clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
@@ -48,7 +47,7 @@ static uint64_t mono_ns(void) {
 void wmm_event_log(uint32_t type, void *ptr) {
     wmm_event_t ev;
     memset(&ev, 0, sizeof(ev));
-    ev.ts   = mono_ns();
+    ev.ts   = wmm_mono_ns();
     ev.type = type;
     ev.tid  = g_tcache != NULL ? g_tcache->tid : (uint32_t)gettid();
     ev.ptr  = (uintptr_t)ptr;
@@ -72,8 +71,16 @@ void wmm_event_log(uint32_t type, void *ptr) {
     pthread_mutex_lock(&g_event_lock);
     g_event_ring[g_event_tail] = ev;
     g_event_tail = (g_event_tail + 1) % WMM_EVENT_RING;
+    g_event_total++;
     if (g_event_tail == g_event_head)   /* 环满:覆盖最旧的一条 */
         g_event_head = (g_event_head + 1) % WMM_EVENT_RING;
+    pthread_mutex_unlock(&g_event_lock);
+}
+
+void wmm_event_copy(wmm_event_t *dst, uint64_t *total) {
+    pthread_mutex_lock(&g_event_lock);
+    memcpy(dst, g_event_ring, sizeof(g_event_ring));
+    *total = g_event_total;
     pthread_mutex_unlock(&g_event_lock);
 }
 

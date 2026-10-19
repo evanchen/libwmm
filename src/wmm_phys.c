@@ -453,8 +453,10 @@ static void *wmm_bg_thread(void *arg) {
 
         pthread_mutex_unlock(&g_bg_lock);
         wmm_phys_purge_if_needed();
-        /* 聚合快照的发布钩子将来挂在这里(wmm_shm_publish),
-           与回收同周期 */
+        /* 共享监控区与回收同周期发布:先回收再发布,读到的
+           active/frag 就是回收之后的状态,不会把已交还内核的页
+           又算进"在用"。未创建共享区时本调用是空操作 */
+        wmm_shm_publish();
         pthread_mutex_lock(&g_bg_lock);
     }
     pthread_mutex_unlock(&g_bg_lock);

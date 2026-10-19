@@ -16,6 +16,7 @@ int test_oracle(void); /* 由 tests/test_oracle.c 提供 */
 int test_stress(void); /* 由 tests/test_stress.c 提供 */
 int test_tcache(void); /* 由 tests/test_tcache.c 提供 */
 int test_stats(void);  /* 由 tests/test_stats.c 提供 */
+int test_shm(void);    /* 由 tests/test_shm.c 提供 */
 
 typedef int (*wmm_test_fn)(void);
 
@@ -31,6 +32,7 @@ static const struct {
     { "stress", test_stress },
     { "tcache", test_tcache },
     { "stats",  test_stats },
+    { "shm",    test_shm },
 };
 
 int main(void) {
