@@ -11,9 +11,10 @@
  *         热 bin 退回 3/4 部分刷出兜底——落点按 GC 公式重放精确断言。
  *   TC3 偶尔用一次的类:填充后晾着不动,显式 GC 把驻留压回 retain
  *         (used==0 → 2 个种子;used>0 → used×1.25),head ≤ retain。
- *   容量公式:每类 ncached_max == clamp(2*nregs, 20, 200),
- *         nfill == ncached_max/2(创建态),栈数组紧贴结构体、按类
- *         顺序排布,各段长度之和与 map_size 精确相等。
+ *   容量公式:每类 ncached_max == clamp(2*nregs, 20, 200),nfill 落
+ *         在自适应范围 [2, ncm/2](创建态 = ncm/2,由 lifecycle 的新
+ *         线程块白盒报告);栈数组紧贴结构体、按类顺序排布,各段
+ *         长度之和与 map_size 精确相等。
  *   线程注册表与退出:工作线程首次分配时建缓存并挂链;pthread 析构
  *         在线程返回时把缓存刷回 bin、摘链、munmap——缓存对象数、
  *         全局 live、注册表节点数三项都回到进场基线。
@@ -107,8 +108,11 @@ static void check_capacity_formula(void) {
             want = WMM_TCACHE_NCACHED_MAX;
 
         CHECK(cb->ncached_max == want);
-        /* 当前阶段还没有自适应:nfill 从创建起就是容量的一半 */
-        CHECK(cb->nfill == cb->ncached_max / 2);
+        /* M9 起 nfill 自适应:创建态是 ncm/2,GC 后会在 [2, ncm/2]
+           里漂(封顶容量一半、下限 2)。主线程的块还被 stress 等前序
+           用例磨过,这里断言的是自适应范围;创建公式由 lifecycle 的
+           新线程块白盒报告覆盖 */
+        CHECK(cb->nfill >= 2 && cb->nfill <= cb->ncached_max / 2);
         CHECK(cb->head <= cb->ncached_max);
         CHECK(cb->low_water <= cb->head);
         CHECK(cb->stack == (void **)(base + off));
@@ -286,16 +290,20 @@ static void check_gc_occasional(void) {
  * 工作线程:nfill 次分配恰好用光一个填充批次(水位回到 0),
  * 再释放一半——这半批对象停在它的缓存里。主线程在它停稳后
  * 检查注册表与缓存总量,然后放行;线程返回触发 pthread 析构,
- * 刷空、摘链、munmap 一次做完。 */
+ * 刷空、摘链、munmap 一次做完。
+ * M9 起批次大小取工作线程自己块的 nfill:主线程的 nfill 被前序
+ * 用例的 GC 磨过,不再等于新块的创建值。worker 白盒报告新块的
+ * ncm/nfill——创建公式 nfill==ncm/2 只对新建块成立,据此断言。 */
 typedef struct {
     szind_t    bin;
-    unsigned   nfill;
+    unsigned   ncm_fresh;    /* 新块创建态:容量(经 ready 发布) */
+    unsigned   nfill;        /* 新块的 nfill,即批次大小 */
     unsigned   half;
-    atomic_int ready;         /* 工作线程:状态已发布 */
-    atomic_int go;            /* 主线程:可以继续收了 */
-    unsigned   err;           /* 工作线程写的错误位,经 ready 发布 */
-    unsigned   head_alloc;    /* nfill 次分配后的水位 */
-    unsigned   head_half;     /* 再释放 half 个后的水位 */
+    atomic_int ready;        /* 工作线程:状态已发布 */
+    atomic_int go;           /* 主线程:可以继续收了 */
+    unsigned   err;          /* 工作线程写的错误位,经 ready 发布 */
+    unsigned   head_alloc;   /* nfill 次分配后的水位 */
+    unsigned   head_half;    /* 再释放 half 个后的水位 */
 } reg_arg_t;
 
 static void *reg_worker(void *arg) {
@@ -304,21 +312,24 @@ static void *reg_worker(void *arg) {
     unsigned  err = 0;
 
     wmm_thread_init();
-    if (g_tcache == NULL)
+    if (g_tcache == NULL) {
         err |= 1u;
+    } else {
+        a->ncm_fresh = g_tcache->bins[a->bin].ncached_max;
+        a->nfill     = g_tcache->bins[a->bin].nfill;
+        a->half      = a->nfill / 2;
 
-    for (unsigned k = 0; k < a->nfill; k++) {
-        o[k] = wmm_alloc(64);
-        if (o[k] == NULL)
-            err |= 2u;
-    }
-    if (g_tcache != NULL)
+        for (unsigned k = 0; k < a->nfill; k++) {
+            o[k] = wmm_alloc(64);
+            if (o[k] == NULL)
+                err |= 2u;
+        }
         a->head_alloc = g_tcache->bins[a->bin].head;
 
-    for (unsigned k = 0; k < a->half; k++)
-        wmm_free(o[k]);
-    if (g_tcache != NULL)
+        for (unsigned k = 0; k < a->half; k++)
+            wmm_free(o[k]);
         a->head_half = g_tcache->bins[a->bin].head;
+    }
 
     a->err = err;
     atomic_store_explicit(&a->ready, 1, memory_order_release);
@@ -334,19 +345,17 @@ static void check_thread_lifecycle(void) {
     uint64_t base   = flush_baseline();
     int      nodes0 = tc_nodes();
     szind_t  bin    = wmm_size2index(64);
-    unsigned nfill  = g_tcache->bins[bin].nfill;
     reg_arg_t a;
 
     a.bin        = bin;
-    a.nfill      = nfill;
-    a.half       = nfill / 2;
+    a.ncm_fresh  = 0;
+    a.nfill      = 0;
+    a.half       = 0;
     a.err        = 0;
     a.head_alloc = 0;
     a.head_half  = 0;
     atomic_init(&a.ready, 0);
     atomic_init(&a.go, 0);
-
-    CHECK(a.half > 0);
 
     pthread_t th;
     if (pthread_create(&th, NULL, reg_worker, &a) != 0) {
@@ -358,10 +367,12 @@ static void check_thread_lifecycle(void) {
         sched_yield();
 
     CHECK(a.err == 0);
-    CHECK(a.head_alloc == 0);         /* 一个填充批次正好被 nfill 次
-                                         分配用光,不多不少 */
-    CHECK(a.head_half == a.half);     /* 释放的半批全压在缓存栈上 */
-    CHECK(tc_nodes() == nodes0 + 1);  /* 注册表多一个线程节点 */
+    CHECK(a.nfill >= 2);                  /* 新块批次至少 2,才有半批 */
+    CHECK(a.nfill == a.ncm_fresh / 2);    /* 创建公式:填充目标 = 一半 */
+    CHECK(a.head_alloc == 0);             /* 一个填充批次正好被 nfill
+                                             次分配用光,不多不少 */
+    CHECK(a.head_half == a.half);         /* 释放的半批全压在缓存栈上 */
+    CHECK(tc_nodes() == nodes0 + 1);      /* 注册表多一个线程节点 */
     CHECK(wmm_tcache_cached_total() == a.half);   /* 主线程已刷空,
                                                      缓存总量就是它的 */
 
@@ -414,11 +425,14 @@ static void *churn_worker(void *arg) {
         if (b4k[k] == NULL)
             err |= 4u;
     }
-    for (int k = 0; k < 4; k++)
+    /* 全部归还:对象要么回到缓存栈(填充余量 + 刚释放的),要么直接
+       回 bin;一个都不许留在应用手里——线程退出后没人替它释放,局部
+       数组里的指针不会自己消失。缓存里的存量由 pthread 析构统一
+       刷空 + munmap,这正是本用例要验证的回收路径 */
+    for (int k = 0; k < 8; k++)
         wmm_free(a64[k]);
-    for (int k = 0; k < 2; k++)
+    for (int k = 0; k < 4; k++)
         wmm_free(b4k[k]);
-    /* 剩余对象留在缓存里,返回时由 pthread 析构统一刷空 + munmap */
     a->err = err;
     return NULL;
 }
