@@ -153,6 +153,14 @@ bool      wmm_pte_is_extent(const void *p, void **out_ext);  /* tag=1 ⇒ *out=e
  * 释放即空,永远不会进 nonfull 堆——状态机不必为它们写插入分支
  * (jemalloc bin.c 同样跳过)。它们存在的意义:请求 4K 差一点、
  * 8K 差一点时给出近-exact 的规格,而不是向上凑整页浪费近一页。
+ *
+ * guard 布局(运行期检测开关打开时小对象走这条):一个 slab 只放
+ * 一个对象,数据区前面是 redzone 兼对齐垫层,后面再跟一段
+ * redzone。为什么每个 slab 只放一个:释放即整块进入隔离区,
+ * 隔离单位与分配单位重合,不需要为"部分对象隔离"再维护一套
+ * 空闲链与计数;代价是内存放大,而 guard 本来就是排障模式。
+ * 常规 slab 与 guard slab 可以同时存在,slab 自己记录布局类型,
+ * 切换开关不要求先把旧对象释放干净。
  */
 struct wmm_slab_s {
     uint32_t    szind;      /* 所属尺寸类编号(0..35)。free 反查拿到 slab
@@ -160,10 +168,25 @@ struct wmm_slab_s {
     uint32_t    nfree;      /* 空闲对象数。两个边界驱动 bin 状态机:
                                0 = 满(挂 full 链),nregs = 全空(整块
                                还给物理层) */
-    uint32_t    free_head;  /* 空闲链头(对象编号);UINT32_MAX = 链空 */
-    uint32_t    pad;        /* 占位凑 8 字节对齐 */
-    void       *addr;       /* slab 基址(页对齐)。对象 r 的地址 =
-                               addr + r*reg_size,编号与地址一次除法互推 */
+    uint32_t    free_head;  /* 空闲链头(对象编号);UINT32_MAX = 链空。
+                               guard slab 只有一个对象,此字段恒为
+                               UINT32_MAX,不参与取还 */
+    uint32_t    nregs;      /* 本 slab 的对象数。常规 slab 等于尺寸类的
+                               nregs;guard slab 固定为 1。bin 状态机按
+                               本字段判断全空,而不是回查尺寸类表——
+                               同一套状态机才能同时服务两种布局 */
+    uint32_t    reg_size;   /* 对象数据区字节数(不含 redzone)。常规
+                               slab 等于尺寸类的 reg_size;guard slab
+                               的哨兵与对齐垫层都在数据区之外 */
+    uint32_t    data_off;   /* 首个对象数据区相对 slab 基址的偏移。
+                               常规 slab 为 0;guard slab 前面有
+                               redzone 与对齐垫层,数据区不从基址开始 */
+    bool        guarded;    /* 本 slab 是否走 guard 布局。free 反查后
+                               据此分流到 guard 路径;常规 slab 恒假 */
+    uint8_t     pad[7];     /* 占位,保持后面指针字段 8 字节对齐 */
+    void       *addr;       /* slab 基址(页对齐)。常规对象 r 的地址 =
+                               addr + r*reg_size,编号与地址一次除法互推;
+                               guard 对象只有一个,地址 = addr + data_off */
     /* ---- 挂链(以下三组链都在所属 bin 的锁内维护) ---- */
     wmm_slab_t *full_prev, *full_next;        /* 满双向链:满 slab 仍需 O(1)
                                                  摘除(释放使它由满转非满) */
@@ -179,6 +202,8 @@ struct wmm_slab_s {
                                                  配对堆时启用它,不必改布局 */
     void       *ext;        /* 承载本 slab 的物理块(extent)。全空归还时
                                由此找到 extent 做相邻合并 */
+    uintptr_t   site_pc;    /* guard 对象分配时的用户调用点,供泄漏
+                               全量 dump 归因;常规 slab 恒 0 */
 };
 
 /* ==================== bin:一个尺寸类的 slab 管理者 ====================
@@ -219,12 +244,24 @@ extern wmm_bin_t g_bins[WMM_NBINS];   /* 全局单 arena,初始化时全零 */
  * 锁契约:以下函数自身不加锁,调用方必须已持有所属 bin 的锁——
  * 上锁成本由调用方(主路径、tcache 批量)统一摊销。 */
 void  wmm_slab_init(wmm_slab_t *sl, void *addr, szind_t i);
-/* 把 [addr, addr+slab_size) 初始化为类 i 的 slab:建全量空闲链、
+/* 把 [addr, addr+slab_size) 初始化为类 i 的常规 slab:建全量空闲链、
  * 登记每一页的页表项。addr 页对齐由物理层保证,sl 头由调用方从
  * base 区取得。ext 字段留空,物理层交接 extent 时填。 */
+void  wmm_slab_init_guard(wmm_slab_t *sl, void *addr, szind_t i,
+                          size_t npages);
+/* 把一个 guard slab 初始化成"只有一个空闲对象"的布局:数据区
+ * 偏移由尺寸类推出,前后铺满 0xBD 哨兵,登记 npages 页的页表项。
+ * npages 由调用方按 data_off + reg_size + 尾部哨兵算足,必须覆盖
+ * 整个对象;冗余页留着不用。 */
+void  wmm_slab_guard_rearm(wmm_slab_t *sl);
+/* 把一个已是 guard 布局的 slab 恢复到"唯一对象空闲、哨兵完整"的
+ * 状态,供回收池复用:不重建页表、不动尺寸类与物理接线,只清
+ * 链指针、复位 nfree/free_head 并重铺哨兵。 */
 void *wmm_slab_alloc(wmm_slab_t *sl);          /* 弹空闲链取对象;nfree==0
                                                  调用即违反内部契约,断言失败 */
-void  wmm_slab_free(wmm_slab_t *sl, void *p);  /* 压链归还;nfree++ */
+void  wmm_slab_free(wmm_slab_t *sl, void *p);  /* 压链归还;nfree++。
+                                                 guard slab 改为把数据区
+                                                 填 0xBC 后 nfree++ */
 void  wmm_bin_slab_install(wmm_bin_t *b, wmm_slab_t *sl);
 /* 新 slab 上任为 slabcur。前提:当前 slabcur==NULL——bin_alloc 返回
  * NULL 的路径已保证(旧热 slab 已挂 full);违反即断言失败 */
@@ -302,6 +339,12 @@ wmm_slab_t   *wmm_phys_alloc_slab(szind_t i);
 /* 取 pgs 页(优先 first-fit 复用,否则窗口 bump)+ slab 头(base 区),
  * 完成 slab 初始化、页表登记与 ext↔slab 双向接线。可在持有 bin 锁
  * 时调用。NULL = 窗口耗尽或元数据耗尽(OOM)。 */
+wmm_slab_t   *wmm_phys_alloc_slab_pages(wmm_slab_t *sl, szind_t i,
+                                        size_t npages, bool guarded);
+/* 同上,但 slab 头由调用方提供,页数也由调用方指定:guard 子系统
+ * 需要按对象尺寸只取够用的页,并复用退休 slab 的头。guarded 为真
+ * 时走 guard 布局初始化,否则按常规尺寸类布局。成功返回 sl;失败
+ * 返回 NULL,sl 保持未接线状态,调用方可把头发回回收链。 */
 void          wmm_phys_free_slab(wmm_slab_t *sl);
 /* 整块 slab 退休:页入空闲(不清物理映射)、页表清零、向两侧合并。
  * 必须在 bin 锁释放后调用(bin 已不引用它;物理层只拿自己的锁)。 */
@@ -359,6 +402,13 @@ void wmm_bg_child_reset(void);
 /* 写一条事件(类型/指针),自动带时间戳、线程号、涉事尺寸类
  * (尽力反查,未知为 0)与两帧调用点。低频路径专用。 */
 void wmm_event_log(uint32_t type, void *ptr);
+
+/* 同上,但调用点由调用方显式给出。为什么需要:guard 的校验发生在
+ * 辅助函数甚至后台线程里,__builtin_return_address 取到的会是
+ * wmm_guard.c 内部帧;排障要看的是用户的分配/释放点。ptr 的尺寸类
+ * 仍按页表尽力反查。pc0/pc1 允许为 0(未知)。 */
+void wmm_event_log_site(uint32_t type, void *ptr, uintptr_t pc0,
+                        uintptr_t pc1);
 extern pthread_mutex_t g_event_lock;  /* 事件环互斥锁;fork 子进程重建 */
 
 /* 整环快照拷贝到 dst(容量须为 WMM_EVENT_RING),累计写入条数写入
@@ -634,6 +684,106 @@ void wmm_prof_thread_drain(wmm_tcache_t *t);
 unsigned wmm_prof_top(wmm_prof_entry_t *dst, unsigned k);
 
 extern pthread_mutex_t g_prof_lock;   /* 聚合表锁;fork 子进程重建 */
+
+/* ==================== guard:poison / redzone / quarantine ====================
+ *
+ * guard 默认关闭,运行期由 wmm_ctl("guard.enable"/"guard.disable")
+ * 切换。打开后新分配的小对象走独立的 guard bin 池:每个 slab 只放
+ * 一个对象,数据区前后各有一圈 0xBD 哨兵;释放时数据区填 0xBC 并
+ * 进入隔离队列,隔离期满后 slab 转入按类别的回收池,复用前再校验
+ * 一次 poison。常规 slab 与 guard slab 可以同时在世:slab 自己记录
+ * guarded 标志,切换开关不要求先把旧对象释放干净。
+ *
+ * 为什么隔离的粒度是整个 slab:一个 guard slab 只有一个对象,释放
+ * 即整块空闲,状态机的"全空退休"与"进入隔离"是同一步;要做逐对象
+ * 隔离,就得让一个 slab 同时存在"在应用手里"和"在隔离区"两种对象,
+ * 还要把隔离中的对象从空闲链里摘掉,状态组合多出一整个维度。
+ *
+ * 锁:g_guard_lock 保护 guard bin 的全部计数、隔离队列、回收池与
+ * slab 头回收链。单独一把锁而不是复用各 bin 的 lock:guard 池的
+ * 元数据本来就是全局队列,一把锁把所有 guard 路径串行化,也避免
+ * guard 状态与常规 bin 状态交叉。锁序 bins → guard → ext → threads
+ * → prof → base,与 fork prepare 一致。
+ */
+
+#define WMM_GUARD_RZ 16u   /* 数据区尾部 redzone 的字节数。取 16 而不是
+                              8:返回指针契约要求 16 字节对齐,数据区
+                              起点必须按对象尺寸的自然对齐摆放;尾部
+                              哨兵不参与对齐,但统一 16 字节便于按字
+                              检查,也省掉一个按类的尺寸分支 */
+#define WMM_GUARD_QUARANTINE 512u  /* 隔离队列容量,以 slab 为单位。
+                              每个 guard slab 只有一个对象,所以这也
+                              就是"最多有多少个刚释放的对象不会被
+                              复用"。队满时最旧的一项先转入回收池,
+                              释放路径不会因为隔离而无限等待 */
+#define WMM_LEAK_WINDOWS 5u        /* 泄漏告警要求 live_bytes 连续上涨
+                                      的 1 秒窗口数。窗口太少会把启动
+                                      期的正常爬坡当泄漏;连续 5 秒仍
+                                      在涨,且累计涨幅过下面的阈值,
+                                      才认为值得告警 */
+#define WMM_LEAK_GROWTH (64u << 10) /* 告警的最小累计涨幅。小对象抖动
+                                      在 64KB 以内很常见,设下限让告警
+                                      只对持续、可观的增长发声 */
+
+extern wmm_bin_t g_guard_bins[WMM_NBINS]; /* guard 专用 bin 池;计数在
+                                             g_guard_lock 内更新。这些
+                                             bin 的 lock 字段不使用,
+                                             不要拿它们上锁 */
+extern pthread_mutex_t g_guard_lock;      /* guard 子系统唯一锁;fork
+                                             子进程里重建 */
+
+/* 求 guard 数据区相对 slab 基址的偏移:至少 16 字节,并按对象尺寸
+ * 中最大的 2 的幂因子对齐。对齐分配先把请求尺寸取整到 alignment
+ * 的倍数,选中的尺寸类因此是 alignment 的倍数;只要数据区偏移也
+ * 整除 alignment,页对齐的 slab 基址就能保证返回指针满足契约。
+ * 上限取页大小:更大的对齐走物理层过分配,不经过这里。 */
+static inline uint32_t wmm_guard_data_off(uint32_t reg_size) {
+    uint32_t align = reg_size & (~reg_size + 1u);  /* 最低置位的 2 的幂 */
+    if (align > (uint32_t)WMM_PAGE)
+        align = (uint32_t)WMM_PAGE;
+    if (align < (uint32_t)WMM_ALIGN)
+        align = (uint32_t)WMM_ALIGN;
+    return align;
+}
+
+/* 取一个 guard 小对象。site_pc 是 wmm_alloc 的返回地址,记在 slab
+ * 上供泄漏全量 dump 归因。返回 NULL = 窗口或元数据耗尽。 */
+void *wmm_guard_alloc(szind_t i, uintptr_t site_pc);
+
+/* 归还 guard 对象。p 必须等于该 slab 唯一的数据区地址,否则按野
+ * 指针记事件且不计数。返回 true 表示这是一次有效释放;调用方据此
+ * 更新线程局部释放计数,双重释放等无效调用不能污染统计。 */
+bool  wmm_guard_free(wmm_slab_t *sl, void *p, uintptr_t site_pc);
+
+/* 后台每秒调用:把隔离队列里的 slab 转入类别回收池,顺手校验隔离
+ * 期间的写入。测试也可直接调用——它自己拿锁,可在任意线程发起。 */
+void  wmm_guard_tick(void);
+
+/* 关闭 guard:先收编隔离队列与回收池(校验后把页还给物理层),
+ * 再停止让新分配走 guard。已经在应用的 guard 对象保持原布局,
+ * 释放时仍走 guard 路径。 */
+void  wmm_guard_disable(void);
+
+/* 全量 dump 当前存活的 guard 对象,按分配调用点聚合,填 dst(容量
+ * k),返回实际条数。只覆盖 guard 对象:常规 slab 没有逐对象的
+ * 调用点元数据,硬凑只能给出每类总量,不是这个命令要回答的问题。 */
+unsigned wmm_guard_leak_dump(wmm_prof_entry_t *dst, unsigned k);
+
+/* 泄漏 B 档:对比自上次调用以来的调用点 TOP 表增量,按增量字节
+ * 降序填 out(容量 k),返回条数;首次调用建立基线并返回 0。 */
+int wmm_leak_check(int k, wmm_prof_entry_t *out);
+
+/* 泄漏 C 档:后台每秒调用。连续 WMM_LEAK_WINDOWS 个窗口 live_bytes
+ * 单调上涨且累计涨幅达到阈值时,记 0xDA 事件并自动打开采样。 */
+void wmm_leak_tick(void);
+
+/* 清空泄漏 C 档的窗口状态。后台线程停止后调用,测试用;正常运行
+ * 不需要。 */
+void wmm_leak_reset(void);
+
+/* 当前 live 字节数(含线程缓存与 guard 对象),与统计快照同一口径。
+ * 供泄漏窗口使用,不推进快照 epoch。 */
+uint64_t wmm_live_bytes_now(void);
 
 /* ==================== 全局状态(初始化时定死) ==================== */
 

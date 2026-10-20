@@ -91,11 +91,14 @@ static size_t gen_size(void) {
     return 262145 + rng() % (1048576 - 262144);
 }
 
-/* Σ live:36 个 bin + 大对象。单线程测试直接读全局,无并发写者。 */
+/* Σ live:36 个常规 bin + 36 个 guard bin + 大对象。单线程测试直接
+   读全局,无并发写者。guard bin 的 live 与常规 bin 同口径(对象在
+   应用手里,含"已分配但尚未释放"),快照也把它们并进 cls[],两侧
+   对账必须用同一口径。 */
 static uint64_t total_live(void) {
     uint64_t sum = 0;
     for (int i = 0; i < WMM_NBINS; i++)
-        sum += g_bins[i].live;
+        sum += g_bins[i].live + g_guard_bins[i].live;
     return sum + g_large.live;
 }
 
@@ -103,7 +106,8 @@ static uint64_t total_live(void) {
 static uint64_t live_bytes_direct(void) {
     uint64_t sum = 0;
     for (int i = 0; i < WMM_NBINS; i++)
-        sum += g_bins[i].live * (uint64_t)wmm_bin_info[i].reg_size;
+        sum += (g_bins[i].live + g_guard_bins[i].live) *
+               (uint64_t)wmm_bin_info[i].reg_size;
     return sum + g_large.live_bytes;
 }
 
@@ -121,7 +125,7 @@ static uint64_t cached_bytes_total(void) {
 }
 
 enum { WMM_ORACLE_SLOTS = 512, WMM_ORACLE_STEPS = 1000000,
-       WMM_ORACLE_CKPT = 100000 };
+       WMM_ORACLE_GUARD_STEPS = 100000, WMM_ORACLE_CKPT = 100000 };
 
 /* 模型槽位:非空指针即"活"。tag = 本代存储指纹(见文件头);
    只需按槽位区分:发现指纹被毁即"存储被重复交付或踩踏",
@@ -337,7 +341,7 @@ static void run_checkpoint(const wmm_oops_t *o, size_t step,
  * churn 依然全覆盖,但活集合压力形同虚设,长活短活混杂的碎片
  * 形态根本测不到;打点版成功率随占用率升高,负反馈天然形成,
  * 均衡才是内点。 */
-static void run_mode(const wmm_oops_t *o) {
+static void run_mode(const wmm_oops_t *o, size_t steps) {
     g_rng = 0x9E3779B97F4A7C15ULL;   /* 两种模式同种子 = 同一条序列 */
     memset(g_slot, 0, sizeof g_slot);
     g_model_bytes = 0;
@@ -356,7 +360,7 @@ static void run_mode(const wmm_oops_t *o) {
     long     n_live = 0, peak = 0;
     uint64_t n_a = 0, n_f = 0, n_r = 0;
 
-    for (size_t step = 1; step <= WMM_ORACLE_STEPS; step++) {
+    for (size_t step = 1; step <= steps; step++) {
         uint32_t r = rng() & 3u;
         size_t   st = rng() % WMM_ORACLE_SLOTS;
         /* 尺寸在分支前预抽、每步恰抽一次:抽取次数与槽位占用、与
@@ -426,9 +430,9 @@ static void run_mode(const wmm_oops_t *o) {
         obs1_snapshot_check();           /* 终局快照:与直读一致 */
     }
 
-    printf("  %s mode: %d steps, %llu allocs / %llu frees / %llu reallocs, "
+    printf("  %s mode: %zu steps, %llu allocs / %llu frees / %llu reallocs, "
            "peak live %ld\n",
-           o->name, WMM_ORACLE_STEPS,
+           o->name, steps,
            (unsigned long long)n_a, (unsigned long long)n_f,
            (unsigned long long)n_r, peak);
 }
@@ -450,9 +454,24 @@ int test_oracle(void) {
         .usable = usable_glibc, .strict16 = false, .can_count = false,
         .deep = false, .name = "glibc",
     };
+    static const wmm_oops_t guard_ops = {
+        .alloc = wmm_alloc, .realloc = wmm_realloc, .free = wmm_free,
+        .usable = usable_wmm, .strict16 = true, .can_count = true,
+        .deep = true, .name = "wmm+guard",
+    };
 
-    run_mode(&wmm_ops);
-    run_mode(&libc_ops);
+    run_mode(&wmm_ops, WMM_ORACLE_STEPS);
+    run_mode(&libc_ops, WMM_ORACLE_STEPS);
+
+    /* guard 通道再用同一条随机序列压一段(步数少一个量级:每个小
+       对象独占 slab 且走全局锁,状态机分支在十万步内已反复覆盖)。
+       对账口径不变——guard bin 的 live 已并入 total_live/字节和,
+       这正是对"两套布局共享同一套计数语义"的验证。关闭时隔离区、
+       回收池与仍在应用的 guard 对象都会被正确收尾,随后的终局
+       对账要求世界回到进场基线。 */
+    CHECK(wmm_ctl("guard.enable") == 0);
+    run_mode(&guard_ops, WMM_ORACLE_GUARD_STEPS);
+    CHECK(wmm_ctl("guard.disable") == 0);
 
     if (g_fail == 0)
         printf("  all oracle checks passed\n");

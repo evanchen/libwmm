@@ -142,6 +142,7 @@ void wmm_boot(void) {
        复用同一段代码。 */
     for (size_t i = 0; i < WMM_NBINS; i++)
         (void)pthread_mutex_init(&g_bins[i].lock, NULL);
+    (void)pthread_mutex_init(&g_guard_lock, NULL);
     (void)pthread_mutex_init(&g_ext_lock, NULL);
     (void)pthread_mutex_init(&g_threads_lock, NULL);
 
@@ -185,9 +186,10 @@ void wmm_boot(void) {
  *
  * fork 只把调用线程复制进子进程:此刻若别的线程持着某把锁,子进程里
  * 这把锁永远等不到释放。三步应对:
- *   prepare:fork 前置,按固定锁序(各 bin 锁 → g_ext_lock →
- *            g_threads_lock → g_prof_lock → g_base_lock)拿住全部
- *            锁,即 freeze the world——fork 快照必须处在"没有分配器
+ *   prepare:fork 前置,按固定锁序(各 bin 锁 → g_guard_lock →
+ *            g_ext_lock → g_threads_lock → g_prof_lock →
+ *            g_base_lock)拿住全部锁,即 freeze the world——fork
+ *            快照必须处在"没有分配器
  *            操作正在进行"的状态,因此 prepare 会一直阻塞到别的线程
  *            做完并放锁。采样聚合表同样要冻住:后台线程合并到一半
  *            时 fork,子进程会继承一张半更新的表;
@@ -210,6 +212,7 @@ void wmm_boot(void) {
 void wmm_atfork_prepare(void) {
     for (size_t i = 0; i < WMM_NBINS; i++)
         (void)pthread_mutex_lock(&g_bins[i].lock);
+    (void)pthread_mutex_lock(&g_guard_lock);
     (void)pthread_mutex_lock(&g_ext_lock);
     (void)pthread_mutex_lock(&g_threads_lock);
     (void)pthread_mutex_lock(&g_prof_lock);
@@ -221,6 +224,7 @@ void wmm_atfork_parent(void) {
     (void)pthread_mutex_unlock(&g_prof_lock);
     (void)pthread_mutex_unlock(&g_threads_lock);
     (void)pthread_mutex_unlock(&g_ext_lock);
+    (void)pthread_mutex_unlock(&g_guard_lock);
     for (size_t i = WMM_NBINS; i > 0; i--)
         (void)pthread_mutex_unlock(&g_bins[i - 1].lock);
 }
@@ -228,6 +232,7 @@ void wmm_atfork_parent(void) {
 void wmm_atfork_child(void) {
     for (size_t i = 0; i < WMM_NBINS; i++)
         (void)pthread_mutex_init(&g_bins[i].lock, NULL);
+    (void)pthread_mutex_init(&g_guard_lock, NULL);
     (void)pthread_mutex_init(&g_ext_lock, NULL);
     (void)pthread_mutex_init(&g_threads_lock, NULL);
     (void)pthread_mutex_init(&g_prof_lock, NULL);

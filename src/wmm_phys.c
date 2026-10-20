@@ -275,6 +275,28 @@ static void extent_release(wmm_extent_t *e) {
 
 /* ==================== 对外接口 ==================== */
 
+wmm_slab_t *wmm_phys_alloc_slab_pages(wmm_slab_t *sl, szind_t i,
+                                      size_t npages, bool guarded) {
+    pthread_mutex_lock(&g_ext_lock);
+    wmm_extent_t *e = extent_get(npages);
+    pthread_mutex_unlock(&g_ext_lock);
+    if (e == NULL)
+        return NULL;   /* 页已耗尽:sl 保持未接线,调用方决定头去留 */
+
+    /* 两种布局的页表登记都在 init 内部完成;guard 的 npages 由对象
+       尺寸推出(数据区 + 前哨兵/对齐垫层 + 尾部哨兵),可能小于
+       extent_get 实际交付的页数(分裂失败时整块交付)。多出的页
+       无主但记账在 extent 里,退休时整体归还,只浪费不损坏。 */
+    if (guarded)
+        wmm_slab_init_guard(sl, e->addr, i, npages);
+    else
+        wmm_slab_init(sl, e->addr, i);
+
+    sl->ext = e;   /* 双向接线:退休时由此找回 extent */
+    e->slab = sl;
+    return sl;
+}
+
 wmm_slab_t *wmm_phys_alloc_slab(szind_t i) {
     const wmm_bin_info_t *bi = &wmm_bin_info[i];
 
@@ -284,15 +306,10 @@ wmm_slab_t *wmm_phys_alloc_slab(szind_t i) {
         return NULL;
     }
 
-    pthread_mutex_lock(&g_ext_lock);
-    wmm_extent_t *e = extent_get(bi->slab_size >> WMM_LG_PAGE);
-    pthread_mutex_unlock(&g_ext_lock);
-    if (e == NULL)
+    if (wmm_phys_alloc_slab_pages(sl, i, bi->slab_size >> WMM_LG_PAGE,
+                                  false) == NULL)
         return NULL;   /* 头已花掉但不追回:base 只进不出,不构成泄漏 */
 
-    wmm_slab_init(sl, e->addr, i);   /* 注意:init 会把 ext 置 NULL */
-    sl->ext = e;                     /* 双向接线:退休时由此找回 extent */
-    e->slab = sl;
     return sl;
 }
 
@@ -453,6 +470,12 @@ static void *wmm_bg_thread(void *arg) {
 
         pthread_mutex_unlock(&g_bg_lock);
         wmm_phys_purge_if_needed();
+        /* guard 隔离区每轮清空一次:把"刚释放"窗口推进到"已冷却",
+           顺便在冷却点校验隔离期间的写入。泄漏 C 档的窗口计数也
+           按同一周期推进——它的告警自动打开采样,必须在合并之前,
+           让本轮新开的采样尽快进入聚合。 */
+        wmm_guard_tick();
+        wmm_leak_tick();
         /* 采样聚合与回收同周期:没有共享区也要合并,否则环形缓冲
            绕圈就会丢样本。合并放在发布之前,发布时取到的就是刚
            聚合完的表;发布内部再取一次 TOP,重复合并是空操作 */

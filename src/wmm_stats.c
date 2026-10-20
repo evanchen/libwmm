@@ -44,13 +44,15 @@ uint64_t wmm_mono_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-void wmm_event_log(uint32_t type, void *ptr) {
-    wmm_event_t ev;
-    memset(&ev, 0, sizeof(ev));
-    ev.ts   = wmm_mono_ns();
-    ev.type = type;
-    ev.tid  = g_tcache != NULL ? g_tcache->tid : (uint32_t)gettid();
-    ev.ptr  = (uintptr_t)ptr;
+/* 事件公共字段:时间戳、类型、触发线程、涉事指针与尺寸类反查。
+ * 调用点两帧由各入口自己填——guard 的检查点没有"当前用户调用帧"
+ * 可抓,它报的是对象的分配点或释放点。 */
+static void event_fill(wmm_event_t *ev, uint32_t type, void *ptr) {
+    memset(ev, 0, sizeof(*ev));
+    ev->ts   = wmm_mono_ns();
+    ev->type = type;
+    ev->tid  = g_tcache != NULL ? g_tcache->tid : (uint32_t)gettid();
+    ev->ptr  = (uintptr_t)ptr;
 
     /* 涉事尺寸类尽力反查:错误路径上的指针大多有效,能填就不让
        监控端猜。反查只读页表(单写者在锁内,这里非原子的读最多
@@ -60,10 +62,34 @@ void wmm_event_log(uint32_t type, void *ptr) {
         wmm_slab_t *sl;
         void       *ext;
         if (wmm_pte_is_slab(ptr, &sl))
-            ev.cls = sl->szind;
+            ev->cls = sl->szind;
         else if (wmm_pte_is_extent(ptr, &ext))
-            ev.cls = WMM_NBINS;   /* 大对象聚合类号 */
+            ev->cls = WMM_NBINS;   /* 大对象聚合类号 */
     }
+}
+
+static void event_push(const wmm_event_t *ev) {
+    pthread_mutex_lock(&g_event_lock);
+    g_event_ring[g_event_tail] = *ev;
+    g_event_tail = (g_event_tail + 1) % WMM_EVENT_RING;
+    g_event_total++;
+    if (g_event_tail == g_event_head)   /* 环满:覆盖最旧的一条 */
+        g_event_head = (g_event_head + 1) % WMM_EVENT_RING;
+    pthread_mutex_unlock(&g_event_lock);
+}
+
+void wmm_event_log_site(uint32_t type, void *ptr, uintptr_t pc0,
+                        uintptr_t pc1) {
+    wmm_event_t ev;
+    event_fill(&ev, type, ptr);
+    ev.pc0 = pc0;
+    ev.pc1 = pc1;
+    event_push(&ev);
+}
+
+void wmm_event_log(uint32_t type, void *ptr) {
+    wmm_event_t ev;
+    event_fill(&ev, type, ptr);
 
     ev.pc0 = (uintptr_t)__builtin_return_address(0);   /* 事件点的调用者 */
     /* 再上一帧。GCC 对非零参数无条件发 -Wframe-address:编译器不能
@@ -81,13 +107,7 @@ void wmm_event_log(uint32_t type, void *ptr) {
 #pragma GCC diagnostic pop
 #endif
 
-    pthread_mutex_lock(&g_event_lock);
-    g_event_ring[g_event_tail] = ev;
-    g_event_tail = (g_event_tail + 1) % WMM_EVENT_RING;
-    g_event_total++;
-    if (g_event_tail == g_event_head)   /* 环满:覆盖最旧的一条 */
-        g_event_head = (g_event_head + 1) % WMM_EVENT_RING;
-    pthread_mutex_unlock(&g_event_lock);
+    event_push(&ev);
 }
 
 void wmm_event_copy(wmm_event_t *dst, uint64_t *total) {
@@ -143,6 +163,20 @@ int wmm_stats_snapshot(wmm_stats_t *st) {
         live_bytes += live * (uint64_t)wmm_bin_info[i].reg_size;
         live_objs  += live;
     }
+
+    /* 1b) guard 池的存活计数按同一口径并入 cls[i]:guard 对象和
+       常规对象一样是"应用手里的内存",只是布局不同。guard bin 的
+       计数在 g_guard_lock 内更新,这里持同一把锁读取,恒等式依然
+       由同一批读数求和成立。锁序 bins → guard → ext,与 fork 一致。 */
+    pthread_mutex_lock(&g_guard_lock);
+    for (szind_t i = 0; i < WMM_NBINS; i++) {
+        wmm_bin_t *b = &g_guard_bins[i];
+        st->cls[i].live    += b->live;
+        st->cls[i].ndalloc += b->ndalloc;
+        live_bytes += b->live * (uint64_t)wmm_bin_info[i].reg_size;
+        live_objs  += b->live;
+    }
+    pthread_mutex_unlock(&g_guard_lock);
 
     /* 2) 大对象与 active 页数:同一把 ext 锁内读取,与"live 恒等式"
        共享同一个事实来源。锁内只读一次到局部变量,cls[] 与两个汇总

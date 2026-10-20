@@ -67,8 +67,13 @@ void wmm_slab_init(wmm_slab_t *sl, void *addr, szind_t i) {
     sl->szind     = i;
     sl->nfree     = bi->nregs;
     sl->free_head = 0;
-    sl->pad       = 0;
+    sl->nregs     = bi->nregs;
+    sl->reg_size  = bi->reg_size;
+    sl->data_off  = 0;
+    sl->guarded   = false;
+    memset(sl->pad, 0, sizeof sl->pad);
     sl->addr      = addr;
+    sl->site_pc   = 0;
     sl->full_prev = NULL;
     sl->full_next = NULL;
     sl->ph_prev   = NULL;
@@ -95,13 +100,77 @@ void wmm_slab_init(wmm_slab_t *sl, void *addr, szind_t i) {
         wmm_pte_set((char *)addr + pg * WMM_PAGE, e);
 }
 
-void *wmm_slab_alloc(wmm_slab_t *sl) {
-    const wmm_bin_info_t *bi = &wmm_bin_info[sl->szind];
+/* 前哨兵兼对齐垫层:0xBD 铺满 [addr, addr+data_off)。尾部哨兵从
+ * 数据区末尾起铺固定 WMM_GUARD_RZ 字节。两块都在数据区之外,应用
+ * 的越界写只能从两头踩进来;检查点见 wmm_guard.c。 */
+static void guard_fill_redzones(wmm_slab_t *sl) {
+    memset(sl->addr, 0xBD, sl->data_off);
+    memset((char *)sl->addr + sl->data_off + sl->reg_size,
+           0xBD, WMM_GUARD_RZ);
+}
 
+void wmm_slab_init_guard(wmm_slab_t *sl, void *addr, szind_t i,
+                         size_t npages) {
+    const wmm_bin_info_t *bi = &wmm_bin_info[i];
+    uint32_t off = wmm_guard_data_off(bi->reg_size);
+
+    assert((size_t)off + bi->reg_size + WMM_GUARD_RZ <= npages * WMM_PAGE);
+
+    sl->szind     = i;
+    sl->nfree     = 1;             /* 唯一对象空闲 */
+    sl->free_head = UINT32_MAX;    /* guard slab 不走空闲链 */
+    sl->nregs     = 1;
+    sl->reg_size  = bi->reg_size;
+    sl->data_off  = off;
+    sl->guarded   = true;
+    memset(sl->pad, 0, sizeof sl->pad);
+    sl->addr      = addr;
+    sl->site_pc   = 0;
+    sl->full_prev = NULL;
+    sl->full_next = NULL;
+    sl->ph_prev   = NULL;
+    sl->ph_next   = NULL;
+    sl->ph_child  = NULL;
+    sl->ext       = NULL;
+
+    guard_fill_redzones(sl);
+
+    /* 页表登记与常规 slab 同款:每一页都指向同一个头,free 从数据区
+       任意位置反查都能确认归属。guard 的隔离队列与回收池都不清页表
+       ——隔离中的指针仍须被识别为"已释放的 guard 对象",这正是
+       双重释放检测的挂点。 */
+    wmm_pte_t e;
+    e.raw = (uintptr_t)sl;
+    for (size_t pg = 0; pg < npages; pg++)
+        wmm_pte_set((char *)addr + pg * WMM_PAGE, e);
+}
+
+void wmm_slab_guard_rearm(wmm_slab_t *sl) {
+    /* 只复位"对象状态",不动布局与物理接线:页表项在 slab 出生时
+       就固定指向本头,ext 在物理层交接时接好。链指针清空是给随后
+       的 bin_slab_install 用的——池里借 full_next 串链,不清就会把
+       池链带进 bin。 */
+    sl->nfree     = 1;
+    sl->free_head = UINT32_MAX;
+    sl->site_pc   = 0;
+    sl->full_prev = NULL;
+    sl->full_next = NULL;
+    sl->ph_prev   = NULL;
+    sl->ph_next   = NULL;
+    sl->ph_child  = NULL;
+    guard_fill_redzones(sl);
+}
+
+void *wmm_slab_alloc(wmm_slab_t *sl) {
     assert(sl->nfree > 0);   /* 内部契约:调用方状态机先判,违反即 bug */
 
+    if (sl->guarded) {
+        sl->nfree--;
+        return (char *)sl->addr + sl->data_off;
+    }
+
     uint32_t r    = sl->free_head;
-    char    *p    = (char *)sl->addr + (size_t)r * bi->reg_size;
+    char    *p    = (char *)sl->addr + (size_t)r * sl->reg_size;
     sl->free_head = *(uint32_t *)p;   /* 侵入式链:下一编号就在对象首字里 */
     sl->nfree--;
     return p;
@@ -110,9 +179,16 @@ void *wmm_slab_alloc(wmm_slab_t *sl) {
 /* 前提:p 属于本 slab 且当前不空闲。双重释放会破坏链——检测靠
    guard 模块的 poison/隔离,不在这条路径上花检查。 */
 void wmm_slab_free(wmm_slab_t *sl, void *p) {
-    const wmm_bin_info_t *bi = &wmm_bin_info[sl->szind];
+    if (sl->guarded) {
+        /* 释放即整块数据区填 poison:隔离/池里的对象保持着"被释放"
+           的可检验状态,应用在 free 之后的任何写入都会被后续检查
+           抓出来。guard slab 只有一个对象,无需维护空闲链。 */
+        memset(p, 0xBC, sl->reg_size);
+        sl->nfree++;
+        return;
+    }
 
-    uint32_t r = (uint32_t)(((uintptr_t)p - (uintptr_t)sl->addr) / bi->reg_size);
+    uint32_t r = (uint32_t)(((uintptr_t)p - (uintptr_t)sl->addr) / sl->reg_size);
     *(uint32_t *)p = sl->free_head;
     sl->free_head  = r;
     sl->nfree++;
@@ -228,8 +304,9 @@ void *wmm_bin_alloc(wmm_bin_t *b) {
 }
 
 bool wmm_bin_dalloc(wmm_bin_t *b, wmm_slab_t *sl, void *p) {
-    const wmm_bin_info_t *bi = &wmm_bin_info[sl->szind];
-
+    /* 一律以 slab 自己的 nregs 为准:常规 slab 等于尺寸类的 nregs,
+       guard slab 恒为 1。回查尺寸类表会让 guard slab 永远达不到
+       "全空"判据,退休路径直接失效。 */
     wmm_slab_free(sl, p);
     b->live--;
     b->ndalloc++;   /* 累计释放次数:一切归还对象的路径都经此,单点计数 */
@@ -239,7 +316,7 @@ bool wmm_bin_dalloc(wmm_bin_t *b, wmm_slab_t *sl, void *p) {
        热位,若误走"由满转非满"会去 full 链摘一个不在链上的节点,
        直接清掉整条满链。 */
     if (sl == b->slabcur) {
-        if (sl->nfree == bi->nregs) {
+        if (sl->nfree == sl->nregs) {
             b->slabcur = NULL;
             b->curslabs--;
             return true;
@@ -251,8 +328,8 @@ bool wmm_bin_dalloc(wmm_bin_t *b, wmm_slab_t *sl, void *p) {
        上一状态必是 full(它从不进 nonfull,且释放一次即全空);
        其余类 nonfull 成员释放前 nfree≥1,能涨到 nregs 的只可能在
        nonfull 链上。 */
-    if (sl->nfree == bi->nregs) {
-        if (bi->nregs == 1)
+    if (sl->nfree == sl->nregs) {
+        if (sl->nregs == 1)
             bin_unlink_full(b, sl);
         else
             nonfull_remove(&b->nonfull_root, sl);
@@ -364,6 +441,27 @@ void *wmm_alloc(size_t size) {
 
     szind_t i = wmm_size2index(size);
 
+    /* ---- guard 通道:绕过线程缓存 ----
+       每个 guard 对象独占一个 slab,缓存批量搬运没有意义;而且隔离
+       状态机挂在整块 slab 上,对象一旦进缓存,释放时点与隔离时点就
+       脱钩。分配与释放都直接落到 guard 子系统的全局锁。返回 NULL
+       就是 OOM——回落到常规路径会静默绕过检测,让 guard 模式名不
+       副实。 */
+    if (g_opt.guard) {
+        size_t reg = wmm_bin_info[i].reg_size;
+        void  *p = wmm_guard_alloc(i, (uintptr_t)__builtin_return_address(0));
+        if (p != NULL) {
+            wmm_tcache_t *t = stats_slot();
+            if (t != NULL) {
+                t->t_alloc_bytes += reg;
+                t->t_alloc_cnt++;
+                if (g_opt.sample_n != 0)
+                    wmm_prof_sample(t, reg, WMM_ALLOC_FRAME());
+            }
+        }
+        return p;
+    }
+
     /* ---- 快路径:线程缓存 ---- */
     if (g_tcache == NULL)
         wmm_thread_init();   /* 惰性建块;建不出来就直走慢路径 */
@@ -433,7 +531,21 @@ void wmm_free(void *p) {
     void       *ext;
 
     if (wmm_pte_is_slab(p, &sl)) {
-        size_t usize = wmm_bin_info[sl->szind].reg_size;
+        size_t usize = sl->reg_size;
+
+        /* guard 对象绝不进线程缓存:隔离队列以整块 slab 为单位,
+           对象若先进缓存,实际释放时点会被推迟到缓存刷出,隔离窗口
+           与"free 之后立刻检测"的语义都对不上。guard 释放自己拿
+           g_guard_lock;无效释放(双重释放/内部指针)不计数。 */
+        if (sl->guarded) {
+            bool ok = wmm_guard_free(sl, p,
+                                     (uintptr_t)__builtin_return_address(0));
+            if (ok && g_tcache != NULL) {
+                g_tcache->t_free_bytes += usize;
+                g_tcache->t_free_cnt++;
+            }
+            return;
+        }
 
         /* 快路径:压进本线程缓存,不碰 bin 锁。缓存满时
            wmm_tcache_free 内部先部分刷出。线程尚未建过缓存
@@ -532,7 +644,7 @@ size_t wmm_usable_size(const void *p) {
     wmm_slab_t *sl;
     void       *ext;
     if (wmm_pte_is_slab(p, &sl))
-        return wmm_bin_info[sl->szind].reg_size;
+        return sl->reg_size;   /* guard 与常规布局同一字段 */
     if (wmm_pte_is_extent(p, &ext)) {
         wmm_extent_t *e = (wmm_extent_t *)ext;
         /* 减去头部零头:对齐分配的 p 不在 extent 基址上,可用大小 =

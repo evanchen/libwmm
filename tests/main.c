@@ -18,6 +18,7 @@ int test_tcache(void); /* 由 tests/test_tcache.c 提供 */
 int test_stats(void);  /* 由 tests/test_stats.c 提供 */
 int test_prof(void);   /* 由 tests/test_prof.c 提供 */
 int test_shm(void);    /* 由 tests/test_shm.c 提供 */
+int test_guard(void);  /* 由 tests/test_guard.c 提供 */
 
 typedef int (*wmm_test_fn)(void);
 
@@ -38,6 +39,10 @@ static const struct {
        shm 组自己 */
     { "prof",   test_prof },
     { "shm",    test_shm },
+    /* guard 组放最后:它切换全局检测开关与采样状态,还在泄漏 C 档
+       启停后台线程。前面的组按"guard 关、采样关、后台停"的默认
+       状态对账;本组结尾把这三项都复位 */
+    { "guard",  test_guard },
 };
 
 int main(void) {

@@ -193,9 +193,22 @@ void wmm_atfork_child(void);
  *                             先合并尚未聚合的样本,再按估算字节降序
  *                             填 out,返回写入条数(0..k),out[n..k)
  *                             清零;参数非法返回 -1/EINVAL
- *   leak.check                泄漏嫌疑的 TOP N 增量对比
- *   leak.dump                 全量 dump 存活对象的调用点
- *   guard.enable/disable      打开/关闭内存错误检测(默认关)
+ *   leak.check                泄漏嫌疑的 TOP N 增量对比:变参为 int k
+ *                             (1..256)与 wmm_prof_entry_t *out(容量
+ *                             ≥ k)。把当前累计采样表与上一次调用的
+ *                             快照做差,按增量字节降序填 out,返回写
+ *                             入条数;首次调用只建立基线并返回 0。
+ *                             依赖采样已打开(guard 告警会自动打开)
+ *   leak.dump                 无参:全量遍历存活的 guard 对象,按分配
+ *                             调用点聚合后打印到 stderr。只覆盖 guard
+ *                             对象(常规 slab 没有逐对象调用点元数据)
+ *   guard.enable/disable      打开/关闭内存错误检测(默认关)。打开后
+ *                             新分配的小对象独占 slab,数据区前后带
+ *                             哨兵,释放先隔离再复用;检测越界写、
+ *                             UAF 写、双重释放并记 0xBC/0xBD/0xBE/
+ *                             0xBF 事件。内存放大明显,属排障模式。
+ *                             关闭会排空隔离区与回收池,已存在的 guard
+ *                             对象保持原布局直到各自释放
  *   purge                     立即回收一次空闲内存(同步)
  *   gc                        强制全部线程的缓存收缩
  *   bg.enable/disable         启动/停止后台线程(回收+聚合)

@@ -1212,6 +1212,30 @@ static unsigned wmm_backtrace(void **buf, unsigned max) {
 - [ ] OBS4:注入越界写 / UAF 读 / 双释放,三种都产出对应类型事件且含调用点;
 - [ ] guard 开启时 M7 oracle 仍全绿(正确性不因 guard 破坏)。
 
+### 实现勘误(M14 落地时记)
+- **尾部 redzone 取 16B 而非 8B**:返回指针必须保持 16 字节对齐,数据区
+  起点要按对象尺寸的自然对齐摆放。前哨兵因此同时是"对齐垫层 + redzone",
+  长度 = clamp(reg_size 的最低 2 的幂位, 16, 页大小),4K 级对象的放大很
+  明显——guard 本来就是排障模式。
+- **一个 guard slab 只放一个对象**,释放即整块空闲,"进入隔离"与"全空
+  退休"合为一步。隔离队列 FIFO 容量 512,到期转入按类别的 LIFO 回收池;
+  池中 slab 保留页映射,直到 `guard.disable` 才归还物理层。
+- **0xBF 与 0xBC 分时**:free 之后到下一次 tick 之间被写 → 0xBF(quarantine
+  期写入);tick 之后到复用之前被写 → 0xBC(释放后内存被改)。两个公开
+  事件类型因此都有实际判据,而不是同一检查点换两个名字。
+- **只检测写,不检测读**:redzone/poison 被读取不会改变内容,纯软件方案
+  无法识别;越界读需要 MPK/ASan 一类机制。
+- **大对象没有 redzone**:整页 extent 不改变交付粒度,越界由页边界
+  (段错误)兜底。
+- **leak A 只覆盖 guard 对象**:常规 slab 没有逐对象的分配调用点元数据;
+  要支持常规对象得在 slab 头里加 per-object 采样哈希,属于可选的增强,
+  本版不做。
+- **leak C 依赖后台线程**:只有 `bg.enable` 后每秒推进的窗口才产生告警;
+  告警自动调用 `sampling.enable`,之后 B 档的增量对比才有数据。
+- **双重释放的判据**:隔离区/回收池期间页表仍指向 slab,靠 `nfree != 0`
+  识别;`guard.disable` 归还物理层后页表清零,由既有的 `raw == 0` 路径
+  接住。
+
 ---
 
 ## 17. M15 wmm_ctl 补全 + `--wrap` 集成

@@ -14,7 +14,7 @@
 | test_stats.c | 统计与事件:快照增量对账/OBS1 独立重算/high_water/active 与 purge 差账/线程表/事件触发与 drain/ctl 接线 | 快照直读独立核算,不用快照自身的求和重放(恒真);组内关缓存、断言取增量 |
 | test_shm.c | 共享内存 seqlock:创建契约/跨进程可见性/并发撕裂压力/映射与内部状态逐字节对账/TOP 采样表发布 | 子进程按路径只读 mmap 当外部监控;每次成功的读验单代恒等式(跨代不成立,撕裂必被抓住);EAGAIN 计数不算失败;TOP 表经监控端读口读回并与内部取数逐字节比对 |
 | test_prof.c | 调用点采样:开关/节拍/调用点折叠/TOP 排序/环形缓冲绕圈/线程退出归账/ctl 参数契约 | 每个吃内存函数一个专属尺寸,按 `bytes == count × size` 识别行;绕圈后 count 精确等于保留样本数 × 权重;关闭时环形缓冲 head 不动;pc 打印供 addr2line 对名 |
-| test_guard.c | guard/泄漏三档(后续里程碑) | 待实现 |
+| test_guard.c | guard/泄漏三档:单对象 slab 布局/redzone/隔离期 UAF/双重释放/野指针/leak.dump/leak.check/持续上涨告警/开关切换 | 事件按"类型 + 精确指针"认定,不数条数(同一坏 slab 会在 tick/复用/关闭时重复报);坏内存写刻意为之,检查的是检测能力而不是 ASan |
 | test_wrap.c | --wrap 集成(后续里程碑) | 待实现 |
 
 统一入口:`tests/main.c` 维护用例表(每个用例文件导出 `int test_xxx(void)`,
