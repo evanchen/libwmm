@@ -6,7 +6,8 @@
 #   -fno-builtin-malloc       --wrap 接管时防止编译器把 malloc 调用
 #                              内联优化掉、绕过 wrap
 # 产物:libwmm.a(debug/release 各一套)+ release 的 libwmm.so。
-# 用法:make debug | make release | make test | make bench | make clean
+# 用法:make debug | make release | make test | make bench |
+#       make monitor | make playbook | make clean
 
 # CC 用直接赋值而不是条件赋值:make 对 CC 内建有 cc 默认值,而 ?= 只在
 # 变量未定义时才生效、内建默认也算"已定义",于是 CC ?= gcc 永远解析
@@ -38,7 +39,7 @@ HDRS := include/wmm.h src/wmm_internal.h src/wmm_sc.h src/wmm_shm.h Makefile
 BUILD_DEBUG   := build/debug
 BUILD_RELEASE := build/release
 
-.PHONY: all debug release test bench clean
+.PHONY: all debug release test bench monitor playbook clean
 
 all: release
 
@@ -107,9 +108,50 @@ test: debug $(WRAP_BIN)
 	@echo "wrap audit: all allocator references go through __wrap_*"
 	./$(WRAP_BIN)
 
-# bench:性能基准(与 glibc 对照);基准程序尚未实现
-bench: release
-	@echo "bench/bench.c 尚为空占位" && exit 1
+# 监控进程是纯读端:只包含两个协议头,不链接 libwmm,也不共用
+# 库的编译约束。这样它可以单独部署、单独升级,目标进程甚至不需要
+# 知道监控端的存在。
+MON_CFLAGS := -std=c11 -D_DEFAULT_SOURCE -O2 -g -Wall -Wextra \
+              -Iinclude -Isrc
+MON_BIN    := build/monitor/monitor
+
+monitor: $(MON_BIN)
+
+$(MON_BIN): monitor/monitor.c src/wmm_shm.h include/wmm.h Makefile
+	@mkdir -p build/monitor
+	$(CC) $(MON_CFLAGS) -o $@ $<
+
+# 基准与 glibc 对照。Makefile 把实现与场景拆成独立进程调用:
+# 同一进程连跑四个场景时,后一行 RSS 会带上前一行没归还的分配器
+# 存量,横向不可比。BENCH_ARGS 可追加参数,例如
+# make bench BENCH_ARGS="--ops 5000000 --threads 8"
+BENCH_BIN := build/bench/bench
+
+$(BENCH_BIN): bench/bench.c $(BUILD_RELEASE)/libwmm.a $(HDRS)
+	@mkdir -p build/bench
+	$(CC) $(CFLAGS_RELEASE) -o $@ bench/bench.c \
+	    $(BUILD_RELEASE)/libwmm.a -lpthread
+
+bench: release $(BENCH_BIN)
+	@echo "impl,scenario,ops,seconds,ops_per_sec,p50_ns,p99_ns,rss_kb"
+	@for sc in seq mt mixed large; do \
+	    for impl in wmm glibc; do \
+	        ./$(BENCH_BIN) $$impl --scenario $$sc --no-header \
+	            $(BENCH_ARGS) || exit 1; \
+	    done; \
+	done
+
+# 演练负载用 release 库:故障模式故意写坏内存,ASan 会抢在分配器
+# 之前终止进程。-no-pie 让事件与采样里的 pc 与文件虚拟地址一致,
+# addr2line -e build/demo/playbook 可以直接解析。
+PLAYBOOK_BIN := build/demo/playbook
+
+$(PLAYBOOK_BIN): demo/playbook.c $(BUILD_RELEASE)/libwmm.a $(HDRS)
+	@mkdir -p build/demo
+	$(CC) $(CFLAGS_RELEASE) -no-pie -o $@ demo/playbook.c \
+	    $(BUILD_RELEASE)/libwmm.a -lpthread
+
+playbook: $(PLAYBOOK_BIN)
 
 clean:
 	rm -rf build
