@@ -20,11 +20,12 @@
  * 收益不成比例,jemalloc 同样保留这个测试。
  *
  * 应用侧前提:本库两套构建都强制 -fno-omit-frame-pointer,且
- * wmm_alloc 在入口主动取自己的帧地址,强制编译器为它建立规范的
- * 帧指针链,所以第一帧(直接调用点)恒准确;更深的帧要应用也带
- * 帧指针编译,否则链可能提前断开或指向垃圾。遍历带单调性与跨度
- * 检查,坏链只会让样本少几帧,不会把它当有效调用链收下——与
- * jemalloc 的帧指针回溯同一前提。
+ * wmm_alloc 的采样分支里有 __builtin_frame_address(0)——内建只要
+ * 出现在函数里,编译期就会强制为它建立规范的帧指针链(哪怕那个
+ * 分支运行时没走),所以第一帧(直接调用点)恒准确;更深的帧要
+ * 应用也带帧指针编译,否则链可能提前断开或指向垃圾。遍历带单调性
+ * 与跨度检查,坏链只会让样本少几帧,不会把它当有效调用链收下——
+ * 与 jemalloc 的帧指针回溯同一前提。
  *
  * 同步:写端只有被采样线程自己;每个槽一把微型 seqlock 供后台合并器
  * 并发读取。聚合表由 g_prof_lock 保护,它是叶子锁(见 wmm_internal.h
@@ -44,7 +45,7 @@
 #define WMM_PROF_MAX_FRAME_BYTES ((uintptr_t)16 << 20)
 
 /* 从分配函数的帧开始向上走帧指针链,把 return address 依次写入 buf。
- * frame 必须是 wmm_alloc 自己的帧地址:由它在函数入口用
+ * frame 必须是 wmm_alloc 自己的帧地址:由它在采样分支内用
  * __builtin_frame_address(0) 捕获后经采样入口传进来。
  *
  * 为什么由分配函数捕获、而不是在采样器或本函数里取:
@@ -176,9 +177,10 @@ static uint64_t prof_hash(void *const *pc, unsigned n) {
     return h;
 }
 
-/* 把一个样本并按权重放大进聚合表。调用方须持 g_prof_lock。
- * n 取 depth 与键帧数的较小者:更深的帧不参与键,但仍保留在样本里
- * (将来若要展示完整栈,不必重新采样)。 */
+/* 把一个样本按权重放大进聚合表。调用方须持 g_prof_lock。
+ * n 取 depth 与键帧数的较小者。捕获深度现在就等于键宽,正常样本
+ * depth == n;保留钳位是为了让聚合不依赖两个常量相等——将来若为
+ * 完整栈转储放大捕获深度,键仍只折叠前 4 帧。 */
 static void prof_agg_add(void *const *pc, unsigned depth,
                          size_t usize, uint32_t weight) {
     unsigned n = depth < WMM_PROF_KEY_FRAMES ? depth : WMM_PROF_KEY_FRAMES;

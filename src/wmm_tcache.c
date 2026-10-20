@@ -94,7 +94,7 @@ static bool tcache_create(void) {
 
     /* 采样状态:head 显式初始化;256 个槽的 seq 保持 mmap 零页的
        零值(偶数 = 未写入,对这些无锁原子类型是合法表示)。刻意不
-       逐槽 atomic_init:槽横跨 72KB,触碰一遍就把整块虚拟内存驻留成
+       逐槽 atomic_init:槽横跨 16KB,触碰一遍就把整块虚拟内存驻留成
        物理页,而采样默认关闭——关着就不该为它付 RSS */
     t->prof_tick = 0;
     atomic_init(&t->prof.head, 0);

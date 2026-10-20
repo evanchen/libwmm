@@ -332,15 +332,16 @@ static wmm_tcache_t *stats_slot(void) {
     return g_tcache;
 }
 
-void *wmm_alloc(size_t size) {
-    /* 采样锚点。必须在分配函数自己的帧上取:一是指针回溯要从这里
-       开始读 return address,二是取帧地址这一事实会强制编译器为
-       wmm_alloc 建立规范的帧指针链——只给 -fno-omit-frame-pointer
-       并不够,-O2 或 ASan 构建仍可能把 rbp 挪作通用寄存器,链上
-       保存的就不是上一帧的帧指针。采样关闭时这里不产生指令,代价
-       只是让 wmm_alloc 少一个可分配的通用寄存器。 */
-    void *alloc_frame = __builtin_frame_address(0);
+/* 采样帧锚点。必须是宏而不是辅助函数:__builtin_frame_address(0)
+   返回求值它的函数的帧,辅助函数在 debug 构建(-O0)下不内联,取到的
+   是辅助函数自己的帧。宏只允许在 wmm_alloc 体内展开。内建只要出现
+   在该函数里,编译期就强制它建立规范的帧指针链,即使运行时走的是
+   采样关闭的分支、内建根本没求值——只给 -fno-omit-frame-pointer
+   并不够,-O2 或 ASan 构建仍可能把 rbp 挪作通用寄存器。内建放在
+   分支内则让关闭采样的路径不在入口付出那次存储。 */
+#define WMM_ALLOC_FRAME() __builtin_frame_address(0)
 
+void *wmm_alloc(size_t size) {
     if (size == 0)
         size = 1;   /* glibc 语义:size==0 当 1 处理,返回可释放指针 */
 
@@ -355,7 +356,8 @@ void *wmm_alloc(size_t size) {
             /* 大对象也参与采样:大块正是"吃内存"归因的主角,而它
                根本不经过 bin;关闭采样时只多一次可预测的标志测试 */
             if (g_opt.sample_n != 0)
-                wmm_prof_sample(t, ext->npages * WMM_PAGE, alloc_frame);
+                wmm_prof_sample(t, ext->npages * WMM_PAGE,
+                                WMM_ALLOC_FRAME());
         }
         return ext->addr;
     }
@@ -378,7 +380,7 @@ void *wmm_alloc(size_t size) {
             g_tcache->t_alloc_cnt++;
             if (g_opt.sample_n != 0)
                 wmm_prof_sample(g_tcache, wmm_bin_info[i].reg_size,
-                                alloc_frame);
+                                WMM_ALLOC_FRAME());
             return p;
         }
         /* 填充失败 = 窗口耗尽:慢路径只会同样失败。保留它,让 OOM
@@ -407,7 +409,8 @@ void *wmm_alloc(size_t size) {
         g_tcache->t_alloc_bytes += wmm_bin_info[i].reg_size;
         g_tcache->t_alloc_cnt++;
         if (g_opt.sample_n != 0)
-            wmm_prof_sample(g_tcache, wmm_bin_info[i].reg_size, alloc_frame);
+            wmm_prof_sample(g_tcache, wmm_bin_info[i].reg_size,
+                            WMM_ALLOC_FRAME());
     }
     return p;
 }

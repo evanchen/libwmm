@@ -430,9 +430,18 @@ typedef struct {
  * 正是所求时才收——既不会把同一槽位的两代样本算两次,也不会因为
  * 合并器来晚了就把别的样本当成本代样本。
  */
-#define WMM_PROF_DEPTH    32      /* 每个样本保留的栈帧上限;更深的
-                                     调用链对定位没有增益,只把槽位
-                                     撑大 */
+#define WMM_PROF_KEY_FRAMES 4u    /* 调用点键折叠的帧数:前 4 帧足以
+                                     区分业务调用链,又不让键过宽 */
+#define WMM_PROF_DEPTH    WMM_PROF_KEY_FRAMES   /* 每个样本保留的栈帧
+                                                上限 = 键宽。聚合只用前
+                                                4 帧,更深的帧在合并时
+                                                被丢弃;环又是瞬态的,槽
+                                                位合并后立刻会被下一批
+                                                样本覆盖,多存没有任何
+                                                消费者,只把槽位和每线程
+                                                环撑大。将来若真要完整
+                                                栈转储,再单独放大这个
+                                                常量 */
 #define WMM_PROF_RING     256     /* 每线程环槽数。一个合并周期(1s)
                                      内采样超过 256 次(即每秒 25.6 万
                                      次分配)才会绕圈,丢了也只丢最旧
@@ -447,8 +456,6 @@ typedef struct {
 #define WMM_PROF_TOP_MAX  256u    /* prof.top 单次最多输出条数;与共享
                                      区 TOP 表容量一致(wmm_shm.c 有
                                      static_assert 钉住) */
-#define WMM_PROF_KEY_FRAMES 4u    /* 调用点键折叠的帧数:前 4 帧足以
-                                     区分业务调用链,又不让键过宽 */
 
 typedef struct {
     _Atomic uint32_t seq;     /* 槽位世代:奇数 = 写入进行中。写者每次
@@ -462,8 +469,8 @@ typedef struct {
                                  权重,运行期改间隔不会把旧样本按新
                                  间隔放大 */
     uint32_t         pad;     /* 显式占位,保持 pc 的 8 字节对齐 */
-    void            *pc[WMM_PROF_DEPTH];  /* 栈帧 return address;
-                                             [0] = 用户的分配调用点 */
+    void            *pc[WMM_PROF_DEPTH];  /* 栈帧 return address,深度即
+                                             键宽;[0] = 用户的分配调用点 */
 } wmm_prof_slot_t;
 
 typedef struct {
@@ -601,12 +608,13 @@ void     wmm_tcache_thread_destructor(void *val);
  */
 
 /* 一次成功分配后的采样入口:usize 是本次分配的实际可用字节,
- * alloc_frame 是 wmm_alloc 自己的帧地址,由它在函数入口用
+ * alloc_frame 是 wmm_alloc 自己的帧地址,由它在采样分支内用
  * __builtin_frame_address(0) 捕获后传入。帧地址必须由分配函数自己
  * 取:该内建描述的是求值它的函数,只有分配函数自己取到的才是栈上
- * 紧挨用户调用点的那一帧;而且取帧地址这一事实会强制编译器为它
- * 建立规范的帧指针链,不因 -O2 或 ASan 把 rbp 挪作通用寄存器而
- * 断开。调用方先判 g_opt.sample_n != 0,使关闭时不产生函数调用;
+ * 紧挨用户调用点的那一帧;而且取帧地址这一事实在编译期就会强制
+ * 编译器为它建立规范的帧指针链,即使那个分支运行时没走,也不因
+ * -O2 或 ASan 把 rbp 挪作通用寄存器而断开。调用方先判
+ * g_opt.sample_n != 0,使关闭时既不产生函数调用,也不求值内建;
  * 本函数内部再按线程节拍决定是否真的走栈。 */
 void wmm_prof_sample(wmm_tcache_t *t, size_t usize, void *alloc_frame);
 
