@@ -210,20 +210,26 @@ void wmm_atfork_child(void);
  *                             关闭会排空隔离区与回收池,已存在的 guard
  *                             对象保持原布局直到各自释放
  *   purge                     立即回收一次空闲内存(同步)
- *   gc                        强制全部线程的缓存收缩
+ *   gc                        强制全部线程的缓存收缩。调用线程当场
+ *                             收缩;其他线程只收到请求,在各自下一次
+ *                             free 时收缩(无锁快路径不能由别人代改)。
+ *                             命令返回不代表所有线程已完成
  *   bg.enable/disable         启动/停止后台线程(回收+聚合)
- *   config.lg_page            查询页大小(2^N)
+ *   config.lg_page            查询页大小:无变参,返回值就是
+ *                             log2(页字节数)(Linux x86-64 为 12)
  *   config.madvise_mode       切换内核回收方式,变参为 int
  *                             (MADV_DONTNEED / MADV_FREE),只影响
  *                             之后的 purge;非法值返回 -1/EINVAL
- *   config.verbose            调试输出开关
+ *   config.verbose            调试输出开关,变参为 int(非 0 开)。
+ *                             只影响尽力而为的诊断日志;fatal/OOM 与
+ *                             事件记录不受影响
  *   shm.create                创建共享监控区,变参为 const char *
  *                             文件路径;成功后可被任意进程只读
  *                             mmap 该文件读快照与事件环,后台线程
  *                             每秒刷新。路径非法返回 -1 并透传 errno;
  *                             本进程已创建过返回 -1/EEXIST
- * 返回 0 成功;未知命令返回 -1 并置 errno=EINVAL;
- * 命令已登记但功能未实现返回 -1 并置 errno=ENOSYS。
+ * 普通命令返回 0 成功;查询类命令返回查询值;未知命令返回 -1 并
+ * 置 errno=EINVAL。
  */
 int  wmm_ctl(const char *cmd, ...);
 

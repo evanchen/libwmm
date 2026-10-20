@@ -29,6 +29,14 @@
  * 过就留 2 个种子),把驻留压到贴近真实需求——偶尔用一次的类囤到
  * 天荒地老的问题由此根治。GC 同时承担自适应填充:nfill 随低水位
  * 信号增减,细节见 tcache_gc_bin 处的注释。
+ *
+ * 跨线程收缩(wmm_ctl("gc")):快路径无锁,控制线程直接改别人的
+ * head 或栈数组会与并发弹压撕出半个栈项。所以控制线程对自己当场
+ * 跑 GC,对其他线程只置 gc_req 请求位;所有者在 free 入口看到置位,
+ * 用原子 exchange 取走请求,再在自己线程里跑全 bin GC。exchange
+ * 先于 GC:收缩期间新到的请求会重新置位,留到下一次处理,不会丢。
+ * 代价是空闲线程要等它下一次释放才收缩——这是无锁缓存换取快路径
+ * 零同步的必然边界,不引入"停等所有线程"的全局同步。
  */
 
 #define _GNU_SOURCE   /* gettid 的 unistd.h 声明在 __USE_GNU 门下,而
@@ -91,6 +99,10 @@ static bool tcache_create(void) {
     t->t_free_cnt    = 0;
     t->gc_evt        = 0;
     t->gc_next       = 0;
+    /* 唯一的跨线程字段:显式初始化,不依赖 mmap 零页恰好是可接受的
+       原子初值——零页本身没问题,但新增字段漏初始化时,这一行让它
+       显形,而不是等控制线程置位后才暴露 */
+    atomic_init(&t->gc_req, 0);
 
     /* 采样状态:head 显式初始化;256 个槽的 seq 保持 mmap 零页的
        零值(偶数 = 未写入,对这些无锁原子类型是合法表示)。刻意不
@@ -257,8 +269,8 @@ void wmm_tcache_flush_all(void) {
  * 快照纪律:used 与 starved 必须先于任何刷出读取——tcache_flush_bins
  * 会把 low_water 重置成新 head,拿不到旧水位。 */
 
-static void tcache_gc_bin(szind_t i) {
-    wmm_cache_bin_t *cb = &g_tcache->bins[i];
+static void tcache_gc_bin(wmm_tcache_t *t, szind_t i) {
+    wmm_cache_bin_t *cb = &t->bins[i];
     unsigned ncached = cb->head;
 
     if (ncached == 0)
@@ -269,13 +281,13 @@ static void tcache_gc_bin(szind_t i) {
 
     if (used_since_gc == 0) {
         if (ncached > 2)
-            wmm_tcache_flush(i, ncached - 2);   /* 没动过:留 2 个种子 */
+            tcache_flush_bins(t, i, ncached - 2);   /* 没动过:留 2 个种子 */
     } else {
         unsigned retain = used_since_gc + (used_since_gc >> 2);
         if (retain > cb->ncached_max)
             retain = cb->ncached_max;
         if (ncached > retain)
-            wmm_tcache_flush(i, ncached - retain);
+            tcache_flush_bins(t, i, ncached - retain);
     }
 
     if (starved) {                 /* 被完整吃空过:供不应求,加大填充 */
@@ -294,13 +306,43 @@ static void tcache_gc_bin(szind_t i) {
 void wmm_tcache_gc(szind_t i) {
     if (g_tcache == NULL)
         return;
-    tcache_gc_bin(i);
+    tcache_gc_bin(g_tcache, i);
+}
+
+/* 一个缓存的全部 bin 跑一遍。调用者必须是该缓存的所有者:本函数
+   直接改 head/栈,与快路径一样以"只有本线程碰"为前提 */
+static void tcache_gc_all_bins(wmm_tcache_t *t) {
+    for (szind_t i = 0; i < WMM_NBINS; i++)
+        tcache_gc_bin(t, i);
+}
+
+void wmm_tcache_gc_all(void) {
+    wmm_tcache_t *self = g_tcache;
+
+    if (self != NULL) {
+        /* 自己:同步做完。先清掉可能残留的请求——这次全 bin GC 已经
+           覆盖它,留着只会让下一次 free 白跑一遍 */
+        atomic_store_explicit(&self->gc_req, 0, memory_order_relaxed);
+        tcache_gc_all_bins(self);
+    }
+
+    /* 别人:只置请求位,不碰它们的 head/栈。持 g_threads_lock 遍历,
+       保证遍历期间节点不会被 wmm_thread_exit 摘链并 munmap;放锁后
+       不再解引用任何 t,所以随后发生的线程退出是安全的 */
+    pthread_mutex_lock(&g_threads_lock);
+    for (wmm_tcache_t *t = g_threads; t != NULL; t = t->next)
+        if (t != self)
+            atomic_store_explicit(&t->gc_req, 1, memory_order_release);
+    pthread_mutex_unlock(&g_threads_lock);
 }
 
 /* ==================== 快路径 ====================
  *
- * 两个函数只被本线程调用,零锁零原子:head 是唯一游标,栈数组是
- * 本线程独占的普通内存。编译器视角它们就是两条 load/store。 */
+ * 两个函数只被本线程调用,零锁:head 是唯一游标,栈数组是本线程
+ * 独占的普通内存。alloc 就是两条 load/store;free 入口多一次对
+ * gc_req 的 acquire 原子读(请求位没有附带数据,relaxed 也够;用
+ * acquire 与置位方的 release 成对,语义完整,在 x86 上都只是一条
+ * mov)——这是跨线程收缩唯一的常驻开销。 */
 
 void *wmm_tcache_alloc(szind_t i) {
     wmm_cache_bin_t *cb = &g_tcache->bins[i];
@@ -314,15 +356,25 @@ void *wmm_tcache_alloc(szind_t i) {
 }
 
 void wmm_tcache_free(szind_t i, void *p) {
-    wmm_cache_bin_t *cb = &g_tcache->bins[i];
+    wmm_tcache_t *t = g_tcache;
+
+    /* 跨线程 GC 请求:控制线程只置位,收缩由所有者在这里完成。
+       先 load 再按需 exchange——常态是一次普通读,不把原子读改写
+       进每一次 free。exchange 先于 GC,收缩期间新到的请求会重新
+       置位,留到下一次 free 处理 */
+    if (atomic_load_explicit(&t->gc_req, memory_order_acquire) != 0 &&
+        atomic_exchange_explicit(&t->gc_req, 0, memory_order_acquire) != 0)
+        tcache_gc_all_bins(t);
+
+    wmm_cache_bin_t *cb = &t->bins[i];
 
     /* 满栈先 GC:retain 公式算出的驻留目标比固定留 1/4 更贴近真实
        用量。热 bin(用量顶到容量、GC 全留)无处可刷,原样压栈会越顶,
        退回 M8 的 3/4 部分刷出兜底——保证栈位、head 永不越过容量 */
     if (cb->head == cb->ncached_max) {
-        tcache_gc_bin(i);
+        tcache_gc_bin(t, i);
         if (cb->head == cb->ncached_max)
-            tcache_flush_bins(g_tcache, i,
+            tcache_flush_bins(t, i,
                               (unsigned)(cb->ncached_max - cb->ncached_max / 4));
     }
     cb->stack[cb->head++] = p;
@@ -330,11 +382,11 @@ void wmm_tcache_free(szind_t i, void *p) {
     /* 释放事件轮转:囤积只发生在释放侧,计数器放这里。每 N 次 free
        对一个轮转 bin 跑 GC,让"偶尔用一次"的类也有机会被压回 retain。
        多出来的快路径代价只有一条普通计数器自增 + 一次比较 */
-    if (++g_tcache->gc_evt >= WMM_TCACHE_GC_EVERY) {
-        g_tcache->gc_evt = 0;
-        szind_t bin = g_tcache->gc_next;
-        g_tcache->gc_next = (uint8_t)((bin + 1) % WMM_NBINS);
-        tcache_gc_bin(bin);
+    if (++t->gc_evt >= WMM_TCACHE_GC_EVERY) {
+        t->gc_evt = 0;
+        szind_t bin = t->gc_next;
+        t->gc_next = (uint8_t)((bin + 1) % WMM_NBINS);
+        tcache_gc_bin(t, bin);
     }
 }
 

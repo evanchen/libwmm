@@ -5,12 +5,13 @@
  * 表里加一行,公共头文件的 ABI 不动——这是签名冻结后唯一的
  * 扩展通道。
  *
- * 已接线:stats.snapshot、stats.per_class、sampling.enable/disable、
- * prof.top、leak.check/dump、guard.enable/disable、purge、
- * bg.enable/disable、config.madvise_mode、shm.create。
- * 其余命令已登记、返回 ENOSYS,随各子系统实现逐条接入。分发对 17 项
- * 做线性扫描:控制命令不在热路径,不值得上哈希。约定:返回 0 成功;
- * 未知命令 -1/EINVAL;已登记未实现 -1/ENOSYS。
+ * 表内 17 条命令已全部接线:stats.snapshot、stats.per_class、
+ * sampling.enable/disable、prof.top、leak.check/dump、
+ * guard.enable/disable、purge、gc、bg.enable/disable、
+ * config.lg_page/madvise_mode/verbose、shm.create。分发对 17 项做
+ * 线性扫描:控制命令不在热路径,不值得上哈希。约定:普通命令返回
+ * 0 成功;查询类命令返回查询值(目前只有 config.lg_page);未知
+ * 命令 -1/EINVAL。
  *
  * 变参约定:带参数的命令由处理函数按自己的 ABI 取 va_arg;整型
  * 实参按 C 默认提升取 int(如 config.madvise_mode 传 MADV_* 常量),
@@ -30,17 +31,9 @@ typedef int (*wmm_ctl_fn_t)(const char *cmd, va_list ap);
 
 typedef struct {
     const char  *name;   /* 完整命令名(精确匹配) */
-    wmm_ctl_fn_t fn;     /* 处理函数;落地前统一指向 ctl_enosys */
+    wmm_ctl_fn_t fn;     /* 处理函数;未接线时统一返回 -1/EINVAL */
     const char  *help;   /* 一句话说明(命令即文档) */
 } wmm_ctl_cmd_t;
-
-static int ctl_enosys(const char *cmd, va_list ap)
-{
-    (void)cmd;
-    (void)ap;
-    errno = ENOSYS;
-    return -1;
-}
 
 /* 取完整统计快照:变参为 wmm_stats_t *。委托 wmm_stats_snapshot,
  * NULL 检查与 errno 由它统一给。 */
@@ -95,6 +88,17 @@ static int ctl_purge(const char *cmd, va_list ap)
     return 0;
 }
 
+/* 全部线程缓存收缩:调用线程当场做完;其他线程只能置请求位,由
+ * 它们在各自的下一次 free 里收缩——快路径无锁,替别人动栈不安全。
+ * 所以返回 0 只表示"请求已发出",不等待其他线程完成。 */
+static int ctl_gc(const char *cmd, va_list ap)
+{
+    (void)cmd;
+    (void)ap;
+    wmm_tcache_gc_all();
+    return 0;
+}
+
 static int ctl_bg_enable(const char *cmd, va_list ap)
 {
     (void)cmd;
@@ -121,6 +125,26 @@ static int ctl_madvise_mode(const char *cmd, va_list ap)
         return -1;
     }
     g_opt.madvise_mode = mode;
+    return 0;
+}
+
+/* 查询页大小:返回值是答案 log2(页字节数),不走"0 成功"约定。
+ * 页大小是编译期常量,无锁、无副作用。 */
+static int ctl_config_lg_page(const char *cmd, va_list ap)
+{
+    (void)cmd;
+    (void)ap;
+    return (int)WMM_LG_PAGE;
+}
+
+/* 调试输出开关:变参为 int,非 0 打开。只影响尽力而为的诊断日志
+ * (boot 摘要、后台 purge 统计);fatal/OOM/事件记录不受开关影响——
+ * 关日志不该把故障线索一起关掉。 */
+static int ctl_config_verbose(const char *cmd, va_list ap)
+{
+    (void)cmd;
+    int on = va_arg(ap, int);
+    g_opt.verbose = (on != 0);
     return 0;
 }
 
@@ -233,12 +257,12 @@ static const wmm_ctl_cmd_t g_ctl_cmds[] = {
     { "guard.enable",        ctl_guard_enable,  "内存错误检测开(默认关)" },
     { "guard.disable",       ctl_guard_disable, "检测关(排空隔离区与回收池)" },
     { "purge",               ctl_purge,         "立即回收一次空闲内存(同步)" },
-    { "gc",                  ctl_enosys,        "全部线程缓存强制收缩" },
+    { "gc",                  ctl_gc,            "全部线程缓存强制收缩" },
     { "bg.enable",           ctl_bg_enable,     "后台线程启(回收+聚合)" },
     { "bg.disable",          ctl_bg_disable,    "后台线程停(退出时 join)" },
-    { "config.lg_page",      ctl_enosys,        "查询页大小 2^N" },
+    { "config.lg_page",      ctl_config_lg_page, "查询页大小 2^N(返回值即 N)" },
     { "config.madvise_mode", ctl_madvise_mode,  "切换内核回收方式 DONTNEED/FREE" },
-    { "config.verbose",      ctl_enosys,        "调试输出开关" },
+    { "config.verbose",      ctl_config_verbose, "调试输出开关(参数:int 非 0 开)" },
     { "shm.create",          ctl_shm_create,    "创建共享监控区(参数:文件路径)" },
 };
 

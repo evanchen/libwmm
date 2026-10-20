@@ -541,8 +541,9 @@ typedef struct {
  *
  * 结构本身链入全局 g_threads 链:统计快照要合并各线程的计数、
  * wmm_ctl("gc") 要遍历所有线程的缓存,都靠这张链找到人。
- * 链指针的改动必须持 g_threads_lock;计数字段只由本线程写、
- * 不加原子——快照读到瞬时旧值无妨,换来快路径零同步开销。
+ * 链指针的改动必须持 g_threads_lock;计数与栈游标只由本线程写、
+ * 不加原子——快照读到瞬时旧值无妨,换来快路径零同步开销。唯一
+ * 例外是 gc_req:控制线程会写它,必须是原子。
  */
 typedef struct wmm_tcache_s wmm_tcache_t;
 struct wmm_tcache_s {
@@ -560,7 +561,15 @@ struct wmm_tcache_s {
     uint32_t      t_alloc_cnt;  /* 累计分配次数 */
     uint32_t      t_free_cnt;   /* 累计释放次数 */
 
-    /* ---- GC 状态(唯一写者 = 本线程,非原子) ---- */
+    /* ---- GC 状态 ---- */
+    _Atomic uint32_t gc_req;   /* 跨线程 GC 请求位:控制线程置 1,所有者
+                                  在下一次 free 入口取走并自行收缩。为什么
+                                  不让控制线程直接改别人的 head/栈:快路径
+                                  无锁,并发弹压会撕出半个栈项;置位是唯一
+                                  安全的跨线程动作。检查点放在 free 而不是
+                                  alloc:缓存只在释放侧变多,而只做分配的
+                                  线程本来就在消耗缓存。代价是空闲线程要等
+                                  它下一次释放才收缩,绝不因此阻塞 */
     uint32_t      gc_evt;      /* 释放事件计数:每 WMM_TCACHE_GC_EVERY 次
                                   free 触发一轮轮转 GC。囤积只发生在释放
                                   侧(分配只会把 head 往下推),计数器放
@@ -626,8 +635,13 @@ void     wmm_tcache_flush_all(void);
 /* 本线程全类刷空、缓存块保留:收敛核对与线程退出前的共用步骤 */
 void     wmm_tcache_gc(szind_t i);
 /* 对当前线程缓存的一个 bin 跑 GC:按 retain 公式(用量+25% 或种子 2)
- * 刷出富余,并按低水位信号自适应 nfill。满栈触发与事件轮转共用;
- * 白盒测试直调(TC3),将来的 wmm_ctl("gc") 也走它 */
+ * 刷出富余,并按低水位信号自适应 nfill。满栈触发、事件轮转与
+ * wmm_ctl("gc") 的调用线程部分共用;白盒测试也直调(TC3) */
+void     wmm_tcache_gc_all(void);
+/* wmm_ctl("gc") 的落地:调用线程当场把全部 bin 收缩一遍;注册表里
+ * 其他线程只置 gc_req,由它们在下一次 free 时取走执行——快路径
+ * 无锁,控制线程不能直接改别人的栈。因此本函数返回时,其他线程的
+ * 缓存可能尚未收缩;空闲线程要等它下一次释放。 */
 void    *wmm_tcache_alloc(szind_t i);
 void     wmm_tcache_free(szind_t i, void *p);
 /* 快路径弹栈/压栈。alloc 返回 NULL = 缓存空,调用方去填充;

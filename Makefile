@@ -66,12 +66,46 @@ $(BUILD_RELEASE)/libwmm.so: $(patsubst src/%.c,$(BUILD_RELEASE)/%.o,$(SRC))
 # test:对 debug 库(带 sanitizer)编译并运行 tests/ 下的全部用例。
 # 用例是白盒的:可直接包含 src/wmm_internal.h 检查内部状态;
 # 入口 tests/main.c 维护用例表,新增 tests/test_xxx.c 时在表中登记。
-TEST_SRC := $(wildcard tests/test_*.c)
-test: debug
+# test_wrap.c 是例外:它自带 main,且必须以 --wrap 链接。主 run
+# 二进制故意不 wrap——test_oracle 的 glibc 对照模式要在同一进程里
+# 调用真的 malloc 家族——所以它单独构建成 build/test/wrap。
+TEST_SRC := $(filter-out tests/test_wrap.c,$(wildcard tests/test_*.c))
+
+WRAP_BIN   := build/test/wrap
+WRAP_FUNCS := malloc free calloc realloc posix_memalign aligned_alloc
+# 不能用 addprefix:它的参数按逗号分隔,前缀里的 -Wl,--wrap= 会被
+# 拆成两段。foreach 对每个名字单独展开,逗号原样留在命令行里。
+WRAP_LDFLAGS := $(foreach f,$(WRAP_FUNCS),-Wl,--wrap=$(f))
+# --wrap 只改写符号引用;编译器若把这些函数识别成内建并直接化简,
+# 链接器就看不到引用。malloc 已在 CFLAGS_COMMON 里关掉,这里补齐
+# 其余五个。
+WRAP_CFLAGS := -fno-builtin-calloc -fno-builtin-realloc \
+               -fno-builtin-free -fno-builtin-posix_memalign \
+               -fno-builtin-aligned_alloc
+
+$(WRAP_BIN): tests/test_wrap.c $(BUILD_DEBUG)/libwmm.a $(HDRS)
+	@mkdir -p build/test
+	$(CC) $(CFLAGS_DEBUG) $(WRAP_CFLAGS) $(WRAP_LDFLAGS) -o $@ $< \
+	    $(BUILD_DEBUG)/libwmm.a -lpthread
+
+test: debug $(WRAP_BIN)
 	@mkdir -p build/test
 	$(CC) $(CFLAGS_DEBUG) -o build/test/run tests/main.c $(TEST_SRC) \
 	    $(BUILD_DEBUG)/libwmm.a -lpthread
 	./build/test/run
+	@echo "---- wrap audit ----"
+	@if nm -u $(WRAP_BIN) | grep -Eq 'U (malloc|free|calloc|realloc|posix_memalign|aligned_alloc)(@|$$)'; then \
+	    echo "wrap audit: 仍有未接管的 libc 分配符号:"; \
+	    nm -u $(WRAP_BIN) | grep -E 'U (malloc|free|calloc|realloc|posix_memalign|aligned_alloc)(@|$$)'; \
+	    exit 1; \
+	fi
+	@for f in $(WRAP_FUNCS); do \
+	    if ! nm $(WRAP_BIN) | grep -q " T __wrap_$$f"; then \
+	        echo "wrap audit: 缺少 __wrap_$$f"; exit 1; \
+	    fi; \
+	done
+	@echo "wrap audit: all allocator references go through __wrap_*"
+	./$(WRAP_BIN)
 
 # bench:性能基准(与 glibc 对照);基准程序尚未实现
 bench: release

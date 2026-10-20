@@ -11,6 +11,9 @@
  *         热 bin 退回 3/4 部分刷出兜底——落点按 GC 公式重放精确断言。
  *   TC3 偶尔用一次的类:填充后晾着不动,显式 GC 把驻留压回 retain
  *         (used==0 → 2 个种子;used>0 → used×1.25),head ≤ retain。
+ *   gc 命令:跨线程收缩。调用线程当场收缩到种子;其他线程只
+ *         置请求位,由它在下一次 free 入口完成收缩——两段握手分别
+ *         验证"请求已置位"与"处理后落点",不靠时序猜测。
  *   容量公式:每类 ncached_max == clamp(2*nregs, 20, 200),nfill 落
  *         在自适应范围 [2, ncm/2](创建态 = ncm/2,由 lifecycle 的新
  *         线程块白盒报告);栈数组紧贴结构体、按类顺序排布,各段
@@ -284,6 +287,135 @@ static void check_gc_occasional(void) {
 
     wmm_tcache_flush_all();
     CHECK(total_live() == base);
+}
+
+/* ---- wmm_ctl("gc"):本线程同步 + 跨线程请求位 ----
+ * 本线程部分:直接填满一个 bin 且不弹栈(low_water == head),GC 判
+ * 定"完全没用过",应压回 2 个种子——这正是命令"强制收缩"的落点。
+ * 跨线程部分:控制线程不能改别人的栈,只能置 gc_req;工作线程在下
+ * 一次 free 入口取走请求并收缩。测试分两段握手:置位后先确认请求
+ * 位可见,再放行 free,最后核对落点。 */
+static void check_ctl_gc_self(void) {
+    uint64_t base = flush_baseline();
+    szind_t  bin  = wmm_size2index(6144);   /* 本组其他用例未碰过的类 */
+    wmm_cache_bin_t *cb = &g_tcache->bins[bin];
+    unsigned ncm;
+
+    CHECK(cb->head == 0);
+    g_tcache->gc_evt  = 0;   /* 关掉事件轮转的噪声 */
+    g_tcache->gc_next = 0;
+
+    /* 填到容量顶,不依赖此前 nfill 被磨到多少 */
+    ncm = cb->ncached_max;
+    CHECK(ncm > 2);
+    wmm_tcache_fill(bin, ncm);
+    CHECK(cb->head == ncm);
+    CHECK(cb->low_water == cb->head);
+
+    CHECK(wmm_ctl("gc") == 0);
+    CHECK(cb->head == 2);   /* used==0 → 留 2 个种子 */
+
+    wmm_tcache_flush_all();
+    CHECK(total_live() == base);
+}
+
+typedef struct {
+    atomic_int ready;          /* 工作线程:块已填好,状态可见 */
+    atomic_int go;             /* 主线程:可以触发请求处理 */
+    atomic_int done;           /* 工作线程:head_after 已发布 */
+    wmm_tcache_t *t;           /* 工作线程的缓存块(退出前有效) */
+    void         *p;           /* 一次 free 的触发对象 */
+    szind_t       bin;         /* 被填满的目标类 */
+    unsigned      head_before;
+    unsigned      head_after;
+    unsigned      err;
+} gc_req_arg_t;
+
+static void *gc_req_worker(void *arg) {
+    gc_req_arg_t *a = (gc_req_arg_t *)arg;
+    unsigned err = 0;
+
+    wmm_thread_init();
+    a->t   = g_tcache;
+    a->bin = wmm_size2index(6144);
+
+    if (g_tcache == NULL) {
+        err |= 1u;
+    } else {
+        a->p = wmm_alloc(64);
+        if (a->p == NULL)
+            err |= 2u;
+
+        /* 填满且期间不弹栈:low_water == head,GC 会判成没动过 */
+        wmm_tcache_fill(a->bin, g_tcache->bins[a->bin].ncached_max);
+        a->head_before = g_tcache->bins[a->bin].head;
+        if (a->head_before <= 2)
+            err |= 4u;
+    }
+    a->err = err;
+    atomic_store_explicit(&a->ready, 1, memory_order_release);
+
+    while (!atomic_load_explicit(&a->go, memory_order_acquire))
+        sched_yield();
+
+    if (err == 0) {
+        /* 任意一次小对象 free 都在缓存入口服务请求位 */
+        wmm_free(a->p);
+        a->head_after = g_tcache->bins[a->bin].head;
+        if (atomic_load_explicit(&g_tcache->gc_req,
+                                 memory_order_acquire) != 0)
+            a->err |= 8u;      /* 请求应已被 exchange 取走 */
+    }
+    atomic_store_explicit(&a->done, 1, memory_order_release);
+    return NULL;
+}
+
+static void check_ctl_gc_cross_thread(void) {
+    uint64_t     base = flush_baseline();
+    int          nodes0 = tc_nodes();
+    gc_req_arg_t a;
+
+    a.t           = NULL;
+    a.p           = NULL;
+    a.bin         = 0;
+    a.head_before = 0;
+    a.head_after  = 0;
+    a.err         = 0;
+    atomic_init(&a.ready, 0);
+    atomic_init(&a.go, 0);
+    atomic_init(&a.done, 0);
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, gc_req_worker, &a) != 0) {
+        printf("  FAIL @%d: pthread_create\n", __LINE__);
+        g_fail++;
+        return;
+    }
+    while (!atomic_load_explicit(&a.ready, memory_order_acquire))
+        sched_yield();
+
+    CHECK(a.err == 0);
+    CHECK(a.t != NULL && a.t != g_tcache);
+    if (a.t != NULL) {
+        CHECK(a.head_before == a.t->bins[a.bin].ncached_max);
+
+        /* 控制线程:自己同步收缩,工作线程只置位。工作线程此刻
+           停在 go 上,不会消费请求,所以置位后可以稳定观察 1 */
+        CHECK(wmm_ctl("gc") == 0);
+        CHECK(atomic_load_explicit(&a.t->gc_req,
+                                   memory_order_acquire) == 1);
+    }
+
+    atomic_store_explicit(&a.go, 1, memory_order_release);
+    while (!atomic_load_explicit(&a.done, memory_order_acquire))
+        sched_yield();
+    CHECK(pthread_join(th, NULL) == 0);
+
+    CHECK(a.err == 0);
+    CHECK(a.head_after == 2);          /* 请求处理后的落点 */
+    CHECK(tc_nodes() == nodes0);       /* 线程已退出并摘链 */
+    CHECK(wmm_tcache_cached_total() == 0);
+    CHECK(total_live() == base);       /* 缓存对象全部归还 */
 }
 
 /* ---- 线程注册表与线程退出 ----
@@ -736,6 +868,8 @@ int test_tcache(void) {
     check_hit_rate();
     check_head_capacity();
     check_gc_occasional();
+    check_ctl_gc_self();
+    check_ctl_gc_cross_thread();
     check_thread_lifecycle();
     check_thread_churn();
     check_disabled_path();

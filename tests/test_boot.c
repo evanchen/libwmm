@@ -113,6 +113,17 @@ int test_boot(void) {
     p1[0] = 0xAB;
     CHECK(p2[0] == 0);
 
+    /* ---- 6) 运行期配置命令 ---- */
+    /* 查询类命令的返回值就是答案,不是成功码 */
+    CHECK(wmm_ctl("config.lg_page") == (int)WMM_LG_PAGE);
+    /* verbose 是普通开关:开、关都要落值;测完恢复,不污染后续组 */
+    bool saved = g_opt.verbose;
+    CHECK(wmm_ctl("config.verbose", 1) == 0);
+    CHECK(g_opt.verbose);
+    CHECK(wmm_ctl("config.verbose", 0) == 0);
+    CHECK(!g_opt.verbose);
+    g_opt.verbose = saved;
+
     if (g_fail == 0)
         printf("  all boot checks passed\n");
     return g_fail;
