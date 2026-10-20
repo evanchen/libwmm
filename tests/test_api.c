@@ -1,6 +1,6 @@
-/* test_api.c —— M4 主路径用例(黑盒为主,白盒核对计数)
+/* test_api.c —— 主路径用例(黑盒为主,白盒核对计数)
  *
- * 覆盖(tasks.md M4 自测清单):
+ * 覆盖:
  *   API1 契约:size==0 当 1、free(NULL) 无操作、realloc 三特例
  *         (NULL/原地收缩/搬移拷贝)、usable_size ≥ 请求;
  *   对齐契约:16B 对齐(仅 8B 类允许 8B);
@@ -190,7 +190,7 @@ static void check_defensive_free(void) {
     g_tcache->enabled = saved;
 }
 
-/* ---- M5:对齐分配(三档 + 错误码 + 档 2 不变量穷举) ---- */
+/* ---- 对齐分配(三档 + 错误码 + 档 2 不变量穷举) ---- */
 static void check_aligned(void) {
     /* posix_memalign 契约错误码:非 2 的幂、小于 sizeof(void*)、
        输出参数为空;失败时 *out 必须是 NULL */
@@ -263,6 +263,37 @@ static void check_aligned(void) {
                 CHECK(wmm_usable_size(m) >= s);
                 wmm_free(m);
             }
+        }
+    }
+
+    /* 档 3 直接从物理层过分配,绕开了 wmm_alloc 的大对象分支。
+       线程计数必须在这里补记,且分配/释放两侧都按可用大小
+       (映射末尾 − 对象地址)记,否则线程表里两边永远对不平。
+       断言取增量:测试组共享进程,绝对计数带着前面用例的历史 */
+    wmm_thread_init();
+    CHECK(g_tcache != NULL);
+    if (g_tcache != NULL) {
+        uint64_t ab = g_tcache->t_alloc_bytes;
+        uint64_t fb = g_tcache->t_free_bytes;
+        uint32_t ac = g_tcache->t_alloc_cnt;
+        uint32_t fc = g_tcache->t_free_cnt;
+
+        void *q = wmm_aligned_alloc(8192, 20000);   /* 8K 对齐 > 页大小 */
+        CHECK(q != NULL);
+        if (q != NULL) {
+            CHECK(((uintptr_t)q & 8191u) == 0);
+            size_t usable = wmm_usable_size(q);
+
+            CHECK(g_tcache->t_alloc_bytes - ab == usable);
+            CHECK(g_tcache->t_alloc_cnt - ac == 1u);
+            CHECK(g_tcache->t_free_bytes - fb == 0);
+            CHECK(g_tcache->t_free_cnt - fc == 0);
+
+            wmm_free(q);
+            CHECK(g_tcache->t_free_bytes - fb == usable);
+            CHECK(g_tcache->t_free_cnt - fc == 1u);
+            CHECK(g_tcache->t_alloc_bytes - ab ==
+                  g_tcache->t_free_bytes - fb);
         }
     }
 }

@@ -162,7 +162,10 @@ ev type=0xBD redzone-overflow tid=... ptr=0x... cls=... pc0=0x... pc1=0x...
 - `ptr` 是**被踩的哨兵地址**,不是对象首地址;它落在 redzone 里,
   用 `wmm_usable_size` 可以反推对象;
 - `pc0` 是释放调用点,`pc1` 是分配调用点;
-- 事件在 `free` 当场产生,不必等后台周期。
+- 事件在 `free` 当场产生,不必等后台周期;
+- 隔离到期时后台会对同一块再校验一次:redzone 仍坏就再记一条 0xBD,
+  这时 `pc0` 是分配点、`pc1` 为 0。它不是第二次越界,按"类型 + 指针"
+  去重即可(guard 测试也按这个口径认定)。
 
 **结论**
 
@@ -249,8 +252,11 @@ ev type=0xBE bad-free tid=... ptr=0x... cls=... pc0=... pc1=...
 
 - 主行 `peak=` 是 `high_water_live`,批次释放后**不会**回落,它记录的是
   历史峰值(在统计快照时更新,后台发布每秒一次);
-- `live` 呈方波,`active` 跟随,`frag` 在释放后短暂升高、后台 purge
-  后再回落;
+- `live` 呈方波;默认批次(2048 × 4 KiB)释放后脏页约 7.9 MiB,仍低于
+  默认 `dirty_max`(8 MiB,判据是"超过才回收"),所以 `active` 停在
+  8 MiB 不回落到低点,空出的页由下一批原地复用,`frag` 在低点升到
+  ~99%;把 `--rate` 提到 4096,脏页越过阈值,后台 purge 才会把
+  `active` 打下去,看到锯齿;
 - `thr:` TOP5 指向执行批次的线程,`cls:` 指向 4096 B 类;
 - CSV 的 `high_water_live` 列可以对齐到具体时刻和 epoch。
 
@@ -267,7 +273,7 @@ ev type=0xBE bad-free tid=... ptr=0x... cls=... pc0=... pc1=...
 | 类型 | 名称 | `ptr` | `pc0` | `pc1` |
 |---|---|---|---|---|
 | 0xBC | uaf-pool-write | 首个被改坏的字节 | 分配点 | 0 |
-| 0xBD | redzone-overflow | 被踩的哨兵地址 | 释放点 | 分配点 |
+| 0xBD | redzone-overflow | 被踩的哨兵地址 | 释放点(复检时为分配点) | 分配点(复检时为 0) |
 | 0xBE | bad-free | 对象地址/野指针 | 本次释放点 | 分配点(guard 路径) |
 | 0xBF | uaf-quarantine | 首个被改坏的字节 | 分配点 | 0 |
 | 0xDA | leak-alert | 0 | 后台 tick 调用链 | — |

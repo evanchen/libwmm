@@ -411,7 +411,8 @@ static wmm_tcache_t *stats_slot(void) {
 
 /* 采样帧锚点。必须是宏而不是辅助函数:__builtin_frame_address(0)
    返回求值它的函数的帧,辅助函数在 debug 构建(-O0)下不内联,取到的
-   是辅助函数自己的帧。宏只允许在 wmm_alloc 体内展开。内建只要出现
+   是辅助函数自己的帧。宏只允许在分配入口(wmm_alloc、alloc_aligned)
+   的体内展开。内建只要出现
    在该函数里,编译期就强制它建立规范的帧指针链,即使运行时走的是
    采样关闭的分支、内建根本没求值——只给 -fno-omit-frame-pointer
    并不够,-O2 或 ASan 构建仍可能把 rbp 挪作通用寄存器。内建放在
@@ -577,7 +578,11 @@ void wmm_free(void *p) {
 
     if (wmm_pte_is_extent(p, &ext)) {
         wmm_extent_t *e = (wmm_extent_t *)ext;
-        size_t bytes = e->npages * WMM_PAGE;
+        /* 可用大小 = 映射末尾 − 对象地址。普通大对象的 p 就是
+           extent 基址;档 3 对齐分配的 p 在基址之后,头部零头不属于
+           应用可用空间,不能计进分配/释放字节 */
+        size_t bytes = (size_t)((char *)e->addr + e->npages * WMM_PAGE
+                                - (char *)p);
         wmm_phys_free_extent(e);
         if (g_tcache != NULL) {
             g_tcache->t_free_bytes += bytes;
@@ -623,7 +628,7 @@ void *wmm_realloc(void *p, size_t size) {
     size_t usable = wmm_usable_size(p);
     if (size <= usable)
         return p;   /* 原地:小对象本无尾巴可割;大对象不割页尾
-                       (jemalloc 的 extent split 属 M6,单独做收益小) */
+                       (jemalloc 的 extent split 单独做收益小) */
 
     void *q = wmm_alloc(size);
     if (q == NULL)
@@ -681,7 +686,10 @@ size_t wmm_usable_size(const void *p) {
  *       size+alignment 字节,返回地址向上对齐。头部零头(基址到
  *       对齐点)与页尾零头一并浪费,上限约 2×alignment;free 与
  *       usable_size 走页表反查 extent(usable 已扣头部零头,见上),
- *       与普通大对象同一条路,无须特殊记账。
+ *       与普通大对象同一条路。分配侧绕开了 wmm_alloc 的大对象
+ *       分支,线程计数与采样要由 alloc_aligned 补记;两边都按
+ *       可用大小(映射末尾 − 对象地址)记账,才能与 wmm_usable_size
+ *       及 free 侧的统计对平。
  */
 
 /* 对齐分配核心。调用方负责校验 alignment 是 2 的幂(两个公开 API
@@ -706,7 +714,25 @@ static void *alloc_aligned(size_t alignment, size_t size) {
         return NULL;
 
     uintptr_t base = (uintptr_t)ext->addr;
-    return (void *)((base + alignment - 1) & ~(uintptr_t)(alignment - 1));
+    void     *p    = (void *)((base + alignment - 1)
+                              & ~(uintptr_t)(alignment - 1));
+
+    /* 这条路径绕开了 wmm_alloc 的大对象分支,线程计数与采样必须在
+       这里补。字节数按可用大小(映射末尾 − 对齐后的地址)记,与
+       free 侧以及 wmm_usable_size 同一公式;否则线程表里分配与释放
+       永远对不平。采样锚点在这里取,回溯链会经过两个公开入口再到
+       调用方 */
+    size_t bytes = (size_t)((char *)ext->addr + ext->npages * WMM_PAGE
+                            - (char *)p);
+    wmm_tcache_t *t = stats_slot();
+    if (t != NULL) {
+        t->t_alloc_bytes += bytes;
+        t->t_alloc_cnt++;
+        if (g_opt.sample_n != 0)
+            wmm_prof_sample(t, bytes, WMM_ALLOC_FRAME());
+    }
+
+    return p;
 }
 
 int wmm_posix_memalign(void **out, size_t alignment, size_t size) {
