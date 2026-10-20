@@ -1,15 +1,15 @@
-/* test_tcache.c —— M8/M9 线程缓存用例(白盒:直接读缓存水位与注册表)
+/* test_tcache.c —— 线程缓存用例(白盒:直接读缓存水位与注册表)
  *
- * 覆盖(tasks.md M8/M9 自测清单 + 快路径的边界行为):
- *   TC1 命中率:单线程对同一尺寸连续分配 10 万次,命中缓存的比例
+ * 覆盖快路径边界与缓存生命周期:
+ *   命中率:单线程对同一尺寸连续分配 10 万次,命中缓存的比例
  *         ≥ 90%。命中判据是白盒的——每次分配前后比较目标 bin 的
  *         head:水位恰好降一格 = 弹栈命中;空栈后先涨到 nfill-1 =
  *         填充事件。只看"分配成功"区分不了快慢路径:慢路径也能
  *         成功,只有水位轨迹能证明对象确实来自缓存。
- *   TC2 容量与满栈 GC:任何时刻 head ≤ ncached_max、low_water ≤ head
+ *   容量与满栈 GC:任何时刻 head ≤ ncached_max、low_water ≤ head
  *         恒成立;满栈释放先跑 GC(留 retain = 用量×1.25 或种子 2),
  *         热 bin 退回 3/4 部分刷出兜底——落点按 GC 公式重放精确断言。
- *   TC3 偶尔用一次的类:填充后晾着不动,显式 GC 把驻留压回 retain
+ *   偶尔用一次的类:填充后晾着不动,显式 GC 把驻留压回 retain
  *         (used==0 → 2 个种子;used>0 → used×1.25),head ≤ retain。
  *   gc 命令:跨线程收缩。调用线程当场收缩到种子;其他线程只
  *         置请求位,由它在下一次 free 入口完成收缩——两段握手分别
@@ -21,7 +21,7 @@
  *   线程注册表与退出:工作线程首次分配时建缓存并挂链;pthread 析构
  *         在线程返回时把缓存刷回 bin、摘链、munmap——缓存对象数、
  *         全局 live、注册表节点数三项都回到进场基线。
- *   G5 千次线程增删:1000 个线程反复创建/退出,Σ live、缓存总量、
+ *   千次线程增删:1000 个线程反复创建/退出,Σ live、缓存总量、
  *         注册表节点全部回到基线,RSS 无量级漂移(粗检,精确账在
  *         stress 窗口预算)。
  *   关闭开关:enabled=false 时分配/释放直走 bin,缓存水位纹丝不动。
@@ -36,7 +36,8 @@
  *
  * 每个用例自清自净:进场先 wmm_tcache_flush_all 把主线程缓存剥空,
  * 出场再刷一次并对回进场 live,组与组之间互不继承缓存状态。
- * 需要确定性的组(TC2/TC3)先把 gc_evt/gc_next 归零,关掉事件轮转
+ * 需要确定性的组(满栈 GC 与偶用类的落点)先把 gc_evt/gc_next 归零,
+ * 关掉事件轮转
  * 的噪声,让 GC 只由本用例显式触发。
  */
 #include "wmm_internal.h"
@@ -111,7 +112,7 @@ static void check_capacity_formula(void) {
             want = WMM_TCACHE_NCACHED_MAX;
 
         CHECK(cb->ncached_max == want);
-        /* M9 起 nfill 自适应:创建态是 ncm/2,GC 后会在 [2, ncm/2]
+        /* nfill 自适应:创建态是 ncm/2,GC 后会在 [2, ncm/2]
            里漂(封顶容量一半、下限 2)。主线程的块还被 stress 等前序
            用例磨过,这里断言的是自适应范围;创建公式由 lifecycle 的
            新线程块白盒报告覆盖 */
@@ -134,11 +135,11 @@ static void check_capacity_formula(void) {
     CHECK(t->bins[WMM_NBINS].nfill == 0);
 }
 
-/* ---- TC1:命中率 ----
+/* ---- 命中率 ----
  * 工作负载:始终保持一个对象在应用手里,分配新的、释放旧的。
  * 这正是一般代码 churn 小对象的形态,也把快路径的两个方向
  * (弹栈、压栈)都压进同一条循环。稳态下除第一次分配外每次
- * 都该命中;命中率门槛按清单取 90%,留足余量给实现演化。 */
+ * 都该命中;门槛取 90%,留足余量给实现演化。 */
 static void check_hit_rate(void) {
     enum { NALLOC = 100000, BIN_SIZE = 64 };
     uint64_t base = flush_baseline();
@@ -173,18 +174,18 @@ static void check_hit_rate(void) {
     }
     wmm_free(prev);
 
-    CHECK(hits * 100u >= (unsigned)NALLOC * 90u);   /* TC1 */
+    CHECK(hits * 100u >= (unsigned)NALLOC * 90u);   /* 命中率下界 */
     CHECK(cb->head <= cb->ncached_max);
 
     wmm_tcache_flush_all();
     CHECK(total_live() == base);
 }
 
-/* ---- TC2:容量上限与满栈 GC ----
- * 先攒满一批对象再逐个释放:缓冲会反复涨到 ncm,触发 M9 的满栈
- * GC(先按 retain 公式刷、热 bin 退回 3/4 兜底)再压一个。每步
- * 核对水位;满栈事件的落点由测试自己按 GC 公式重放,精确断言——
- * GC 是 M9 新增的行为,公式若改,这里同步改,落点仍然钉得住。
+/* ---- 容量上限与满栈 GC ----
+ * 先攒满一批对象再逐个释放:缓冲会反复涨到 ncm,触发满栈 GC(先按
+ * retain 公式刷、热 bin 退回 3/4 兜底)再压一个。每步核对水位;满栈
+ * 事件的落点由测试自己按 GC 公式重放,精确断言——公式若改,这里
+ * 同步改,落点仍然钉得住。
  *
  * 重放要点:lw_tracked 镜像真实的 low_water。真实 low_water 只在
  * 两处变:弹栈时取 min(快路径,释放阶段没有弹栈),刷出时重置为
@@ -209,7 +210,7 @@ static void check_head_capacity(void) {
     for (int k = 0; k < NOBJ; k++) {
         o[k] = wmm_alloc(BIN_SIZE);
         CHECK(o[k] != NULL);
-        CHECK(cb->head <= ncm);           /* TC2:分配侧不越顶 */
+        CHECK(cb->head <= ncm);           /* 分配侧不越顶 */
         CHECK(cb->low_water <= cb->head);
     }
     /* 分配阶段把缓存吃空过多次,low_water 钉在 0——重放从这起算 */
@@ -218,7 +219,7 @@ static void check_head_capacity(void) {
         unsigned before = cb->head;
 
         wmm_free(o[k]);
-        CHECK(cb->head <= ncm);           /* TC2:释放侧不越顶 */
+        CHECK(cb->head <= ncm);           /* 释放侧不越顶 */
         CHECK(cb->low_water <= cb->head);
 
         if (before == ncm) {
@@ -245,7 +246,7 @@ static void check_head_capacity(void) {
     CHECK(total_live() == base);
 }
 
-/* ---- TC3:偶尔用一次的类,GC 压回 retain ----
+/* ---- 偶尔用一次的类:GC 压回 retain ----
  * 白盒构造:冷 bin 先填充一批(填充把 low_water 抬到新水位),然后
  * 晾着——不再弹栈,GC 看到的 used==0,retain 缩到种子 2,整批压回;
  * 再构造"用过一点"的场景(弹掉一半再放回),used>0 时 retain =
@@ -267,7 +268,7 @@ static void check_gc_occasional(void) {
     CHECK(cb->head == nf);
     wmm_tcache_gc(bin);
     CHECK(cb->head == 2);                  /* used==0 → 留 2 个种子 */
-    CHECK(cb->head <= 2);                  /* TC3:head ≤ retain */
+    CHECK(cb->head <= 2);                  /* head ≤ retain */
 
     /* 场景 B:用过一点。弹栈把 low_water 压到 nf2−half,放回不碰它,
        GC 看到 used == half,retain = half×1.25,刷到刚好 retain */
@@ -283,7 +284,7 @@ static void check_gc_occasional(void) {
     unsigned used   = nf2 - (nf2 - half);  /* = half */
     unsigned retain = used + (used >> 2);
     CHECK(cb->head == retain);             /* 刷到 retain,不多不少 */
-    CHECK(cb->head <= retain);             /* TC3 */
+    CHECK(cb->head <= retain);
 
     wmm_tcache_flush_all();
     CHECK(total_live() == base);
@@ -423,7 +424,7 @@ static void check_ctl_gc_cross_thread(void) {
  * 再释放一半——这半批对象停在它的缓存里。主线程在它停稳后
  * 检查注册表与缓存总量,然后放行;线程返回触发 pthread 析构,
  * 刷空、摘链、munmap 一次做完。
- * M9 起批次大小取工作线程自己块的 nfill:主线程的 nfill 被前序
+ * 批次大小取工作线程自己块的 nfill:主线程的 nfill 被前序
  * 用例的 GC 磨过,不再等于新块的创建值。worker 白盒报告新块的
  * ncm/nfill——创建公式 nfill==ncm/2 只对新建块成立,据此断言。 */
 typedef struct {
@@ -529,7 +530,7 @@ static size_t rss_kb(void) {
     return (size_t)resident * (sysconf(_SC_PAGESIZE) >> 10);
 }
 
-/* ---- G5:千次线程创建/退出 ----
+/* ---- 千次线程创建/退出 ----
  * 每个线程分配一小批、释放一半,另一半留给 pthread 析构刷回——
  * 缓存块随线程退出整块 munmap。千次下来,live / 缓存总量 / 注册表
  * 节点必须全部回到基线,一个块都不许漏。RSS 只做粗检:线程栈与
@@ -588,7 +589,7 @@ static void check_thread_churn(void) {
         CHECK(a.err == 0);
     }
 
-    CHECK(tc_nodes() == nodes0);              /* G5:注册表回到基线 */
+    CHECK(tc_nodes() == nodes0);              /* 注册表回到基线 */
     CHECK(wmm_tcache_cached_total() == 0);    /* 每块都经析构刷空 */
     CHECK(total_live() == base);              /* Σ live 分毫不差 */
 

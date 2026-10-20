@@ -1,11 +1,11 @@
-/* test_phys.c —— M6 物理层用例(白盒:直接检查地址序链与计数)
+/* test_phys.c —— 物理层用例(白盒:直接检查地址序链与计数)
  *
- * 覆盖(tasks.md M6 自测清单):
- *   PHY1 合并:奇偶交替释放 → 独立空闲块;全释放 → 融成单块;
+ * 覆盖:
+ *   合并:奇偶交替释放 → 独立空闲块;全释放 → 融成单块;
  *         复用取最低地址且 g_heap_cur 不前进(零新映射);
  *   分裂:大块复用时从低段切,余段按地址留在链上,计数守恒;
  *   跨路径吸收:slab 退休的页被大对象分配复用(碎片不丢);
- *   PHY3:大对象每页页表登记同一 extent,释放后全页 raw==0;
+ *   页表登记:大对象每页登记同一 extent,释放后全页 raw==0;
  *   结构不变量:地址序链严格递增、不重叠、双向指针互指、
  *         g_dirty_pages == Σ FREE 页数(每个检查点跑一遍);
  *   重放:混合压力序列跑两遍(同种子同序列),第二遍 g_heap_cur
@@ -103,7 +103,7 @@ static void drain_free_pool(void) {
     ar_check();
 }
 
-/* ---- PHY3:大对象页表登记与清零 ---- */
+/* ---- 大对象页表登记与清零 ---- */
 static void check_large_pte(void) {
     drain_free_pool();
 
@@ -129,7 +129,7 @@ static void check_large_pte(void) {
         CHECK(wmm_pte_get(L + pg * WMM_PAGE).raw == 0);
 }
 
-/* ---- PHY1:交替释放的合并与最低地址复用 ---- */
+/* ---- 交替释放的合并与最低地址复用 ---- */
 static void check_merge(void) {
     drain_free_pool();
 
@@ -329,7 +329,7 @@ static size_t dirty_pages_locked(void) {
     return n;
 }
 
-/* ---- PHY2:同步 purge 把脏页还给内核 ----
+/* ---- 同步 purge 把脏页还给内核 ----
  * 三件事分别证明:账本(dirty 归零、页数守恒转 RETAINED)、物理
  * 事实(RSS 实测回落,不是只改状态),以及回收后的页仍可零系统
  * 调用复用。NB×4MB 这个量级取的是"远大于 dirty_max",断言只依赖
@@ -443,7 +443,7 @@ static void check_merge_across_states(void) {
 
 /* ---- 后台线程:启停幂等 + 阈值触发 + 停后不再动 ----
  * 时间预算:两段"等一个巡检周期"各 1.3s,回收轮询上限 2s。
- * 128MB 足以越过默认 8MB 阈值,不必像 PHY2 上 1GB。 */
+ * 128MB 足以越过默认 8MB 阈值,不必像同步回收用例那样上 1GB。 */
 static void check_bg_lifecycle(void) {
     drain_free_pool();
 
@@ -522,7 +522,7 @@ int test_phys(void) {
 
     /* 关缓存,理由见文件头。先 exit 丢掉前序组可能留在缓存里的
        对象,再建一个本组的空缓存并禁用——wmm_alloc/free 回到
-       M7 的直通路径 */
+       bin 的直通路径 */
     wmm_thread_exit();
     wmm_thread_init();
     g_tcache->enabled = false;

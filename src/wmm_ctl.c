@@ -150,8 +150,8 @@ static int ctl_config_verbose(const char *cmd, va_list ap)
 
 /* 调用点采样开关:无变参。不开放任意的采样间隔——间隔是估计精度
  * 的旋钮,不是业务配置;固定 1000 让不同进程的 TOP 表口径一致,
- * 也避免一个荒谬的小间隔把分配路径拖垮。无参还保证 M14 的自动
- * 开启可以直接 wmm_ctl("sampling.enable") 调用,不会从变参表里
+ * 也避免一个荒谬的小间隔把分配路径拖垮。无参还保证 guard 告警的
+ * 自动开启可以直接 wmm_ctl("sampling.enable") 调用,不会从变参表里
  * 读到不存在的实参。 */
 static int ctl_sampling_enable(const char *cmd, va_list ap)
 {

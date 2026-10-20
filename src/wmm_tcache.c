@@ -24,7 +24,7 @@
  * 对象都在空闲链上,自然包括此刻批次里尚未归还的那些;等最后一个
  * 也归还时才退休,之后批次里不再有它的对象。
  *
- * M9 起满栈不再只按固定比例刷出,而是先跑 GC:用 (head − low_water)
+ * 满栈时不再只按固定比例刷出,而是先跑 GC:用 (head − low_water)
  * 估计"上次 GC 以来真正消耗了多少",retain = 用量×1.25(完全没动
  * 过就留 2 个种子),把驻留压到贴近真实需求——偶尔用一次的类囤到
  * 天荒地老的问题由此根治。GC 同时承担自适应填充:nfill 随低水位
@@ -59,7 +59,7 @@
  * 上限 200 把单线程缓存的无界膨胀钉死。为什么大对象不缓存,见
  * wmm_internal.h 里 wmm_tcache_t.bins 的注释。
  *
- * 失败处理:整块 mmap 失败就直接返回——调用方落回 M7 的慢路径,
+ * 失败处理:整块 mmap 失败就直接返回——调用方落回 bin 慢路径,
  * 功能不损失,只是这个线程享受不到快路径。不缓存失败结果,下次
  * 分配再试;mmap 失败到这个程度,系统已经在 OOM 边缘,重试的
  * 系统调用开销不是问题。 */
@@ -78,6 +78,11 @@ static bool tcache_create(void) {
         total += (size_t)v * sizeof(void *);
     }
 
+    /* 测试注入:模拟整块 mmap 失败。调用方必须能落回 bin 慢路径,
+       功能不损失;缓存指针保持 NULL,后续分配会再次尝试创建 */
+    if (wmm_fault_check(WMM_FAULT_TCACHE))
+        return false;
+
     void *blk = mmap(NULL, total, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (blk == MAP_FAILED)
@@ -93,10 +98,10 @@ static bool tcache_create(void) {
 
     /* 线程局部计数保持显式零值:mmap 本就零填充,写出来是给新增
        字段立规矩——漏赋会被这一行一行看见,而不是埋在零页里 */
-    t->t_alloc_bytes = 0;
-    t->t_free_bytes  = 0;
-    t->t_alloc_cnt   = 0;
-    t->t_free_cnt    = 0;
+    atomic_init(&t->t_alloc_bytes, 0);
+    atomic_init(&t->t_free_bytes, 0);
+    atomic_init(&t->t_alloc_cnt, 0);
+    atomic_init(&t->t_free_cnt, 0);
     t->gc_evt        = 0;
     t->gc_next       = 0;
     /* 唯一的跨线程字段:显式初始化,不依赖 mmap 零页恰好是可接受的
@@ -370,7 +375,7 @@ void wmm_tcache_free(szind_t i, void *p) {
 
     /* 满栈先 GC:retain 公式算出的驻留目标比固定留 1/4 更贴近真实
        用量。热 bin(用量顶到容量、GC 全留)无处可刷,原样压栈会越顶,
-       退回 M8 的 3/4 部分刷出兜底——保证栈位、head 永不越过容量 */
+       退回固定的 3/4 部分刷出兜底——保证栈位、head 永不越过容量 */
     if (cb->head == cb->ncached_max) {
         tcache_gc_bin(t, i);
         if (cb->head == cb->ncached_max)

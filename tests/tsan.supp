@@ -1,0 +1,20 @@
+# TSan 抑制表:只覆盖分配器自实现的两处 seqlock。
+#
+# TSan 只认识 C11 原子与 pthread 同步,不认识"世代号 + 栅栏"的
+# seqlock:数据字段本身是普通内存访问,竞争检测必然报出"写端写
+# payload、读端读 payload"的假阳性。两处协议都在代码里用栅栏建立
+# 了 happens-before,读端首尾序号相等才接受数据——竞争是设计本身,
+# 数据被丢弃而不是被误用。
+#
+# 匹配用函数名;TSan 构建用 -O0,两条路径都保留独立栈帧,不会因为
+# 内联让抑制失效。
+#
+# prof 环:线程写自己的环,后台合并器并发读槽位。
+race:prof_ring_push
+race:prof_ring_merge_locked
+#
+# 共享区:单写者发布,多读者一致读。
+race:shm_publish_to
+race:wmm_shm_read
+race:wmm_shm_read_prof
+race:wmm_shm_read_events

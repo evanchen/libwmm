@@ -1,4 +1,4 @@
-/* test_guard.c —— M14 guard/quarantine 与泄漏三档用例
+/* test_guard.c —— guard/quarantine 与泄漏三档用例
  *
  * 覆盖:
  *   基本布局:guard 对象独占 slab、数据区按 data_off 对齐垫层摆放、

@@ -1,7 +1,7 @@
 /* test_api.c —— 主路径用例(黑盒为主,白盒核对计数)
  *
  * 覆盖:
- *   API1 契约:size==0 当 1、free(NULL) 无操作、realloc 三特例
+ *   基础契约:size==0 当 1、free(NULL) 无操作、realloc 三特例
  *         (NULL/原地收缩/搬移拷贝)、usable_size ≥ 请求;
  *   对齐契约:16B 对齐(仅 8B 类允许 8B);
  *   usable 精确值:查表边界(17→32、49→64)、公式段(4097→5120)、
@@ -13,7 +13,7 @@
  *         压栈、页表登记保持,第二次 free 会被静默再收一次——这是
  *         所有 tcache 实现共同的盲区(glibc 同款),检测归 guard 模块。
  *         本组负路径因此临时关缓存,专测慢路径的诊断;
- *   PTE2 + G2 零点:万次随机分配/释放风暴后全部归还,36 个 bin 的
+ *   页表与计数零点:万次随机分配/释放风暴后全部归还,36 个 bin 的
  *         live/curslabs/链指针全零、大对象计数全零、抽 witness 指针
  *         查页表已清登记。风暴的归还是两段:应用先全量 free(对象
  *         落进本线程缓存),再 wmm_thread_exit 把缓存刷回 arena——
@@ -46,7 +46,7 @@ static uint32_t rng(void) {
     return (uint32_t)(g_rng >> 32);
 }
 
-/* ---- API1:基础契约 ---- */
+/* ---- 基础契约 ---- */
 static void check_contract_basics(void) {
     /* size==0 按 1 处理:可分配、可释放、至少 8B 对齐 */
     void *z = wmm_alloc(0);
@@ -157,6 +157,18 @@ static void check_realloc(void) {
     p = wmm_alloc(100);
     CHECK(p != NULL);
     CHECK(wmm_realloc(p, 0) == NULL);
+
+    /* reallocarray:乘积溢出必须拒绝,且旧块原样有效;正常乘积
+       与 realloc 同语义 */
+    p = wmm_alloc(32);
+    CHECK(p != NULL);
+    errno = 0;
+    CHECK(wmm_reallocarray(p, SIZE_MAX / 2, 3) == NULL);
+    CHECK(errno == ENOMEM);
+    CHECK(wmm_usable_size(p) >= 32);
+    q = wmm_reallocarray(p, 4, 100);
+    CHECK(q != NULL && wmm_usable_size(q) >= 400);
+    wmm_free(q);
 }
 
 /* ---- 防御性释放:三种非法指针都不许把进程带走 ---- */
@@ -275,8 +287,8 @@ static void check_aligned(void) {
     if (g_tcache != NULL) {
         uint64_t ab = g_tcache->t_alloc_bytes;
         uint64_t fb = g_tcache->t_free_bytes;
-        uint32_t ac = g_tcache->t_alloc_cnt;
-        uint32_t fc = g_tcache->t_free_cnt;
+        uint64_t ac = g_tcache->t_alloc_cnt;
+        uint64_t fc = g_tcache->t_free_cnt;
 
         void *q = wmm_aligned_alloc(8192, 20000);   /* 8K 对齐 > 页大小 */
         CHECK(q != NULL);
@@ -298,7 +310,7 @@ static void check_aligned(void) {
     }
 }
 
-/* ---- PTE2/G2:万次随机风暴 + 全量归还的零点核对 ---- */
+/* ---- 页表与计数零点:万次随机风暴 + 全量归还 ---- */
 static void check_random_storm(void) {
     enum { SLOTS = 4096, WITNESS = 16 };
     static void *slot[SLOTS];
@@ -336,7 +348,7 @@ static void check_random_storm(void) {
             wmm_free(slot[s]);
     wmm_thread_exit();   /* 刷空缓存 + 从注册表摘除 + munmap 缓存块 */
 
-    /* G2 的全零特例:live 恒等式此刻两边都是 0(应用持有与缓存皆空) */
+    /* 全零特例:live 恒等式此刻两边都是 0(应用持有与缓存皆空) */
     for (szind_t i = 0; i < WMM_NBINS; i++) {
         CHECK(g_bins[i].live == 0);
         CHECK(g_bins[i].curslabs == 0);
@@ -349,7 +361,7 @@ static void check_random_storm(void) {
     CHECK(g_large.live_bytes == 0);
     CHECK(g_large.ndalloc > 0);
 
-    /* PTE2:witness 指针的页表登记已清零(退休/释放时同步清的) */
+    /* witness 指针的页表登记已清零(退休/释放时同步清的) */
     for (int k = 0; k < n_witness; k++)
         CHECK(wmm_pte_get(witness[k]).raw == 0);
 }

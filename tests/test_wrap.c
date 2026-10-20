@@ -1,8 +1,9 @@
 /* test_wrap.c —— --wrap 接管冒烟测试(独立程序,自带 main)
  *
  * 覆盖(冒烟三连):
- *   1) 跑通:malloc/calloc/realloc/posix_memalign/aligned_alloc/free
- *      六个入口全部经 __wrap_* 落到 libwmm,混合负载不崩;
+ *   1) 跑通:malloc/calloc/realloc/reallocarray/posix_memalign/
+ *      aligned_alloc/free 七个入口全部经 __wrap_* 落到 libwmm,
+ *      混合负载不崩;
  *   2) 统计非零且合理:增量分配字节 ≥ 请求总和、不超过请求总和的
  *      8 倍(尺寸类取整的理论最坏比),累计分配与释放严格对平;
  *   3) 退出零泄漏:全部释放并刷空本线程缓存后,live 字节与对象数
@@ -57,7 +58,7 @@ static bool in_heap(const void *p) {
 
 /* ---- malloc 基础契约:0 字节、空指针释放、对齐、首尾可写 ---- */
 static void check_malloc(void) {
-    free(NULL);   /* API1:空指针释放是合法空操作,不崩、不记账 */
+    free(NULL);   /* 空指针释放是合法空操作,不崩、不记账 */
 
     void *z = malloc(0);
 
@@ -171,6 +172,30 @@ static void check_realloc(void) {
     if (p != NULL) {
         g_requested += 100;
         CHECK(realloc(p, 0) == NULL);
+    }
+
+    /* reallocarray:溢出拒绝且旧块有效;正常乘积与 realloc 等价。
+       huge 经 volatile 读入,避免编译器在编译期判定必然溢出 */
+    volatile size_t huge = SIZE_MAX / 2;
+    unsigned char *ra = malloc(32);
+    CHECK(ra != NULL);
+    if (ra != NULL) {
+        CHECK(in_heap(ra));
+        g_requested += 32;
+
+        errno = 0;
+        CHECK(reallocarray(ra, huge, 3) == NULL);
+        CHECK(errno == ENOMEM);
+        CHECK(in_heap(ra));   /* 失败后旧块必须仍可用 */
+
+        ra = reallocarray(ra, 4, 100);
+        CHECK(ra != NULL);
+        if (ra != NULL) {
+            CHECK(in_heap(ra));
+            CHECK(wmm_usable_size(ra) >= 400);
+            g_requested += 400;
+            free(ra);
+        }
     }
 }
 

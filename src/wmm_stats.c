@@ -10,10 +10,13 @@
  *                    把锁读取——"Σ live*size == live_bytes"恒成立
  *                    不是估计值,是同一批读数的和;
  *   allocated/freed  各线程在分配/释放出口累进自己的 tcache 块,
- *                    快照遍历 g_threads 合并。合并瞬间允许瞬时偏差
- *                    (读写不同步),换来的是分配快路径零同步开销;
+ *                    快照遍历 g_threads 合并。所有者是唯一写者,
+ *                    写与读都走 relaxed 原子访问:合并瞬间仍可能读到
+ *                    上一瞬的值,但 C11 层面不存在数据竞争,快路径
+ *                    也只有普通 load/store(单写者不需要读改写);
  *   active/high_water 前者在 g_ext_lock 内记账(purge 增减),后者
- *                    快照时取历史最大值。
+ *                    快照时取历史最大值;快照可能被应用线程与后台
+ *                    发布线程并发调用,两个跨调用的状态必须是原子。
  *
  * 事件环为什么用互斥锁而不是无锁环:多生产者是事实——任何线程
  * 的错误路径(双释放、OOM)和后台线程的回收动作都会写。事件是
@@ -136,8 +139,13 @@ int wmm_event_drain(wmm_event_t *buf, size_t n, size_t *got) {
 
 /* ==================== 快照 ==================== */
 
-static uint64_t g_snapshot_epoch;    /* 快照序号;每次成功快照 +1 */
-static uint64_t g_high_water_live;   /* live_bytes 历史峰值;快照时更新 */
+/* 快照不是后台线程的私有路径:应用随时可以调 wmm_stats_snapshot,
+ * 后台发布每秒也调一次,两者会并发。下面两个跨调用状态因此必须是
+ * 原子量——epoch 的普通 ++ 会让两个并发快照拿到同一个序号,高水位
+ * 的"读-比较-写"则可能被较旧的一次快照覆盖而回退。两者都只在快照
+ * 冷路径访问,原子操作的代价无关紧要。 */
+static _Atomic uint64_t g_snapshot_epoch;   /* 快照序号;每次成功快照 +1 */
+static _Atomic uint64_t g_high_water_live;  /* live_bytes 历史峰值;快照时更新 */
 
 int wmm_stats_snapshot(wmm_stats_t *st) {
     if (st == NULL) {
@@ -200,13 +208,23 @@ int wmm_stats_snapshot(wmm_stats_t *st) {
     st->frag_bytes   = st->active_bytes >= live_bytes
                          ? st->active_bytes - live_bytes : 0;
 
-    /* 3) 高水位:快照时取历史最大(监控读到的就是"至今为止") */
-    if (live_bytes > g_high_water_live)
-        g_high_water_live = live_bytes;
-    st->high_water_live = g_high_water_live;
+    /* 3) 高水位:快照时取历史最大(监控读到的就是"至今为止")。
+       CAS 循环保证并发快照下只升不降:较旧的快照即使来得晚,也只会
+       在 live_bytes 更大时成功写入。 */
+    uint64_t hw = atomic_load_explicit(&g_high_water_live,
+                                       memory_order_relaxed);
+    while (live_bytes > hw &&
+           !atomic_compare_exchange_weak_explicit(&g_high_water_live, &hw,
+                                                  live_bytes,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed))
+        ;
+    st->high_water_live = atomic_load_explicit(&g_high_water_live,
+                                               memory_order_relaxed);
 
-    /* 4) 各线程计数:遍历注册表。读是非原子的——写者是拥有该块的
-       线程,读到瞬时旧值被设计接受(见 wmm_internal.h 线程缓存段)。
+    /* 4) 各线程计数:遍历注册表。所有者是唯一写者,读端用 relaxed
+       原子访问——可能读到上一瞬的值,但不会撕裂,也不构成 C11 数据
+       竞争(见 wmm_internal.h 线程缓存段)。
        超过 128 行合并进聚合桶 threads[127](tid 记 0)。 */
     pthread_mutex_lock(&g_threads_lock);
     uint64_t alloc_total = 0;
@@ -218,11 +236,17 @@ int wmm_stats_snapshot(wmm_stats_t *st) {
             st->threads[dst].tid = t->tid;
         else
             st->threads[dst].tid = 0;   /* 聚合桶:不再区分线程 */
-        st->threads[dst].alloc_bytes += t->t_alloc_bytes;
-        st->threads[dst].free_bytes  += t->t_free_bytes;
-        st->threads[dst].alloc_cnt   += t->t_alloc_cnt;
-        alloc_total += t->t_alloc_bytes;
-        free_total  += t->t_free_bytes;
+        uint64_t ab = atomic_load_explicit(&t->t_alloc_bytes,
+                                           memory_order_relaxed);
+        uint64_t fb = atomic_load_explicit(&t->t_free_bytes,
+                                           memory_order_relaxed);
+        uint64_t ac = atomic_load_explicit(&t->t_alloc_cnt,
+                                           memory_order_relaxed);
+        st->threads[dst].alloc_bytes += ab;
+        st->threads[dst].free_bytes  += fb;
+        st->threads[dst].alloc_cnt   += ac;
+        alloc_total += ab;
+        free_total  += fb;
         tslot++;
     }
     pthread_mutex_unlock(&g_threads_lock);
@@ -230,6 +254,9 @@ int wmm_stats_snapshot(wmm_stats_t *st) {
     st->allocated_bytes   = alloc_total;
     st->deallocated_bytes = free_total;
 
-    st->epoch = ++g_snapshot_epoch;
+    /* 并发快照各自取得一个全局唯一、递增的序号;两个调用的完成顺序
+       可能与序号顺序不同,监控端只用它判断"数据是否换了一代" */
+    st->epoch = atomic_fetch_add_explicit(&g_snapshot_epoch, 1,
+                                          memory_order_relaxed) + 1;
     return 0;
 }

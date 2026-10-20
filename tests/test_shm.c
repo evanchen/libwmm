@@ -1,6 +1,6 @@
-/* test_shm.c —— M12 共享内存 seqlock 用例
+/* test_shm.c —— 共享内存 seqlock 用例
  *
- * 覆盖(tasks.md M12 自测清单):
+ * 覆盖:
  *   创建契约:未创建时发布是空操作;NULL 路径 EINVAL、目录不存在
  *        ENOENT、重复创建 EEXIST(且不破坏已有映射);
  *   跨进程:子进程按路径 open + 只读 mmap 同一文件(外部监控进程的

@@ -14,7 +14,7 @@
  *      剩下的才是"应用持有"。字节版同一等式:模型按每次分配实测的
  *      usable 累计字节,逐步对账"Σ live*reg_size + 大对象字节 −
  *      缓存字节"——live_bytes 的累加链因此被钉在模型观测上,这是
- *      OBS1 恒等式的逐步版;快照路径自身的对账(快照 vs 直读)在
+ *      live 恒等式的逐步版;快照路径自身的对账(快照 vs 直读)在
  *      检查点与终局各取一次——快照要 37 把锁加 5KB 清零,每步做会
  *      把 oracle 时长拉长数倍,而计数/字节两条逐步等式已经读的是
  *      快照所读的同一批全局变量。
@@ -79,7 +79,7 @@ static uint32_t rng(void) {
 
 /* 尺寸生成:覆盖 1..1MB 全区间,但按带宽加权、小对象为主。
    若按区间均匀取值,99% 的请求落进大对象路径,bin/slab 机制几乎
-   得不到随机压测——而它恰是前面全部里程碑的主体。带宽边界取尺寸
+   得不到随机压测——而它恰是分配器的主体。带宽边界取尺寸
    体系的关键刻度:64(16 的倍数类上界)、4096(查表线)、14336
    (小对象上界)、262144(中大型分界)。 */
 static size_t gen_size(void) {
@@ -277,9 +277,9 @@ static int op_realloc(const wmm_oops_t *o, size_t s, size_t nreq) {
     return 0;
 }
 
-/* OBS1 快照钩子:取一次快照,与白盒直读逐项对账。快照口径与直读同为
+/* 快照钩子:取一次快照,与白盒直读逐项对账。快照口径与直读同为
    "含线程缓存"(见 wmm_internal.h),两侧一致,无需扣缓存层 */
-static void obs1_snapshot_check(void) {
+static void snapshot_check(void) {
     wmm_stats_t st;
     CHECK(wmm_stats_snapshot(&st) == 0);
     CHECK(st.live_bytes == live_bytes_direct());
@@ -312,7 +312,7 @@ static void run_checkpoint(const wmm_oops_t *o, size_t step,
         /* 字节版:缓存已空,直接对模型累计。快照钩子取在满槽世界——
            这是 live_bytes 最大、尺寸类分布最广的采样点 */
         CHECK(live_bytes_direct() - live_bytes0 == (uint64_t)g_model_bytes);
-        obs1_snapshot_check();
+        snapshot_check();
     }
 
     for (size_t s = 0; s < WMM_ORACLE_SLOTS; s++)
@@ -427,7 +427,7 @@ static void run_mode(const wmm_oops_t *o, size_t steps) {
         CHECK(total_live() == live0);
         CHECK(live_bytes_direct() == live_bytes0);   /* 字节口径同归基线 */
         CHECK(g_model_bytes == 0);
-        obs1_snapshot_check();           /* 终局快照:与直读一致 */
+        snapshot_check();                /* 终局快照:与直读一致 */
     }
 
     printf("  %s mode: %zu steps, %llu allocs / %llu frees / %llu reallocs, "

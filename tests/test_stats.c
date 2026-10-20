@@ -1,7 +1,7 @@
-/* test_stats.c —— M11 统计与事件用例(白盒:直接对账内部计数)
+/* test_stats.c —— 统计与事件用例(白盒:直接对账内部计数)
  *
- * 覆盖(tasks.md M11 自测清单):
- *   OBS1 恒等式:Σ cls[i].live*size + 大对象字节 == live_bytes。用
+ * 覆盖:
+ *   live 恒等式:Σ cls[i].live*size + 大对象字节 == live_bytes。用
  *        独立核算(直接读全局计数)与快照对照——拿快照自己的求和
  *        重放恒等式是恒真的,测不出任何东西;
  *   快照增量:已知工作量的分配/释放字节数与对象数逐项对账,
@@ -16,7 +16,7 @@
  * 确定性策略:本组开始时重建主线程缓存并关掉 enabled(同 test_phys),
  * 释放即回 bin,计数不经缓存中转;进程内其余线程都已 join,白盒
  * 直读全局计数没有并发写者。快照与直读的差值因此可以写死。
- * 本组放在用例表末尾:不依赖后续组,也不给后续组留半开状态
+ * 本组不依赖前序组的内部状态,也不给后续组留半开状态
  * (组尾恢复 enabled)。
  */
 
@@ -61,7 +61,7 @@ static size_t dirty_pages_locked(void) {
     return n;
 }
 
-/* ---- 快照增量 + OBS1 独立核算 ---- */
+/* ---- 快照增量 + live 恒等式独立核算 ---- */
 static void check_snapshot_accounting(void) {
     enum { NS = 40, NL = 4 };
     static void *ps[NS], *pl[NL];
@@ -108,7 +108,7 @@ static void check_snapshot_accounting(void) {
     CHECK(s1.allocated_bytes - s0.allocated_bytes == expect_alloc);
     CHECK(s1.deallocated_bytes - s0.deallocated_bytes == expect_free);
 
-    /* OBS1:快照与独立核算逐字节一致 */
+    /* 快照与独立核算逐字节一致 */
     CHECK(s1.live_bytes == live_bytes_direct());
     CHECK(s1.live_objects == live_objects_direct());
 

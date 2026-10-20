@@ -82,6 +82,26 @@ wmm_opt_t g_opt = {
     .abort_oom    = false,             /* OOM 返回 NULL,与 glibc 行为一致 */
 };
 
+/* 故障注入状态(测试专用,见 wmm_internal.h)。默认全零 = 关闭,
+   生产路径不写这两个变量;检查只是一次 relaxed 原子读。 */
+_Atomic unsigned g_fault_site;
+_Atomic unsigned g_fault_after;
+
+bool wmm_fault_check(unsigned site) {
+    unsigned want = atomic_load_explicit(&g_fault_site, memory_order_relaxed);
+    if (want == 0 || (want != WMM_FAULT_ANY && want != site))
+        return false;
+
+    unsigned n = atomic_load_explicit(&g_fault_after, memory_order_relaxed);
+    while (n != 0 && n != WMM_FAULT_ALWAYS) {
+        if (atomic_compare_exchange_weak_explicit(&g_fault_after, &n, n - 1,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed))
+            return n == 1;   /* 第 N 次检查:消费最后一个计数并失败 */
+    }
+    return n == WMM_FAULT_ALWAYS;
+}
+
 static bool g_boot_done = false;   /* 幂等标志;契约保证只有单线程碰它 */
 
 /* base 区自身的锁(见文件尾 wmm_base_alloc)。叶子锁:持它期间
@@ -396,6 +416,15 @@ void *wmm_base_alloc(size_t size) {
         size = 8;                      /* 调用方不该要 0;给最小块而非 NULL */
 
     pthread_mutex_lock(&g_base_lock);
+
+    /* 测试注入放在入口:无论当前块是否还有空间,都模拟"元数据
+       不可用"。真实失败只发生在追加块时,但调用方看到的契约相同,
+       回滚路径也相同;放在块容量判断内部会让测试无法稳定触发 */
+    if (wmm_fault_check(WMM_FAULT_BASE)) {
+        pthread_mutex_unlock(&g_base_lock);
+        return NULL;
+    }
+
     wmm_base_block_t *b = g_base_cur;
     if (b == NULL || size > b->cap - b->used) {
         /* 追加新块:容量取 max(默认 4MB, 本次需求)——单个大请求不会被

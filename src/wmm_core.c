@@ -429,8 +429,7 @@ void *wmm_alloc(size_t size) {
             return NULL;
         wmm_tcache_t *t = stats_slot();
         if (t != NULL) {
-            t->t_alloc_bytes += ext->npages * WMM_PAGE;   /* 可用 = 页对齐 */
-            t->t_alloc_cnt++;
+            wmm_tcache_count_alloc(t, ext->npages * WMM_PAGE);   /* 可用 = 页对齐 */
             /* 大对象也参与采样:大块正是"吃内存"归因的主角,而它
                根本不经过 bin;关闭采样时只多一次可预测的标志测试 */
             if (g_opt.sample_n != 0)
@@ -454,8 +453,7 @@ void *wmm_alloc(size_t size) {
         if (p != NULL) {
             wmm_tcache_t *t = stats_slot();
             if (t != NULL) {
-                t->t_alloc_bytes += reg;
-                t->t_alloc_cnt++;
+                wmm_tcache_count_alloc(t, reg);
                 if (g_opt.sample_n != 0)
                     wmm_prof_sample(t, reg, WMM_ALLOC_FRAME());
             }
@@ -475,8 +473,7 @@ void *wmm_alloc(size_t size) {
             p = wmm_tcache_alloc(i);
         }
         if (p != NULL) {
-            g_tcache->t_alloc_bytes += wmm_bin_info[i].reg_size;
-            g_tcache->t_alloc_cnt++;
+            wmm_tcache_count_alloc(g_tcache, wmm_bin_info[i].reg_size);
             if (g_opt.sample_n != 0)
                 wmm_prof_sample(g_tcache, wmm_bin_info[i].reg_size,
                                 WMM_ALLOC_FRAME());
@@ -505,8 +502,7 @@ void *wmm_alloc(size_t size) {
     }
     pthread_mutex_unlock(&b->lock);
     if (p != NULL && g_tcache != NULL) {
-        g_tcache->t_alloc_bytes += wmm_bin_info[i].reg_size;
-        g_tcache->t_alloc_cnt++;
+        wmm_tcache_count_alloc(g_tcache, wmm_bin_info[i].reg_size);
         if (g_opt.sample_n != 0)
             wmm_prof_sample(g_tcache, wmm_bin_info[i].reg_size,
                             WMM_ALLOC_FRAME());
@@ -541,10 +537,8 @@ void wmm_free(void *p) {
         if (sl->guarded) {
             bool ok = wmm_guard_free(sl, p,
                                      (uintptr_t)__builtin_return_address(0));
-            if (ok && g_tcache != NULL) {
-                g_tcache->t_free_bytes += usize;
-                g_tcache->t_free_cnt++;
-            }
+            if (ok && g_tcache != NULL)
+                wmm_tcache_count_free(g_tcache, usize);
             return;
         }
 
@@ -553,8 +547,7 @@ void wmm_free(void *p) {
            (只释放、不分配)时直走慢路径——对象在慢路径逐个
            回链,计数口径不变 */
         if (g_tcache != NULL && g_tcache->enabled) {
-            g_tcache->t_free_bytes += usize;
-            g_tcache->t_free_cnt++;
+            wmm_tcache_count_free(g_tcache, usize);
             wmm_tcache_free(sl->szind, p);
             return;
         }
@@ -563,10 +556,8 @@ void wmm_free(void *p) {
         pthread_mutex_lock(&b->lock);
         bool retire = wmm_bin_dalloc(b, sl, p);
         pthread_mutex_unlock(&b->lock);
-        if (g_tcache != NULL) {
-            g_tcache->t_free_bytes += usize;
-            g_tcache->t_free_cnt++;
-        }
+        if (g_tcache != NULL)
+            wmm_tcache_count_free(g_tcache, usize);
 
         /* 退休在 bin 锁外执行:物理层只拿自己的锁,不与 bin 锁
            嵌套。批量刷出路径同理——刷出时先把退休 slab 收集进
@@ -584,10 +575,8 @@ void wmm_free(void *p) {
         size_t bytes = (size_t)((char *)e->addr + e->npages * WMM_PAGE
                                 - (char *)p);
         wmm_phys_free_extent(e);
-        if (g_tcache != NULL) {
-            g_tcache->t_free_bytes += bytes;
-            g_tcache->t_free_cnt++;
-        }
+        if (g_tcache != NULL)
+            wmm_tcache_count_free(g_tcache, bytes);
         return;
     }
 
@@ -615,6 +604,17 @@ void *wmm_calloc(size_t n, size_t size) {
        追踪"是否全新"的状态;小而精先要 correctness。 */
     memset(p, 0, bytes);
     return p;
+}
+
+void *wmm_reallocarray(void *p, size_t n, size_t size) {
+    /* 乘积溢出时绝不能回绕成小尺寸:那会把"要 4GB 数组"变成一次
+       小分配,调用方按原尺寸写入时直接越界。错误码与 glibc 一致,
+       旧块保持有效,调用方仍可自行释放 */
+    if (size != 0 && n > SIZE_MAX / size) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    return wmm_realloc(p, n * size);
 }
 
 void *wmm_realloc(void *p, size_t size) {
@@ -663,7 +663,7 @@ size_t wmm_usable_size(const void *p) {
 
 /* ==================== 对齐分配 ====================
  *
- * 三档(指南的"免费对齐"思想:能白拿的对齐绝不付过分配的代价):
+ * 三档(免费对齐:能白拿的对齐绝不付过分配的代价):
  *   档 1 alignment ≤ 8:白拿。类 0 的对象 8B 对齐、类 1 起全部
  *       16B 对齐,任何 ≤ 8 的 2 的幂天然满足。
  *       边界为什么是 8 不是 16:alignment=16、size≤8 时若直接
@@ -726,8 +726,7 @@ static void *alloc_aligned(size_t alignment, size_t size) {
                             - (char *)p);
     wmm_tcache_t *t = stats_slot();
     if (t != NULL) {
-        t->t_alloc_bytes += bytes;
-        t->t_alloc_cnt++;
+        wmm_tcache_count_alloc(t, bytes);
         if (g_opt.sample_n != 0)
             wmm_prof_sample(t, bytes, WMM_ALLOC_FRAME());
     }

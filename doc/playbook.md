@@ -38,6 +38,10 @@ monitor: ./build/monitor/monitor /tmp/libwmm-playbook-leak.shm --pid 12345
 (测试里用 `wmm_tcache_flush_all`,演示进程会在关键节点调 `gc`)。
 `frag = active - live`,单位是字节;监控同时打印它占 active 的百分比。
 
+CSV 的 `epoch` 是**快照序号**,不是发布计数:演示进程自己每秒取一次
+统计快照、后台发布也取一次,所以同一秒看到 +2 是正常的;只要序号
+持续推进,就说明后台发布没有卡住。`publish_age_ms` 才是数据新鲜度。
+
 ## 2. 内存持续上涨
 
 **复现**

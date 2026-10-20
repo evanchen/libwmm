@@ -28,6 +28,7 @@
 
 #include <pthread.h>
 #include <errno.h>
+#include <stdatomic.h>   /* 跨线程字段一律用 C11 原子访问,不靠"读旧值无妨" */
 
 /* ==================== 常量(目标平台 Linux x86-64,4K 页) ==================== */
 
@@ -383,7 +384,7 @@ void wmm_bg_child_reset(void);
 
 /* ==================== 统计与事件(wmm_stats.c) ====================
  *
- * 快照:合并各 bin 的 live/ndalloc(锁内读取,与 OBS1 恒等式同源)、
+ * 快照:合并各 bin 的 live/ndalloc(锁内读取,与 live 恒等式同源)、
  * 大对象与 active 页数(ext 锁)、各线程的局部计数(遍历 g_threads,
  * 允许瞬时偏差)。线程表超过 128 行时第 129+ 个线程合并进
  * threads[127](聚合桶,tid 记 0)——直方图有限,聚合一个桶也比
@@ -541,9 +542,13 @@ typedef struct {
  *
  * 结构本身链入全局 g_threads 链:统计快照要合并各线程的计数、
  * wmm_ctl("gc") 要遍历所有线程的缓存,都靠这张链找到人。
- * 链指针的改动必须持 g_threads_lock;计数与栈游标只由本线程写、
- * 不加原子——快照读到瞬时旧值无妨,换来快路径零同步开销。唯一
- * 例外是 gc_req:控制线程会写它,必须是原子。
+ * 链指针的改动必须持 g_threads_lock;栈游标只由本线程写,别的线程
+ * 只在全体静止时刻读取(白盒核对)。线程计数字段例外:快照会从
+ * 另一个线程读它们,所以声明为原子量——所有者仍是唯一写者,读端
+ * 读到瞬时旧值无妨,但 C11 层面不再有数据竞争。写者用 load+store
+ * 而不是 +=:单写者不需要读改写,relaxed load/store 在 x86-64 上
+ * 就是普通 mov,快路径没有锁前缀。gc_req 是另一个跨线程字段,
+ * 控制线程会写它,同样是原子。
  */
 typedef struct wmm_tcache_s wmm_tcache_t;
 struct wmm_tcache_s {
@@ -555,11 +560,11 @@ struct wmm_tcache_s {
                                    线程退出按创建时的长度 munmap;重算
                                    会把"容量常量将来可变"变成一处静默
                                    地雷 */
-    /* ---- 线程局部计数(唯一写者 = 本线程,非原子) ---- */
-    uint64_t      t_alloc_bytes;   /* 累计分配字节(按可用大小计) */
-    uint64_t      t_free_bytes; /* 累计释放字节 */
-    uint32_t      t_alloc_cnt;  /* 累计分配次数 */
-    uint32_t      t_free_cnt;   /* 累计释放次数 */
+    /* ---- 线程局部计数(唯一写者 = 本线程;读端用 relaxed 原子访问) ---- */
+    _Atomic uint64_t t_alloc_bytes; /* 累计分配字节(按可用大小计) */
+    _Atomic uint64_t t_free_bytes;  /* 累计释放字节 */
+    _Atomic uint64_t t_alloc_cnt;   /* 累计分配次数;64 位避免高分配率下回绕 */
+    _Atomic uint64_t t_free_cnt;    /* 累计释放次数;公开线程表同样按 64 位输出 */
 
     /* ---- GC 状态 ---- */
     _Atomic uint32_t gc_req;   /* 跨线程 GC 请求位:控制线程置 1,所有者
@@ -604,6 +609,29 @@ struct wmm_tcache_s {
                                   RSS */
 };
 
+/* 线程计数的唯一写入口。调用方必须是 t 的所有者。为什么不用
+ * atomic_fetch_add:所有者是唯一写者,不需要读改写语义;load+store
+ * 两个 relaxed 操作在 x86-64 上都是普通 mov,不会生成带 lock 前缀
+ * 的指令。读端(统计快照)同样用 relaxed load,读到旧值可以接受,
+ * 但访问本身是原子类型,C11 数据竞争与 TSan 报告都不会出现。 */
+static inline void wmm_tcache_count_alloc(wmm_tcache_t *t, size_t bytes) {
+    uint64_t v = atomic_load_explicit(&t->t_alloc_bytes,
+                                      memory_order_relaxed);
+    atomic_store_explicit(&t->t_alloc_bytes, v + bytes,
+                          memory_order_relaxed);
+    v = atomic_load_explicit(&t->t_alloc_cnt, memory_order_relaxed);
+    atomic_store_explicit(&t->t_alloc_cnt, v + 1, memory_order_relaxed);
+}
+
+static inline void wmm_tcache_count_free(wmm_tcache_t *t, size_t bytes) {
+    uint64_t v = atomic_load_explicit(&t->t_free_bytes,
+                                      memory_order_relaxed);
+    atomic_store_explicit(&t->t_free_bytes, v + bytes,
+                          memory_order_relaxed);
+    v = atomic_load_explicit(&t->t_free_cnt, memory_order_relaxed);
+    atomic_store_explicit(&t->t_free_cnt, v + 1, memory_order_relaxed);
+}
+
 extern _Thread_local wmm_tcache_t *g_tcache;  /* 惰性创建;NULL = 本线程尚未建 */
 extern wmm_tcache_t *g_threads;               /* 线程注册表链头 */
 extern pthread_mutex_t g_threads_lock;
@@ -636,7 +664,7 @@ void     wmm_tcache_flush_all(void);
 void     wmm_tcache_gc(szind_t i);
 /* 对当前线程缓存的一个 bin 跑 GC:按 retain 公式(用量+25% 或种子 2)
  * 刷出富余,并按低水位信号自适应 nfill。满栈触发、事件轮转与
- * wmm_ctl("gc") 的调用线程部分共用;白盒测试也直调(TC3) */
+ * wmm_ctl("gc") 的调用线程部分共用;白盒测试也直调 */
 void     wmm_tcache_gc_all(void);
 /* wmm_ctl("gc") 的落地:调用线程当场把全部 bin 收缩一遍;注册表里
  * 其他线程只置 gc_req,由它们在下一次 free 时取走执行——快路径
@@ -663,8 +691,8 @@ void     wmm_tcache_thread_destructor(void *val);
  *
  * 触发点覆盖 wmm_alloc 的全部成功返回路径(大对象、缓存命中、bin),
  * 而不是只挂 bin 慢路径:×N 估计器要求对全体分配均匀抽样,只抽
- * 慢路径会系统性低估缓存命中的热调用点,也完全漏掉 OBS2 使用的
- * 1MB 大对象。关闭时每个分配点只多一次可预测的全局标志测试。
+ * 慢路径会系统性低估缓存命中的热调用点,也完全漏掉 1MB 量级的大
+ * 对象。关闭时每个分配点只多一次可预测的全局标志测试。
  *
  * 锁序:g_prof_lock 是叶子锁。后台合并先持 g_threads_lock 遍历注册
  * 表、再取 g_prof_lock,与 fork prepare 的 bins → ext → threads →
@@ -843,24 +871,60 @@ typedef struct {
                                归还。为什么用简单阈值而不是 jemalloc 的
                                decay 平滑算法:行为可预期(后台每秒查一
                                次)、代码少两个数量级 */
-    int      madvise_mode;   /* 内核回收方式,运行期可切:
-                               MADV_DONTNEED 立即还物理页,RSS 收得干脆,
-                               代价是再访问要缺页;
-                               MADV_FREE 懒还,内核内存紧张才收,延迟更稳。
-                               RSS 敏感选前者,延迟敏感选后者 */
-    unsigned sample_n;       /* 调用点采样间隔:每 N 次成功分配采一次栈;
-                               0 = 关(默认关,采样有开销)。读数不加
-                               原子:切换瞬间多采/漏采一个样本无碍 */
-    bool     guard;          /* 越界/UAF/双释放检测总开关(默认关)。
+    _Atomic int madvise_mode; /* 内核回收方式,运行期可切:
+                                 MADV_DONTNEED 立即还物理页,RSS 收得干脆,
+                                 代价是再访问要缺页;
+                                 MADV_FREE 懒还,内核内存紧张才收,延迟更稳。
+                                 RSS 敏感选前者,延迟敏感选后者。
+                                 控制面写、后台回收线程读,原子类型让
+                                 切换不构成 C11 数据竞争 */
+    _Atomic unsigned sample_n; /* 调用点采样间隔:每 N 次成功分配采一次栈;
+                                  0 = 关(默认关,采样有开销)。控制面
+                                  (含 guard 告警触发的自动开启)写、各
+                                  分配线程读;切换瞬间多采/漏采一个样本
+                                  无碍,但访问本身必须是原子的。热路径
+                                  的原子读在 x86-64 仍是一条普通 mov */
+    _Atomic bool guard;      /* 越界/UAF/双释放检测总开关(默认关)。
                                检测要 poison/redzone/隔离,内存放大且
-                               慢路径变慢——只排障时开 */
-    bool     verbose;        /* wmm_dprintf 调试输出开关 */
+                               慢路径变慢——只排障时开。控制线程切换、
+                               其他线程的分配路径读取,故用原子类型 */
+    _Atomic bool verbose;    /* wmm_dprintf 调试输出开关;任意线程可查询 */
     bool     abort_oom;      /* OOM 行为:false 返回 NULL(默认,跟 glibc
                                一致);true 直接 abort——快速失败比带病
                                延续好排查 */
 } wmm_opt_t;
 
 extern wmm_opt_t g_opt;
+
+/* ==================== 故障注入(测试专用) ====================
+ *
+ * 分配器最难的代码不是成功路径,而是失败回滚;真实 OOM 无法按需
+ * 制造,测试必须能在确定的系统调用前让它返回失败。下列设施默认
+ * 关闭,检查只是一次可预测的原子读,生产路径不受影响;它们是内部
+ * 接口,不属于公共 API,只有白盒测试会写。
+ *
+ * 语义:g_fault_site 限定注入点(WMM_FAULT_ANY 匹配全部,0 = 关闭);
+ * g_fault_after 为 N(1..)时,该点第 N 次检查失败并自动归零;
+ * WMM_FAULT_ALWAYS 表示持续失败,直到测试显式复位。计数按检查次数
+ * 递减,所以"同一次分配里的重试"也会消耗计数——要让一次公开调用
+ * 稳定失败,测试应使用 WMM_FAULT_ALWAYS。
+ */
+enum {
+    WMM_FAULT_NONE    = 0,   /* 注入关闭 */
+    WMM_FAULT_MAP     = 1,   /* 窗口 bump 的 mmap */
+    WMM_FAULT_MADVISE = 2,   /* purge 的 madvise */
+    WMM_FAULT_TCACHE  = 3,   /* 线程缓存整块 mmap */
+    WMM_FAULT_BASE    = 4,   /* base 区元数据块 mmap */
+};
+#define WMM_FAULT_ANY    0x7FFFFFFFu   /* site 过滤器:匹配全部注入点 */
+#define WMM_FAULT_ALWAYS 0xFFFFFFFFu   /* after 哨兵:持续失败 */
+
+extern _Atomic unsigned g_fault_site;    /* 当前注入点;0 = 关闭 */
+extern _Atomic unsigned g_fault_after;   /* 距失败还剩的检查次数 */
+
+/* 在注入点上调用:返回真表示"本次系统调用应失败"。site 不匹配或
+ * 计数已尽时返回假。多线程安全,计数用 CAS 消费。 */
+bool wmm_fault_check(unsigned site);
 
 /* ==================== 元数据 bump 区(对应 jemalloc base.c) ====================
  *

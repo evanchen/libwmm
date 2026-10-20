@@ -1,9 +1,9 @@
 /* wmm_wrap.c —— malloc 家族的链接期接管(-Wl,--wrap)
  *
- * 应用照常写 malloc/free/calloc/realloc/posix_memalign/aligned_alloc,
- * 链接时加 -Wl,--wrap=<名字>:GNU ld 把本可执行文件里对这些符号的
- * 未定义引用改写成 __wrap_<名字>,于是全部落到 libwmm。这对
- * 已经写好的程序是零源码改动——不需要宏替换,也不需要重新声明。
+ * 应用照常写 malloc/free/calloc/realloc/reallocarray/posix_memalign/
+ * aligned_alloc,链接时加 -Wl,--wrap=<名字>:GNU ld 把本可执行文件里
+ * 对这些符号的未定义引用改写成 __wrap_<名字>,于是全部落到 libwmm。
+ * 这对已经写好的程序是零源码改动——不需要宏替换,也不需要重新声明。
  *
  * 函数体只做转发:size==0、free(NULL)、溢出检查、对齐与错误码等
  * 语义全由 wmm_* 负责,这里不重复判断,也不吞错误。包装层越薄,
@@ -46,6 +46,11 @@ void *__wrap_calloc(size_t n, size_t size)
 void *__wrap_realloc(void *p, size_t size)
 {
     return wmm_realloc(p, size);
+}
+
+void *__wrap_reallocarray(void *p, size_t n, size_t size)
+{
+    return wmm_reallocarray(p, n, size);
 }
 
 int __wrap_posix_memalign(void **memptr, size_t alignment, size_t size)

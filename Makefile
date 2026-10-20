@@ -6,7 +6,7 @@
 #   -fno-builtin-malloc       --wrap 接管时防止编译器把 malloc 调用
 #                              内联优化掉、绕过 wrap
 # 产物:libwmm.a(debug/release 各一套)+ release 的 libwmm.so。
-# 用法:make debug | make release | make test | make bench |
+# 用法:make debug | make release | make test | make tsan | make bench |
 #       make monitor | make playbook | make clean
 
 # CC 用直接赋值而不是条件赋值:make 对 CC 内建有 cc 默认值,而 ?= 只在
@@ -28,6 +28,9 @@ CFLAGS_COMMON := -std=c11 -D_DEFAULT_SOURCE -fPIC -fno-omit-frame-pointer \
                  -fno-builtin-malloc -pthread -Wall -Wextra -Iinclude -Isrc
 CFLAGS_DEBUG   := $(CFLAGS_COMMON) -O0 -g -fsanitize=address,undefined
 CFLAGS_RELEASE := $(CFLAGS_COMMON) -O2 -g
+# TSan 不能与 ASan 混用,单独一套目标目录。-O0 同时保证自定义
+# seqlock 的收发函数不被内联,tsan.supp 才能按函数名稳定匹配。
+CFLAGS_TSAN    := $(CFLAGS_COMMON) -O0 -g -fsanitize=thread
 
 SRC := $(wildcard src/*.c)
 
@@ -38,8 +41,9 @@ HDRS := include/wmm.h src/wmm_internal.h src/wmm_sc.h src/wmm_shm.h Makefile
 
 BUILD_DEBUG   := build/debug
 BUILD_RELEASE := build/release
+BUILD_TSAN    := build/tsan
 
-.PHONY: all debug release test bench monitor playbook clean
+.PHONY: all debug release test tsan bench monitor playbook clean
 
 all: release
 
@@ -73,16 +77,16 @@ $(BUILD_RELEASE)/libwmm.so: $(patsubst src/%.c,$(BUILD_RELEASE)/%.o,$(SRC))
 TEST_SRC := $(filter-out tests/test_wrap.c,$(wildcard tests/test_*.c))
 
 WRAP_BIN   := build/test/wrap
-WRAP_FUNCS := malloc free calloc realloc posix_memalign aligned_alloc
+WRAP_FUNCS := malloc free calloc realloc reallocarray posix_memalign aligned_alloc
 # 不能用 addprefix:它的参数按逗号分隔,前缀里的 -Wl,--wrap= 会被
 # 拆成两段。foreach 对每个名字单独展开,逗号原样留在命令行里。
 WRAP_LDFLAGS := $(foreach f,$(WRAP_FUNCS),-Wl,--wrap=$(f))
 # --wrap 只改写符号引用;编译器若把这些函数识别成内建并直接化简,
 # 链接器就看不到引用。malloc 已在 CFLAGS_COMMON 里关掉,这里补齐
-# 其余五个。
+# 其余六个入口。
 WRAP_CFLAGS := -fno-builtin-calloc -fno-builtin-realloc \
-               -fno-builtin-free -fno-builtin-posix_memalign \
-               -fno-builtin-aligned_alloc
+               -fno-builtin-reallocarray -fno-builtin-free \
+               -fno-builtin-posix_memalign -fno-builtin-aligned_alloc
 
 $(WRAP_BIN): tests/test_wrap.c $(BUILD_DEBUG)/libwmm.a $(HDRS)
 	@mkdir -p build/test
@@ -95,9 +99,9 @@ test: debug $(WRAP_BIN)
 	    $(BUILD_DEBUG)/libwmm.a -lpthread
 	./build/test/run
 	@echo "---- wrap audit ----"
-	@if nm -u $(WRAP_BIN) | grep -Eq 'U (malloc|free|calloc|realloc|posix_memalign|aligned_alloc)(@|$$)'; then \
+	@if nm -u $(WRAP_BIN) | grep -Eq 'U (malloc|free|calloc|realloc|reallocarray|posix_memalign|aligned_alloc)(@|$$)'; then \
 	    echo "wrap audit: 仍有未接管的 libc 分配符号:"; \
-	    nm -u $(WRAP_BIN) | grep -E 'U (malloc|free|calloc|realloc|posix_memalign|aligned_alloc)(@|$$)'; \
+	    nm -u $(WRAP_BIN) | grep -E 'U (malloc|free|calloc|realloc|reallocarray|posix_memalign|aligned_alloc)(@|$$)'; \
 	    exit 1; \
 	fi
 	@for f in $(WRAP_FUNCS); do \
@@ -107,6 +111,30 @@ test: debug $(WRAP_BIN)
 	done
 	@echo "wrap audit: all allocator references go through __wrap_*"
 	./$(WRAP_BIN)
+
+# tsan:数据竞争检查。只跑主测试二进制(带 --wrap 的 wrap 程序是
+# 单线程冒烟,对竞争检测没有增量;而 TSan 与 --wrap 一起用时,接管
+# 范围之外的解释器行为更容易制造噪声)。
+# tests/tsan.supp 只抑制两处自实现 seqlock 的 payload 假阳性,见文件
+# 内注释;其余任何 race 报告都当失败。
+TSAN_BIN := build/test/run_tsan
+
+$(BUILD_TSAN)/%.o: src/%.c $(HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS_TSAN) -c $< -o $@
+
+$(BUILD_TSAN)/libwmm.a: $(patsubst src/%.c,$(BUILD_TSAN)/%.o,$(SRC))
+	$(AR) rcs $@ $^
+
+$(TSAN_BIN): tests/main.c $(TEST_SRC) $(BUILD_TSAN)/libwmm.a $(HDRS)
+	@mkdir -p build/test
+	$(CC) $(CFLAGS_TSAN) -o $@ tests/main.c $(TEST_SRC) \
+	    $(BUILD_TSAN)/libwmm.a -lpthread
+
+tsan: $(TSAN_BIN)
+	@echo "---- tsan ----"
+	TSAN_OPTIONS="suppressions=$(abspath tests/tsan.supp) halt_on_error=1" \
+	    ./$(TSAN_BIN)
 
 # 监控进程是纯读端:只包含两个协议头,不链接 libwmm,也不共用
 # 库的编译约束。这样它可以单独部署、单独升级,目标进程甚至不需要

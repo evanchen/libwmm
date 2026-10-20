@@ -120,6 +120,16 @@ static void *window_map(size_t npages) {
         return NULL;
     }
 
+    /* 测试注入:模拟系统调用失败,日志/事件/abort 策略与真实 mmap
+       失败完全一致,否则测试验证的就不是生产失败路径 */
+    if (wmm_fault_check(WMM_FAULT_MAP)) {
+        wmm_dprintf("OOM: injected mmap failure, %zu pages\n", npages);
+        wmm_event_log(0xDB, NULL);
+        if (g_opt.abort_oom)
+            abort();
+        return NULL;
+    }
+
     void *p = mmap(g_heap_cur, bytes, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     if (p == MAP_FAILED) {
@@ -388,6 +398,11 @@ static size_t purge_dirty_locked(void) {
     for (wmm_extent_t *e = g_ar_head; e != NULL; e = e->ar_next) {
         if (e->state != WMM_EXT_FREE_DIRTY)
             continue;
+        /* 测试注入:走与真实 madvise 失败相同的分支——保持 DIRTY,
+           下一轮再试,绝不改状态或计数 */
+        if (wmm_fault_check(WMM_FAULT_MADVISE))
+            continue;
+
         /* DONTNEED:内容立刻丢弃、RSS 立即回落;FREE:内容保留,
            内核缺内存时才收。两种模式都归 RETAINED,语义是"内核
            可随时回收",不承诺页面内容还在。 */

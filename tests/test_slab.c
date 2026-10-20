@@ -1,18 +1,19 @@
-/* test_slab.c —— M3 用例:slab 空闲链、页表登记、bin 状态机(白盒)
+/* test_slab.c —— slab 空闲链、页表登记、bin 状态机用例(白盒)
  *
- * 覆盖(tasks.md M3 自测清单):
- *   SLAB1 建链后逐对象弹出:地址 = addr + r*reg_size,按编号升序、
+ * 覆盖:
+ *   建链后逐对象弹出:地址 = addr + r*reg_size,按编号升序、
  *         互不重叠、恰好覆盖全 slab;
- *   PTE1 slab 每一页的页表项都指向该 slab;从未映射的页 raw==0
- *         (这就是将来 free 反查"未分配地址"的挂点);
- *   SLAB2 随机 alloc/free 序列中周期性沿链遍历:长度恰等于 nfree、
+ *   页表:slab 每一页的页表项都指向该 slab;从未映射的页 raw==0
+ *         (这就是 free 反查"未分配地址"的挂点);
+ *   随机 alloc/free 序列中周期性沿链遍历:长度恰等于 nfree、
  *         无环;排空后链恰好覆盖全部对象;
- *   AR1   bin 状态机:满→full 链、由满转非满(地址序)、取最低地址
+ *   bin 状态机:满→full 链、由满转非满(地址序)、取最低地址
  *         转正、全空退休的三条路径(热位/nonfull/nregs==1 的 full)。
  *
- * 页从哪来:M6 物理层还没写,测试自备 map_pages——在预留窗口内
- * MAP_FIXED 改权限并推进 g_heap_cur,与将来物理层取页的动作一致;
- * M6 落地后测试改调真实接口,断言不变。
+ * 页与 slab 头由测试自备:本组只验证 slab/bin 状态机。若走物理层,
+ * extent 的复用、合并与地址序会让 slab 地址不可预知,断言就钉不住。
+ * map_pages 在预留窗口内 MAP_FIXED 并推进 g_heap_cur,与物理层取页
+ * 的动作一致;slab 头由 new_slab 直接向 base 区申请。
  */
 #include "wmm_internal.h"
 
@@ -43,7 +44,7 @@ static uint32_t rng(void) {
 
 /* 在窗口内把 g_heap_cur 起始的 bytes 改成可写页,推进 bump 指针。
    MAP_FIXED 会覆盖目标处的既有映射——目标区是 boot 预留的 PROT_NONE
-   空白,覆盖即安全;这正是将来物理层取页的同款动作。 */
+   空白,覆盖即安全;与物理层取页的动作一致。 */
 static void *map_pages(size_t bytes) {
     bytes = (bytes + WMM_PAGE - 1) & ~(WMM_PAGE - 1);
     void *p = mmap(g_heap_cur, bytes, PROT_READ | PROT_WRITE,
@@ -77,7 +78,7 @@ static wmm_slab_t *new_slab(void) {
     return (wmm_slab_t *)wmm_base_alloc(sizeof(wmm_slab_t));
 }
 
-/* ---- SLAB1 + PTE1 + SLAB2:单个尺寸类的全链路 ---- */
+/* ---- 单个尺寸类的全链路 ---- */
 static void check_class(szind_t i) {
     const wmm_bin_info_t *bi = &wmm_bin_info[i];
     void       *addr = map_pages(bi->slab_size);
@@ -91,7 +92,7 @@ static void check_class(szind_t i) {
     CHECK(sl->nfree == bi->nregs);
     CHECK(sl->free_head == 0);
 
-    /* PTE1:每一页都指向本 slab */
+    /* 每一页都指向本 slab */
     size_t npages = bi->slab_size >> WMM_LG_PAGE;
     for (size_t pg = 0; pg < npages; pg++) {
         wmm_slab_t *out = NULL;
@@ -99,7 +100,7 @@ static void check_class(szind_t i) {
         CHECK(out == sl);
     }
 
-    /* SLAB1:建链序即弹出序,第 r 次弹出恰是 addr + r*reg_size */
+    /* 建链序即弹出序,第 r 次弹出恰是 addr + r*reg_size */
     void *held[512];
     CHECK(bi->nregs <= 512);
     for (uint32_t r = 0; r < bi->nregs; r++) {
@@ -116,7 +117,7 @@ static void check_class(szind_t i) {
     CHECK(sl->nfree == bi->nregs);
     CHECK(walk_freelist(sl) == bi->nregs);
 
-    /* SLAB2:随机 alloc/free,周期校验链长 == nfree */
+    /* 随机 alloc/free,周期校验链长 == nfree */
     uint32_t nheld = 0;
     for (int op = 0; op < 3000; op++) {
         if (sl->nfree > 0 && (rng() & 1) && nheld < bi->nregs) {
@@ -135,7 +136,7 @@ static void check_class(szind_t i) {
     CHECK(walk_freelist(sl) == bi->nregs);   /* 排空后链覆盖全部对象 */
 }
 
-/* ---- AR1:bin 状态机全场景(16B 类,nregs=256) ---- */
+/* ---- bin 状态机全场景(16B 类,nregs=256) ---- */
 static void check_bin_statemachine(void) {
     wmm_bin_t *b = &g_bins[1];
     const wmm_bin_info_t *bi = &wmm_bin_info[1];
