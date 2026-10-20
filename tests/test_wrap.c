@@ -184,11 +184,24 @@ static void check_realloc(void) {
         g_requested += 32;
 
         errno = 0;
+
+        /* 溢出失败后旧块必须仍可读、可再次交给 reallocarray——这正是
+           glibc 的契约,也是本段要验证的东西。GCC 12 的
+           -Wuse-after-free 只看"指针是否又出现在 reallocarray 之后",
+           不区分返回 NULL 的失败路径,因此在这里显式关掉;判定本身
+           仍由下面的断言完成,没有放宽任何检查。 */
+#if defined(__GNUC__) && __GNUC__ >= 12
+# pragma GCC diagnostic push
+# pragma GCC diagnostic ignored "-Wuse-after-free"
+#endif
         CHECK(reallocarray(ra, huge, 3) == NULL);
         CHECK(errno == ENOMEM);
         CHECK(in_heap(ra));   /* 失败后旧块必须仍可用 */
 
         ra = reallocarray(ra, 4, 100);
+#if defined(__GNUC__) && __GNUC__ >= 12
+# pragma GCC diagnostic pop
+#endif
         CHECK(ra != NULL);
         if (ra != NULL) {
             CHECK(in_heap(ra));
