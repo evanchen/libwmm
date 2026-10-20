@@ -1,42 +1,20 @@
-/* wmm_ctl.c —— 运行期控制的命令分发
- *
- * 采样、guard、purge、后台线程……所有可调参数不做成一个个导出
- * 函数,而是收敛成字符串命令经 wmm_ctl 分发:新能力只需在下面
- * 表里加一行,公共头文件的 ABI 不动——这是签名冻结后唯一的
- * 扩展通道。
- *
- * 表内 17 条命令已全部接线:stats.snapshot、stats.per_class、
- * sampling.enable/disable、prof.top、leak.check/dump、
- * guard.enable/disable、purge、gc、bg.enable/disable、
- * config.lg_page/madvise_mode/verbose、shm.create。分发对 17 项做
- * 线性扫描:控制命令不在热路径,不值得上哈希。约定:普通命令返回
- * 0 成功;查询类命令返回查询值(目前只有 config.lg_page);未知
- * 命令 -1/EINVAL。
- *
- * 变参约定:带参数的命令由处理函数按自己的 ABI 取 va_arg;整型
- * 实参按 C 默认提升取 int(如 config.madvise_mode 传 MADV_* 常量),
- * 指针实参直接取指针(如 stats.* 传 wmm_stats_t *,shm.create 传
- * const char * 路径)。
- *
- * 本文件只做分发,不做业务;禁止任何内部分配(与库其余部分同约)。
- */
+/* wmm_ctl.c —— 字符串命令表形式的运行时控制接口 */
+
 #include "wmm_internal.h"
 
 #include <stdarg.h>
 #include <string.h>
 #include <sys/mman.h>
 
-/* 统一处理函数原型:cmd = 完整命令串(含点号分级),ap = 变参。 */
 typedef int (*wmm_ctl_fn_t)(const char *cmd, va_list ap);
 
+/* 命令项:名称、处理函数与帮助文本 */
 typedef struct {
-    const char  *name;   /* 完整命令名(精确匹配) */
-    wmm_ctl_fn_t fn;     /* 处理函数;未接线时统一返回 -1/EINVAL */
-    const char  *help;   /* 一句话说明(命令即文档) */
+    const char  *name;
+    wmm_ctl_fn_t fn;
+    const char  *help;
 } wmm_ctl_cmd_t;
 
-/* 取完整统计快照:变参为 wmm_stats_t *。委托 wmm_stats_snapshot,
- * NULL 检查与 errno 由它统一给。 */
 static int ctl_stats_snapshot(const char *cmd, va_list ap)
 {
     (void)cmd;
@@ -44,9 +22,6 @@ static int ctl_stats_snapshot(const char *cmd, va_list ap)
     return wmm_stats_snapshot(st);
 }
 
-/* 只取按尺寸类的直方图(轻量):变参为 wmm_stats_t *,只填 cls[],
- * epoch 与线程表不动——监控端高频轮询直方图时不必付整快照的代价。
- * 每类读数与快照同源(锁内读),口径一致。 */
 static int ctl_stats_per_class(const char *cmd, va_list ap)
 {
     (void)cmd;
@@ -63,8 +38,7 @@ static int ctl_stats_per_class(const char *cmd, va_list ap)
         st->cls[i].size    = wmm_bin_info[i].reg_size;
         pthread_mutex_unlock(&b->lock);
     }
-    /* guard 对象按同一尺寸类并入:调用方看到的是"这一类用了多少",
-       布局差异不该让统计断档 */
+
     pthread_mutex_lock(&g_guard_lock);
     for (szind_t i = 0; i < WMM_NBINS; i++) {
         st->cls[i].live    += g_guard_bins[i].live;
@@ -79,7 +53,6 @@ static int ctl_stats_per_class(const char *cmd, va_list ap)
     return 0;
 }
 
-/* 同步回收一次:不看阈值,立即把全部 FREE_DIRTY 交还内核。 */
 static int ctl_purge(const char *cmd, va_list ap)
 {
     (void)cmd;
@@ -88,9 +61,6 @@ static int ctl_purge(const char *cmd, va_list ap)
     return 0;
 }
 
-/* 全部线程缓存收缩:调用线程当场做完;其他线程只能置请求位,由
- * 它们在各自的下一次 free 里收缩——快路径无锁,替别人动栈不安全。
- * 所以返回 0 只表示"请求已发出",不等待其他线程完成。 */
 static int ctl_gc(const char *cmd, va_list ap)
 {
     (void)cmd;
@@ -103,19 +73,16 @@ static int ctl_bg_enable(const char *cmd, va_list ap)
 {
     (void)cmd;
     (void)ap;
-    return wmm_bg_start();     /* 幂等;失败已置 errno */
+    return wmm_bg_start();
 }
 
 static int ctl_bg_disable(const char *cmd, va_list ap)
 {
     (void)cmd;
     (void)ap;
-    return wmm_bg_stop();      /* 幂等;返回时线程已 join */
+    return wmm_bg_stop();
 }
 
-/* 切换 madvise 方式:变参为 int(MADV_DONTNEED / MADV_FREE)。
- * 只影响之后的 purge;已 RETAINED 的页不回改。并发写一个 int 在
- * x86-64 上原子;读到旧值的 purge 只是用上一轮的 advice,无害。 */
 static int ctl_madvise_mode(const char *cmd, va_list ap)
 {
     (void)cmd;
@@ -128,8 +95,6 @@ static int ctl_madvise_mode(const char *cmd, va_list ap)
     return 0;
 }
 
-/* 查询页大小:返回值是答案 log2(页字节数),不走"0 成功"约定。
- * 页大小是编译期常量,无锁、无副作用。 */
 static int ctl_config_lg_page(const char *cmd, va_list ap)
 {
     (void)cmd;
@@ -137,9 +102,6 @@ static int ctl_config_lg_page(const char *cmd, va_list ap)
     return (int)WMM_LG_PAGE;
 }
 
-/* 调试输出开关:变参为 int,非 0 打开。只影响尽力而为的诊断日志
- * (boot 摘要、后台 purge 统计);fatal/OOM/事件记录不受开关影响——
- * 关日志不该把故障线索一起关掉。 */
 static int ctl_config_verbose(const char *cmd, va_list ap)
 {
     (void)cmd;
@@ -148,11 +110,6 @@ static int ctl_config_verbose(const char *cmd, va_list ap)
     return 0;
 }
 
-/* 调用点采样开关:无变参。不开放任意的采样间隔——间隔是估计精度
- * 的旋钮,不是业务配置;固定 1000 让不同进程的 TOP 表口径一致,
- * 也避免一个荒谬的小间隔把分配路径拖垮。无参还保证 guard 告警的
- * 自动开启可以直接 wmm_ctl("sampling.enable") 调用,不会从变参表里
- * 读到不存在的实参。 */
 static int ctl_sampling_enable(const char *cmd, va_list ap)
 {
     (void)cmd;
@@ -169,9 +126,6 @@ static int ctl_sampling_disable(const char *cmd, va_list ap)
     return 0;
 }
 
-/* 取调用点 TOP 表:变参为 int k 与 wmm_prof_entry_t *out(容量 ≥ k)。
- * 返回写入条数(0..k);k 越界或 out 为空 -1/EINVAL。wmm_prof_top
- * 内部先合并各线程缓冲,因此不依赖后台线程是否在运行。 */
 static int ctl_prof_top(const char *cmd, va_list ap)
 {
     (void)cmd;
@@ -184,9 +138,6 @@ static int ctl_prof_top(const char *cmd, va_list ap)
     return (int)wmm_prof_top(out, (unsigned)k);
 }
 
-/* 泄漏 B 档:变参为 int k 与 wmm_prof_entry_t *out(容量 ≥ k)。
- * 返回写入条数;首次调用建立基线并返回 0。k/out 校验与 prof.top
- * 同一口径。 */
 static int ctl_leak_check(const char *cmd, va_list ap)
 {
     (void)cmd;
@@ -199,11 +150,6 @@ static int ctl_leak_check(const char *cmd, va_list ap)
     return wmm_leak_check(k, out);
 }
 
-/* 泄漏 A 档:无变参。全量遍历 guard 池里存活对象,按分配调用点
- * 聚合后直接打到 stderr。为什么走日志而不是回填调用方数组:命令
- * 语义是"dump",调用方要的是人可读的现场,不是又一次结构化查询
- * (结构化增量对比是 leak.check 的职责)。没有 guard 对象时打印
- * 0 条,不是错误。 */
 static int ctl_leak_dump(const char *cmd, va_list ap)
 {
     (void)cmd;
@@ -218,8 +164,6 @@ static int ctl_leak_dump(const char *cmd, va_list ap)
     return 0;
 }
 
-/* guard 开关:打开后新分配走单对象 slab + redzone + 隔离;关闭时
- * 排空隔离区与回收池,已在应用手里的对象保持原布局直到各自释放 */
 static int ctl_guard_enable(const char *cmd, va_list ap)
 {
     (void)cmd;
@@ -236,9 +180,6 @@ static int ctl_guard_disable(const char *cmd, va_list ap)
     return 0;
 }
 
-/* 创建共享监控区:变参为 const char * 文件路径。命令名带参数而
- * 不是分成 shm.create/shm.path 两条,是因为路径就是这条命令的
- * 全部参数,多一条命令只多一个状态。失败原样透传 errno。 */
 static int ctl_shm_create(const char *cmd, va_list ap)
 {
     (void)cmd;
@@ -246,6 +187,7 @@ static int ctl_shm_create(const char *cmd, va_list ap)
     return wmm_shm_create(path);
 }
 
+/* 命令表;wmm_ctl 按名称线性查找,新增命令在此登记 */
 static const wmm_ctl_cmd_t g_ctl_cmds[] = {
     { "stats.snapshot",      ctl_stats_snapshot, "取统计快照(同步合并各线程计数)" },
     { "stats.per_class",     ctl_stats_per_class, "取按尺寸类的直方图" },
@@ -266,6 +208,7 @@ static const wmm_ctl_cmd_t g_ctl_cmds[] = {
     { "shm.create",          ctl_shm_create,    "创建共享监控区(参数:文件路径)" },
 };
 
+/* 查找并执行命令;空名称或未知命令返回 EINVAL */
 int wmm_ctl(const char *cmd, ...)
 {
     if (cmd == NULL) {
@@ -282,6 +225,6 @@ int wmm_ctl(const char *cmd, ...)
             return rc;
         }
     }
-    errno = EINVAL;    /* 未知命令 */
+    errno = EINVAL;
     return -1;
 }
