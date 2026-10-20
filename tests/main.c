@@ -16,6 +16,7 @@ int test_oracle(void); /* 由 tests/test_oracle.c 提供 */
 int test_stress(void); /* 由 tests/test_stress.c 提供 */
 int test_tcache(void); /* 由 tests/test_tcache.c 提供 */
 int test_stats(void);  /* 由 tests/test_stats.c 提供 */
+int test_prof(void);   /* 由 tests/test_prof.c 提供 */
 int test_shm(void);    /* 由 tests/test_shm.c 提供 */
 
 typedef int (*wmm_test_fn)(void);
@@ -32,6 +33,10 @@ static const struct {
     { "stress", test_stress },
     { "tcache", test_tcache },
     { "stats",  test_stats },
+    /* prof 必须排在 shm 之前:shm 用例要检查 TOP 表随发布代一起
+       镜像,而 wmm_shm_create 每进程只能调用一次,文件所有权归
+       shm 组自己 */
+    { "prof",   test_prof },
     { "shm",    test_shm },
 };
 

@@ -46,6 +46,15 @@ static wmm_event_t g_ring_scratch[WMM_SHM_EVENT_RING];
 _Static_assert(WMM_EVENT_RING == WMM_SHM_EVENT_RING,
                "事件环镜像按整环 memcpy,两侧容量必须相等");
 
+/* TOP 表按整表 memcpy 镜像:内部取数上限与共享区容量必须一致,
+   否则多出的项被静默截断或写越界 */
+_Static_assert(WMM_PROF_TOP_MAX == WMM_SHM_PROF_N,
+               "TOP 表容量与共享区不一致");
+
+/* TOP 表的发布中转区:取 TOP 要合并各线程缓冲并持聚合锁,必须在
+   seqlock 写段之外完成;写段里只做 memcpy。8KB 静态内存换写段最短 */
+static wmm_prof_entry_t g_prof_scratch[WMM_SHM_PROF_N];
+
 /* 发布一代数据到已映射的共享区。调用者须保证自己是唯一写者。 */
 static void shm_publish_to(wmm_shm_t *h) {
     /* 1) 备数据:全在 seqlock 之外完成 */
@@ -54,6 +63,11 @@ static void shm_publish_to(wmm_shm_t *h) {
 
     uint64_t ev_total = 0;
     wmm_event_copy(g_ring_scratch, &ev_total);   /* 持事件锁整环拷贝 */
+
+    /* 调用点 TOP 表:内部先合并各线程缓冲(持锁),同样在写段之外。
+       返回条数不足 256 时,其余项已被取数函数清零——否则会发布
+       上一代的残项,读端把已经跌出 TOP 的调用点当成当前数据 */
+    (void)wmm_prof_top(g_prof_scratch, WMM_SHM_PROF_N);
 
     uint64_t ts = wmm_mono_ns();
 
@@ -70,6 +84,7 @@ static void shm_publish_to(wmm_shm_t *h) {
     memcpy(&h->stats, &st, sizeof st);
     h->events_total = ev_total;
     h->publish_ts   = ts;
+    memcpy(h->prof, g_prof_scratch, sizeof g_prof_scratch);
     memcpy(h->events, g_ring_scratch, sizeof g_ring_scratch);
 
     atomic_thread_fence(memory_order_release);

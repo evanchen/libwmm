@@ -22,10 +22,11 @@
  *     wmm_realloc(p, 0) 等价 wmm_free(p) 并返回 NULL;
  *   - wmm_usable_size(p) 恒 ≥ 当初请求的大小。
  *
- * 布局冻结:wmm_stats_t / wmm_event_t 的字段顺序与类型同时是共享
- * 内存监控协议的线上格式——监控进程直接 mmap 同一文件按偏移读取,
- * 重排字段就会读错。文件尾的 _Static_assert 把两个结构的大小在
- * 编译期锁死:改布局的人会立刻编译失败,而不是上线后监控读花。
+ * 布局冻结:wmm_stats_t / wmm_event_t / wmm_prof_entry_t 的字段顺序
+ * 与类型同时是共享内存监控协议的线上格式——监控进程直接 mmap 同一
+ * 文件按偏移读取,重排字段就会读错。文件尾的 _Static_assert 把结构
+ * 的大小在编译期锁死:改布局的人会立刻编译失败,而不是上线后监控
+ * 读花。
  */
 #ifndef WMM_H_INCLUDED
 #define WMM_H_INCLUDED
@@ -102,6 +103,22 @@ typedef struct {
     uintptr_t pc1;                /* 调用点第 2 帧 return address */
 } wmm_event_t;
 
+/* wmm_prof_entry_t —— 调用点采样 TOP 表的一项。
+ *
+ * 同时是共享监控区 0x1800 处 TOP N 表的线上格式(32 字节/项),监控
+ * 进程按同样偏移解析。pc 是采样到的用户调用点——对 wmm_alloc 的
+ * 调用指令之后的返回地址,监控端用 addr2line 对到源码行;bytes 与
+ * count 是按采样间隔放大的估计值:采到一次代表约 N 次同调用点的
+ * 分配,不是精确计数(与 jemalloc prof 同一统计口径)。reserved 恒
+ * 为 0,留给协议升级。
+ */
+typedef struct {
+    uintptr_t pc;        /* 用户调用点(return address) */
+    uint64_t  bytes;     /* 估算累计分配字节(实际可用大小 × 采样权重) */
+    uint64_t  count;     /* 估算分配次数 */
+    uint64_t  reserved;  /* 恒 0;协议升级预留 */
+} wmm_prof_entry_t;
+
 /* ==================== 分配/释放(与 malloc 家族同语义) ====================
  * `-Wl,--wrap` 链接期接管只是把这组函数挂到 malloc 名下,语义不变。 */
 
@@ -169,7 +186,13 @@ void wmm_atfork_child(void);
 /* 字符串命令分发——公共 API 冻结后唯一的扩展通道。可用命令:
  *   stats.snapshot            取统计快照(同步合并各线程计数)
  *   stats.per_class           取按尺寸类的直方图
- *   sampling.enable/disable   打开/关闭调用点采样(默认关)
+ *   sampling.enable           打开调用点采样;无参数,间隔固定 1000
+ *   sampling.disable          关闭调用点采样(默认关)
+ *   prof.top                  取调用点 TOP 表:变参为 int k(1..256)
+ *                             与 wmm_prof_entry_t *out(容量 ≥ k 项)。
+ *                             先合并尚未聚合的样本,再按估算字节降序
+ *                             填 out,返回写入条数(0..k),out[n..k)
+ *                             清零;参数非法返回 -1/EINVAL
  *   leak.check                泄漏嫌疑的 TOP N 增量对比
  *   leak.dump                 全量 dump 存活对象的调用点
  *   guard.enable/disable      打开/关闭内存错误检测(默认关)
@@ -204,9 +227,11 @@ int  wmm_event_drain(wmm_event_t *buf, size_t n, size_t *got);
  * src/wmm_shm.h 的 WMM_SHM_VERSION):监控进程与库是两个可独立
  * 升级的二进制,版本号是它们之间唯一的兼容性判据。
  * 0x13B8 = 5048 = 8 字节汇总头 + 37×24 直方图 + 128×32 线程表。
- * 0x30 = 48 字节事件记录。 */
+ * 0x30 = 48 字节事件记录。0x20 = 32 字节采样表项。 */
 _Static_assert(sizeof(wmm_stats_t) == 0x13B8, "wmm_stats_t layout is frozen (SHM ABI)");
 _Static_assert(sizeof(wmm_event_t) == 0x30,   "wmm_event_t layout is frozen (SHM ABI)");
+_Static_assert(sizeof(wmm_prof_entry_t) == 0x20,
+               "wmm_prof_entry_t layout is frozen (SHM ABI)");
 
 #ifdef __cplusplus
 }

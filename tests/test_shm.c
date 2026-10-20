@@ -8,8 +8,9 @@
  *        MAP_SHARED 对另一个进程可见,且两进程解析结果逐字节一致;
  *   撕裂压力:一个线程猛分配/释放并持续写事件、一个线程不停发布、
  *        主线程不停读,每一次成功的读都验单代恒等式(见下);
- *   镜像一致:发布一代后,映射里的快照/事件环与直接读内部状态
- *        逐字节相同。
+ *   镜像一致:发布一代后,映射里的快照/事件环/TOP 采样表与直接读
+ *        内部状态逐字节相同;TOP 表经 wmm_shm_read_prof 按监控端
+ *        路径读回,证明采样数据确实随发布代跨进程可见。
  *
  * 读端每代能验什么:快照是"锁内读数拼起来的一代",所以
  *   Σ cls[i].live == live_objects(同一批读数求和,逐字节精确),
@@ -399,6 +400,55 @@ static void check_mirror(void) {
     monitor_close(h);
 }
 
+/* ---- TOP 采样表随发布代镜像 ---- */
+static __attribute__((noinline)) void eat_shm(void) {
+    /* 5000 次分配 → 5 个样本 × 权重 1000 → 估算 count = 5000。
+       每组测试之间的主线程节拍已在上一组末尾归零 */
+    for (unsigned i = 0; i < 5000; i++) {
+        void *p = wmm_alloc(512);
+        if (p == NULL)
+            return;
+        wmm_free(p);
+    }
+}
+
+static void check_prof_table(void) {
+    CHECK(wmm_ctl("sampling.enable") == 0);
+    eat_shm();
+    CHECK(wmm_ctl("sampling.disable") == 0);
+
+    static wmm_prof_entry_t top[WMM_SHM_PROF_N];
+    int n = wmm_ctl("prof.top", (int)WMM_SHM_PROF_N, top);
+    CHECK(n >= 1);
+    if (n < 1)
+        return;
+
+    /* 本组的吃内存函数只分配 512B,它的行满足 bytes == count × 512;
+       上一组的工作线程也用过 512B,但 count 不同,这里只确认新行
+       存在,不依赖表的完整内容 */
+    int found = 0;
+    for (int i = 0; i < n; i++)
+        if (top[i].count != 0 && top[i].bytes == top[i].count * 512)
+            found = 1;
+    CHECK(found);
+
+    /* 发布一代,再按监控进程的路径只读映射读回 TOP 表:内部取数与
+       发布内容必须逐字节一致。发布内部会再取一次 TOP,但这期间
+       没有任何新分配,聚合表不变 */
+    wmm_shm_publish();
+
+    const wmm_shm_t *h = monitor_open(g_path);
+    CHECK(h != NULL);
+    if (h == NULL)
+        return;
+
+    static wmm_prof_entry_t pub[WMM_SHM_PROF_N];
+    CHECK(wmm_shm_read_prof(h, pub) == 0);
+    CHECK(memcmp(pub, top, sizeof top) == 0);
+
+    monitor_close(h);
+}
+
 int test_shm(void) {
     g_fail = 0;
     wmm_boot();
@@ -415,6 +465,7 @@ int test_shm(void) {
     check_cross_process();
     check_stress();
     check_mirror();
+    check_prof_table();
 
     CHECK(unlink(g_path) == 0);
 

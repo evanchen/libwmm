@@ -333,6 +333,14 @@ static wmm_tcache_t *stats_slot(void) {
 }
 
 void *wmm_alloc(size_t size) {
+    /* 采样锚点。必须在分配函数自己的帧上取:一是指针回溯要从这里
+       开始读 return address,二是取帧地址这一事实会强制编译器为
+       wmm_alloc 建立规范的帧指针链——只给 -fno-omit-frame-pointer
+       并不够,-O2 或 ASan 构建仍可能把 rbp 挪作通用寄存器,链上
+       保存的就不是上一帧的帧指针。采样关闭时这里不产生指令,代价
+       只是让 wmm_alloc 少一个可分配的通用寄存器。 */
+    void *alloc_frame = __builtin_frame_address(0);
+
     if (size == 0)
         size = 1;   /* glibc 语义:size==0 当 1 处理,返回可释放指针 */
 
@@ -344,6 +352,10 @@ void *wmm_alloc(size_t size) {
         if (t != NULL) {
             t->t_alloc_bytes += ext->npages * WMM_PAGE;   /* 可用 = 页对齐 */
             t->t_alloc_cnt++;
+            /* 大对象也参与采样:大块正是"吃内存"归因的主角,而它
+               根本不经过 bin;关闭采样时只多一次可预测的标志测试 */
+            if (g_opt.sample_n != 0)
+                wmm_prof_sample(t, ext->npages * WMM_PAGE, alloc_frame);
         }
         return ext->addr;
     }
@@ -364,6 +376,9 @@ void *wmm_alloc(size_t size) {
         if (p != NULL) {
             g_tcache->t_alloc_bytes += wmm_bin_info[i].reg_size;
             g_tcache->t_alloc_cnt++;
+            if (g_opt.sample_n != 0)
+                wmm_prof_sample(g_tcache, wmm_bin_info[i].reg_size,
+                                alloc_frame);
             return p;
         }
         /* 填充失败 = 窗口耗尽:慢路径只会同样失败。保留它,让 OOM
@@ -391,6 +406,8 @@ void *wmm_alloc(size_t size) {
     if (p != NULL && g_tcache != NULL) {
         g_tcache->t_alloc_bytes += wmm_bin_info[i].reg_size;
         g_tcache->t_alloc_cnt++;
+        if (g_opt.sample_n != 0)
+            wmm_prof_sample(g_tcache, wmm_bin_info[i].reg_size, alloc_frame);
     }
     return p;
 }

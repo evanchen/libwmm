@@ -37,6 +37,7 @@
 
 #include "wmm_internal.h"
 
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -90,6 +91,14 @@ static bool tcache_create(void) {
     t->t_free_cnt    = 0;
     t->gc_evt        = 0;
     t->gc_next       = 0;
+
+    /* 采样状态:head 显式初始化;256 个槽的 seq 保持 mmap 零页的
+       零值(偶数 = 未写入,对这些无锁原子类型是合法表示)。刻意不
+       逐槽 atomic_init:槽横跨 72KB,触碰一遍就把整块虚拟内存驻留成
+       物理页,而采样默认关闭——关着就不该为它付 RSS */
+    t->prof_tick = 0;
+    atomic_init(&t->prof.head, 0);
+    t->prof.merged = 0;
 
     /* 栈数组紧跟在结构体后。结构体 8 字节对齐且尺寸是 8 的倍数,
        所以每个栈数组都天然满足指针数组的对齐要求 */
@@ -358,6 +367,11 @@ void wmm_thread_exit(void) {
     if (t == NULL)
         return;
 
+    /* 采样本先归账:环嵌在本块里,下面的 munmap 会让尚未合并的样本
+       随块消失。放在刷缓存之前——两者互不相干,先收样本少一个
+       "块已改、样本未走"的窗口 */
+    wmm_prof_thread_drain(t);
+
     /* 先把对象还给 bin,再拆壳:顺序反了就是在已 munmap 的块上刷栈 */
     wmm_tcache_flush_all();
 
@@ -418,6 +432,9 @@ void wmm_tcache_child_cleanup(void) {
             t->next = NULL;
             g_threads = t;
         } else {
+            /* 死线程环里的样本先归账再撤块:它们属于 fork 前的进程
+               历史,子进程的聚合表照单继承;不取出来就只能随块丢弃 */
+            wmm_prof_thread_drain(t);
             for (szind_t i = 0; i < WMM_NBINS; i++)
                 if (t->bins[i].head > 0)
                     tcache_flush_bins(t, i, t->bins[i].head);

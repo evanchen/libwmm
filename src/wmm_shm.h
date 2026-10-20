@@ -17,8 +17,11 @@
  *   0x018  publish_ts(8)          最近一次发布的 CLOCK_MONOTONIC 纳秒;
  *                                 与读端自己的同源时钟对比可判数据新鲜度
  *   0x020  wmm_stats_t 主快照     (0x13B8,布局冻结见 wmm.h)
- *   0x1800 TOP N 采样表           256 项 × 32B;调用点采样落地后填,
- *                                 未启用时恒为全零
+ *   0x1800 TOP N 采样表           256 项 × 32B(wmm_prof_entry_t),
+ *                                 按估算字节降序;未启用采样时恒为全零。
+ *                                 每项带用户调用点 PC,监控端用
+ *                                 addr2line 对名;bytes/count 是按采样
+ *                                 间隔放大的估计值
  *   0x4000 事件环                  1024 条 × 0x30,整环镜像内部事件环
  *
  * 一致性协议(单写者 + 多读者):
@@ -60,8 +63,9 @@ typedef struct {
     wmm_stats_t       stats;          /* 主快照 */
 
     unsigned char pad_to_prof[0x1800 - 0x020 - sizeof(wmm_stats_t)];
-    unsigned char prof[WMM_SHM_PROF_N * 32];   /* 0x1800:每项 {pc,bytes,count,reserved} */
-    unsigned char pad_to_ring[0x4000 - 0x1800 - WMM_SHM_PROF_N * 32];
+    wmm_prof_entry_t prof[WMM_SHM_PROF_N];     /* 0x1800:调用点 TOP 表 */
+    unsigned char pad_to_ring[0x4000 - 0x1800 -
+                              WMM_SHM_PROF_N * sizeof(wmm_prof_entry_t)];
     wmm_event_t   events[WMM_SHM_EVENT_RING];  /* 0x4000:整环镜像,按数组序回放 */
 } wmm_shm_t;
 
@@ -91,6 +95,27 @@ static inline int wmm_shm_read(const wmm_shm_t *h, wmm_stats_t *stats,
         atomic_thread_fence(memory_order_acquire);
         uint64_t s2 = atomic_load_explicit(&h->seq, memory_order_relaxed);
         if (s1 == s2)                      /* 首尾同一偶数值 = 完整一代 */
+            return 0;
+    }
+    errno = EAGAIN;
+    return -1;
+}
+
+/* TOP 采样表的一致读端:整表 256 项在同一次 seqlock 保护内拷出。
+ * 表与主快照属于同一个发布代,但本函数与 wmm_shm_read 分两次调用
+ * 时仍可能读到两个代——协议不提供合并读口,需要严格同代比对的
+ * 读端要自己用 seq 框住两次读。 */
+static inline int wmm_shm_read_prof(const wmm_shm_t *h,
+                                    wmm_prof_entry_t *dst)
+{
+    for (int i = 0; i < WMM_SHM_READ_TRIES; i++) {
+        uint64_t s1 = atomic_load_explicit(&h->seq, memory_order_acquire);
+        if (s1 & 1u)
+            continue;
+        memcpy(dst, h->prof, sizeof h->prof);
+        atomic_thread_fence(memory_order_acquire);
+        uint64_t s2 = atomic_load_explicit(&h->seq, memory_order_relaxed);
+        if (s1 == s2)
             return 0;
     }
     errno = EAGAIN;

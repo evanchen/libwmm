@@ -417,6 +417,64 @@ typedef struct {
                                加总,避免逐对象累加拖慢慢路径 */
 } wmm_cache_bin_t;
 
+/* ==================== 调用点采样的线程侧缓冲 ====================
+ *
+ * 采样点就在被采样线程的分配路径上,写缓冲不能加锁——无锁快路径
+ * 是线程缓存存在的理由。方案:每线程一个定长环形缓冲,写者独占
+ * head 与槽位;唯一的并发读者是后台合并线程,每个槽用一把微型
+ * seqlock(世代号)让合并器在"恰好撞上正在写的槽"时识别并放弃,
+ * 而不是读到半新半旧的栈帧。
+ *
+ * 槽位带绝对序号 index:环绕圈后槽会被新样本覆盖,合并器按"从
+ * merged 到 head 的每个绝对序号"逐个索取,只有槽里现存的 index
+ * 正是所求时才收——既不会把同一槽位的两代样本算两次,也不会因为
+ * 合并器来晚了就把别的样本当成本代样本。
+ */
+#define WMM_PROF_DEPTH    32      /* 每个样本保留的栈帧上限;更深的
+                                     调用链对定位没有增益,只把槽位
+                                     撑大 */
+#define WMM_PROF_RING     256     /* 每线程环槽数。一个合并周期(1s)
+                                     内采样超过 256 次(即每秒 25.6 万
+                                     次分配)才会绕圈,丢了也只丢最旧
+                                     的——分配路径永远不会为采样等待 */
+#define WMM_PROF_SAMPLE_N 1000u   /* 采样间隔:每 N 次成功分配采一次。
+                                     ×N 放大的估计在千级样本时误差已
+                                     收敛到几个百分点 */
+#define WMM_PROF_TAB_N    1024u   /* 合并表桶数(2 的幂),开放寻址线性
+                                     探测。调用点数远超桶数时宁可丢弃
+                                     新样本也不扩容:采样路径不能向
+                                     分配器申请内存(自举) */
+#define WMM_PROF_TOP_MAX  256u    /* prof.top 单次最多输出条数;与共享
+                                     区 TOP 表容量一致(wmm_shm.c 有
+                                     static_assert 钉住) */
+#define WMM_PROF_KEY_FRAMES 4u    /* 调用点键折叠的帧数:前 4 帧足以
+                                     区分业务调用链,又不让键过宽 */
+
+typedef struct {
+    _Atomic uint32_t seq;     /* 槽位世代:奇数 = 写入进行中。写者每次
+                                 占用 +2,读者凭"首尾相等且为偶"判定
+                                 读到的是完整一代 */
+    uint32_t         depth;   /* 有效帧数(1..WMM_PROF_DEPTH) */
+    uint64_t         index;   /* 绝对样本序号 = 写入时的 head 值;合并
+                                 器据此确认槽里是不是它要的那一代 */
+    size_t           usize;   /* 本次分配的实际可用字节 */
+    uint32_t         weight;  /* 采样间隔 N 的采样时快照。样本自带
+                                 权重,运行期改间隔不会把旧样本按新
+                                 间隔放大 */
+    uint32_t         pad;     /* 显式占位,保持 pc 的 8 字节对齐 */
+    void            *pc[WMM_PROF_DEPTH];  /* 栈帧 return address;
+                                             [0] = 用户的分配调用点 */
+} wmm_prof_slot_t;
+
+typedef struct {
+    _Atomic uint64_t head;    /* 累计样本数,只有本线程写;槽位 =
+                                 旧值 % WMM_PROF_RING。合并器读它
+                                 确定"新样本到哪为止" */
+    uint64_t         merged;  /* 已合并到的绝对序号,只有合并器写。
+                                 线程退出时合并器就是线程自己 */
+    wmm_prof_slot_t  slot[WMM_PROF_RING];
+} wmm_prof_ring_t;
+
 /* wmm_tcache_t —— 线程缓存主体,兼任线程注册表节点。
  *
  * 内存来源:一次 mmap 一整块,布局 = [ 本结构 | 各 bin 的栈数组 ]。
@@ -468,6 +526,16 @@ struct wmm_tcache_s {
                                              8 字节存页数、弹栈时校验,[36]
                                              即为此预留(届时不必改本结构
                                              布局) */
+
+    /* ---- 调用点采样(默认关闭时本组字段不被触碰) ---- */
+    uint32_t        prof_tick; /* 本线程分配计数节拍:到采样间隔就采
+                                  一次并清零。只在采样开启时推进 */
+    wmm_prof_ring_t prof;      /* 采样环形缓冲。嵌在缓存块里让它跟线程
+                                  同生命周期(整块 mmap/munmap),不必
+                                  为线程退出单独管一块内存;关闭采样
+                                  时只占虚拟地址——mmap 零页不被触碰
+                                  就不驻留物理内存,因此关着不为它付
+                                  RSS */
 };
 
 extern _Thread_local wmm_tcache_t *g_tcache;  /* 惰性创建;NULL = 本线程尚未建 */
@@ -515,6 +583,49 @@ void     wmm_tcache_child_cleanup(void);
  * 由 wmm_atfork_child 在所有锁重建后调用 */
 void     wmm_tcache_thread_destructor(void *val);
 /* pthread 键析构;显式 exit 之后再触发是空操作(幂等) */
+
+/* ==================== 调用点采样(wmm_prof.c) ====================
+ *
+ * 回答"内存是谁吃的":被采中的分配记下用户调用栈,合并器把前 4 帧
+ * 折叠成调用点键,按样本自带的权重 N 放大成估算字节/次数。输出是
+ * 估计值而非精确计数——这正是采样能把开销压到接近零的原因。
+ *
+ * 触发点覆盖 wmm_alloc 的全部成功返回路径(大对象、缓存命中、bin),
+ * 而不是只挂 bin 慢路径:×N 估计器要求对全体分配均匀抽样,只抽
+ * 慢路径会系统性低估缓存命中的热调用点,也完全漏掉 OBS2 使用的
+ * 1MB 大对象。关闭时每个分配点只多一次可预测的全局标志测试。
+ *
+ * 锁序:g_prof_lock 是叶子锁。后台合并先持 g_threads_lock 遍历注册
+ * 表、再取 g_prof_lock,与 fork prepare 的 bins → ext → threads →
+ * prof → base 一致;线程退出只单独取 prof 锁,不构成环。
+ */
+
+/* 一次成功分配后的采样入口:usize 是本次分配的实际可用字节,
+ * alloc_frame 是 wmm_alloc 自己的帧地址,由它在函数入口用
+ * __builtin_frame_address(0) 捕获后传入。帧地址必须由分配函数自己
+ * 取:该内建描述的是求值它的函数,只有分配函数自己取到的才是栈上
+ * 紧挨用户调用点的那一帧;而且取帧地址这一事实会强制编译器为它
+ * 建立规范的帧指针链,不因 -O2 或 ASan 把 rbp 挪作通用寄存器而
+ * 断开。调用方先判 g_opt.sample_n != 0,使关闭时不产生函数调用;
+ * 本函数内部再按线程节拍决定是否真的走栈。 */
+void wmm_prof_sample(wmm_tcache_t *t, size_t usize, void *alloc_frame);
+
+/* 合并所有已注册线程的环形缓冲到全局聚合表。后台线程每周期调用
+ * (没有共享区也要调:否则环绕圈丢样本);wmm_prof_top 取数前也会
+ * 同步调用,因此不依赖后台线程是否在运行。 */
+void wmm_prof_merge(void);
+
+/* 线程退出前取出并合并自己缓冲里的残余样本。必须在 munmap 缓存块
+ * 之前调用:环嵌在块里,块一撤,最多一个合并周期的样本就随块消失。
+ * 只由块的所有者(退出线程)或 fork 子进程的独占清理调用。 */
+void wmm_prof_thread_drain(wmm_tcache_t *t);
+
+/* 取 TOP k:先同步合并再按估算字节降序填 dst,返回实际条数(0..k);
+ * dst[n..k) 清零。k 被钳到 1..WMM_PROF_TOP_MAX;dst==NULL 或 k==0
+ * 返回 0。只做选择不排序、不分配内存。 */
+unsigned wmm_prof_top(wmm_prof_entry_t *dst, unsigned k);
+
+extern pthread_mutex_t g_prof_lock;   /* 聚合表锁;fork 子进程重建 */
 
 /* ==================== 全局状态(初始化时定死) ==================== */
 
@@ -565,8 +676,9 @@ typedef struct {
                                代价是再访问要缺页;
                                MADV_FREE 懒还,内核内存紧张才收,延迟更稳。
                                RSS 敏感选前者,延迟敏感选后者 */
-    unsigned sample_n;       /* 调用点采样间隔:每 N 次慢路径分配采一次栈;
-                               0 = 关(默认关,采样有开销) */
+    unsigned sample_n;       /* 调用点采样间隔:每 N 次成功分配采一次栈;
+                               0 = 关(默认关,采样有开销)。读数不加
+                               原子:切换瞬间多采/漏采一个样本无碍 */
     bool     guard;          /* 越界/UAF/双释放检测总开关(默认关)。
                                检测要 poison/redzone/隔离,内存放大且
                                慢路径变慢——只排障时开 */

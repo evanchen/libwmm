@@ -453,6 +453,10 @@ static void *wmm_bg_thread(void *arg) {
 
         pthread_mutex_unlock(&g_bg_lock);
         wmm_phys_purge_if_needed();
+        /* 采样聚合与回收同周期:没有共享区也要合并,否则环形缓冲
+           绕圈就会丢样本。合并放在发布之前,发布时取到的就是刚
+           聚合完的表;发布内部再取一次 TOP,重复合并是空操作 */
+        wmm_prof_merge();
         /* 共享监控区与回收同周期发布:先回收再发布,读到的
            active/frag 就是回收之后的状态,不会把已交还内核的页
            又算进"在用"。未创建共享区时本调用是空操作 */
