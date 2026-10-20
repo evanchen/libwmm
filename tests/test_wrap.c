@@ -89,11 +89,21 @@ static void check_malloc(void) {
 
 /* ---- calloc:溢出拒绝 + 复用对象必须重新清零 ---- */
 static void check_calloc(void) {
-    CHECK(calloc(SIZE_MAX / 2, 3) == NULL);
-    CHECK(calloc((size_t)1 << 40, (size_t)1 << 30) == NULL);
+    /* 两个调用故意要乘积溢出。实参经 volatile 读入,编译器就不能在
+       编译期断定"必定溢出",否则测试自己会触发
+       -Walloc-size-larger-than;运行期仍是同样的大数,照常走
+       calloc 内部的溢出拒绝分支 */
+    volatile size_t n = SIZE_MAX / 2;
+    volatile size_t sz = 3;
+    CHECK(calloc(n, sz) == NULL);
+    n  = (size_t)1 << 40;
+    sz = (size_t)1 << 30;
+    CHECK(calloc(n, sz) == NULL);
 
-    /* 零元请求按 glibc 语义仍返回可释放指针(size→1) */
-    unsigned char *cz = calloc(0, 16);
+    /* 零元请求按 glibc 语义仍返回可释放指针(size→1)。同样用 volatile
+       挡住 -Walloc-size:常量 0 会让编译器判定"分配不足以放下 1 字节" */
+    volatile size_t zero = 0;
+    unsigned char *cz = calloc(zero, 16);
     CHECK(cz != NULL);
     if (cz != NULL) {
         CHECK(in_heap(cz));
