@@ -297,19 +297,46 @@ wmm_slab_t *wmm_phys_alloc_slab_pages(wmm_slab_t *sl, szind_t i,
     return sl;
 }
 
-/* 新建 slab:头从 base 区取,页从物理层取 */
+/* slab 头复用链:单链,full_next 作链指针,full_prev 不使用。
+   base 只增不还,空 slab 退役后头必须回收,否则随机释放导致的
+   slab 生命周期会让元数据随运行时长线性增长 */
+static wmm_slab_t *g_slab_hdr_free;
+
+static wmm_slab_t *slab_hdr_get(void) {
+    pthread_mutex_lock(&g_ext_lock);
+    wmm_slab_t *sl = g_slab_hdr_free;
+    if (sl != NULL)
+        g_slab_hdr_free = sl->full_next;
+    pthread_mutex_unlock(&g_ext_lock);
+
+    if (sl == NULL)
+        sl = (wmm_slab_t *)wmm_base_alloc(sizeof(wmm_slab_t));
+    return sl;
+}
+
+static void slab_hdr_put(wmm_slab_t *sl) {
+    pthread_mutex_lock(&g_ext_lock);
+    sl->full_prev   = NULL;
+    sl->full_next   = g_slab_hdr_free;
+    g_slab_hdr_free = sl;
+    pthread_mutex_unlock(&g_ext_lock);
+}
+
+/* 新建 slab:头优先复用,页从物理层取 */
 wmm_slab_t *wmm_phys_alloc_slab(szind_t i) {
     const wmm_bin_info_t *bi = &wmm_bin_info[i];
 
-    wmm_slab_t *sl = (wmm_slab_t *)wmm_base_alloc(sizeof(wmm_slab_t));
+    wmm_slab_t *sl = slab_hdr_get();
     if (sl == NULL) {
         wmm_event_log(0xDB, NULL);
         return NULL;
     }
 
     if (wmm_phys_alloc_slab_pages(sl, i, bi->slab_size >> WMM_LG_PAGE,
-                                  false) == NULL)
+                                  false) == NULL) {
+        slab_hdr_put(sl);
         return NULL;
+    }
 
     return sl;
 }
@@ -324,6 +351,13 @@ void wmm_phys_free_slab(wmm_slab_t *sl) {
     pthread_mutex_lock(&g_ext_lock);
     extent_release(e);
     pthread_mutex_unlock(&g_ext_lock);
+}
+
+/* 普通 slab 退休:页还给物理层,头进复用链;
+   guard 的 slab 头由自己的备用池管理,不走这里 */
+void wmm_phys_retire_slab(wmm_slab_t *sl) {
+    wmm_phys_free_slab(sl);
+    slab_hdr_put(sl);
 }
 
 /* 大对象 extent:页表项打 extent 标签,并计入大对象统计 */

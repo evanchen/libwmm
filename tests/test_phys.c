@@ -7,6 +7,7 @@
  *   尺寸桶:同桶装不下的块必须跳过,跨桶取最小可用块;切分后
  *         余段按原状态归入新桶(每检查点跑桶一致性审计);
  *   跨路径吸收:slab 退休的页被大对象分配复用(碎片不丢);
+ *   slab 头回收:空 slab 退役后,下一个新 slab 复用退役头;
  *   页表登记:大对象每页登记同一 extent,释放后全页 raw==0;
  *   结构不变量:地址序链严格递增、不重叠、双向指针互指、
  *         g_dirty_pages == Σ FREE 页数(每个检查点跑一遍);
@@ -299,6 +300,25 @@ static void check_slab_absorb(void) {
     wmm_free(big);
 }
 
+/* ---- slab 头回收:12288B 类每 slab 一个对象,释放即整块退休,
+   下一次同类分配必须复用退役头,不能线性泄漏 */
+static void check_slab_hdr_reuse(void) {
+    drain_free_pool();
+
+    unsigned char *a = wmm_alloc(12288);
+    CHECK(a != NULL);
+    wmm_slab_t *old = NULL;
+    CHECK(wmm_pte_is_slab(a, &old));
+    wmm_free(a);
+
+    unsigned char *b = wmm_alloc(12288);
+    CHECK(b != NULL);
+    wmm_slab_t *now = NULL;
+    CHECK(wmm_pte_is_slab(b, &now));
+    CHECK(now == old);
+    wmm_free(b);
+}
+
 /* ---- 混合压力 ×2 重放:第二遍零新映射 = 碎片被吸收 ---- */
 static void mixed_replay_pass(void) {
     enum { SLOTS = 256, OPS = 3000 };
@@ -578,6 +598,7 @@ int test_phys(void) {
     check_split();
     check_size_bucket();
     check_slab_absorb();
+    check_slab_hdr_reuse();
     check_replay();
     check_purge();
     check_merge_across_states();

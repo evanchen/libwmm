@@ -412,7 +412,7 @@ void wmm_free(void *p) {
             wmm_tcache_count_free(g_tcache, usize);
 
         if (retire)
-            wmm_phys_free_slab(sl);
+            wmm_phys_retire_slab(sl);
         return;
     }
 

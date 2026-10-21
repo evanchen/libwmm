@@ -139,7 +139,7 @@ static void tcache_flush_bins(wmm_tcache_t *t, szind_t i, unsigned n) {
     pthread_mutex_unlock(&b->lock);
 
     for (unsigned k = 0; k < nret; k++)
-        wmm_phys_free_slab(retired[k]);
+        wmm_phys_retire_slab(retired[k]);
 
     memmove(cb->stack, cb->stack + n,
             (size_t)(cb->head - n) * sizeof(void *));

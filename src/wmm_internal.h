@@ -74,7 +74,7 @@ struct wmm_slab_s {
     uint8_t     pad[7];
     void       *addr;
 
-    wmm_slab_t *full_prev, *full_next;          /* full/隔离/回收池共用链 */
+    wmm_slab_t *full_prev, *full_next;          /* full/隔离/回收池/头复用共用链 */
     wmm_slab_t *ph_prev, *ph_next, *ph_child;   /* nonfull 地址序链;ph_child 预留 */
     void       *ext;                            /* 物理层 extent;NULL=自备页 */
     uintptr_t   site_pc;                        /* guard 分配点,泄漏归因 */
@@ -147,6 +147,7 @@ wmm_slab_t   *wmm_phys_alloc_slab_pages(wmm_slab_t *sl, szind_t i,
                                         size_t npages, bool guarded);
 
 void          wmm_phys_free_slab(wmm_slab_t *sl);
+void          wmm_phys_retire_slab(wmm_slab_t *sl);
 
 wmm_extent_t *wmm_phys_alloc_extent(size_t size);
 
