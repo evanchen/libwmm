@@ -18,6 +18,7 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 
@@ -388,6 +389,8 @@ static void oom_reuse_checks(void) {
     wmm_free(small);
 }
 
+static int oom_abort_child_case(void);
+
 static void oom_window_fill_case(void) {
     wmm_stats_t base;
 
@@ -397,6 +400,12 @@ static void oom_window_fill_case(void) {
     }
 
     oom_fill_window();
+
+    /* 窗口仍满时 fork:子进程第一次请求就会走 window_map 失败并 abort,
+       不依赖子进程遍历已归还的 retained extent,结果确定且开销很小 */
+    if (g_fail == 0 && g_cfg.abort_child)
+        (void)oom_abort_child_case();
+
     if (g_fail == 0)
         oom_contract_checks(&base);
     if (g_fail == 0)
@@ -422,6 +431,10 @@ static int oom_abort_child_case(void) {
     }
 
     if (pid == 0) {
+        struct rlimit no_core = { 0, 0 };
+
+        /* 不写核心转储:64GB 地址空间的核心文件会让父进程等待超时 */
+        (void)setrlimit(RLIMIT_CORE, &no_core);
         g_opt.abort_oom = true;
         for (;;) {
             void *p = wmm_alloc((size_t)64 << 20);
@@ -431,7 +444,7 @@ static int oom_abort_child_case(void) {
         }
     }
 
-    uint64_t deadline = v_now_ns() + 15000000000ull;
+    uint64_t deadline = v_now_ns() + 30000000000ull;
 
     for (;;) {
         int status = 0;
@@ -520,7 +533,7 @@ static void oom_print_cgroup(void) {
     FILE *f = fopen("/proc/self/cgroup", "r");
 
     if (f != NULL) {
-        char line[1200];
+        char line[1024];
 
         while (fgets(line, sizeof line, f) != NULL) {
             if (strncmp(line, "0::", 3) == 0) {
@@ -652,8 +665,7 @@ int main(int argc, char **argv) {
 
     if (cfg.window_fill)
         oom_window_fill_case();
-
-    if (cfg.abort_child)
+    else if (cfg.abort_child)
         (void)oom_abort_child_case();
 
     printf("OOM_RESULT: %s mode=%s failures=%u oom_events=%" PRIu64

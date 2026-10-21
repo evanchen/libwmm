@@ -466,6 +466,14 @@ def run_fork(args, out_dir, env, gates, guard):
     return {"result_line": line}
 
 
+def last_oom_error(text):
+    for line in reversed(text.splitlines()):
+        s = line.strip()
+        if s.startswith("oomcheck:"):
+            return s
+    return ""
+
+
 def run_oom(args, out_dir, env, gates):
     log_path = out_dir / "oom.log"
     cmd = [args.oom_bin, "--window-fill", "--abort-child"] \
@@ -479,9 +487,14 @@ def run_oom(args, out_dir, env, gates):
         gates.add("oom:exit", "FAIL", "timed out after 180s")
     else:
         gates.add("oom:exit", "PASS" if rc == 0 else "FAIL", f"rc={rc}")
+    detail = result or "no OOM_RESULT line"
+    if "OOM_RESULT: PASS" not in result:
+        err = last_oom_error(text)
+        if err:
+            detail += f" | {err}"
     gates.add("oom:result",
               "PASS" if "OOM_RESULT: PASS" in result else "FAIL",
-              result or "no OOM_RESULT line")
+              detail)
     gates.add("oom:abort",
               "PASS" if "OOM_ABORT: PASS" in abort else "FAIL",
               abort or "no OOM_ABORT line")

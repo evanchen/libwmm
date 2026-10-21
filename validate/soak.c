@@ -931,7 +931,7 @@ int main(int argc, char **argv) {
         bool st_ok = wmm_stats_snapshot(&st) == 0;
         if (!st_ok) {
             SOAK_FAIL("stats snapshot failed at %" PRIu64 "s\n",
-                      elapsed_ns / 1000000000ull);
+                      (uint64_t)(elapsed_ns / 1000000000ull));
             memset(&st, 0, sizeof st);
         } else {
             unsigned n = v_stats_check(&st, &prev, prev_valid);
@@ -1012,7 +1012,8 @@ int main(int argc, char **argv) {
                     ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
                     ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
                     ",%" PRIu64 ",%" PRIu64 "\n",
-                    elapsed_ns / 1000000000ull, soak_phase_name(ph),
+                    (uint64_t)(elapsed_ns / 1000000000ull),
+                    soak_phase_name(ph),
                     st.live_bytes, st.active_bytes, st.frag_bytes,
                     st.high_water_live, st.live_objects, rss, cached,
                     soak_total_ops(), ev_guard, ev_leak, ev_oom, ev_purge,
