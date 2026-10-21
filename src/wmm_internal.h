@@ -374,6 +374,7 @@ enum {
     WMM_FAULT_MADVISE = 2,                      /* purge madvise */
     WMM_FAULT_TCACHE  = 3,                      /* 线程缓存 mmap */
     WMM_FAULT_BASE    = 4,                      /* base 元数据 */
+    WMM_FAULT_SLAB_HDR = 5,                     /* slab 头分配 */
 };
 #define WMM_FAULT_ANY    0x7FFFFFFFu            /* 匹配任意 site */
 #define WMM_FAULT_ALWAYS 0xFFFFFFFFu            /* 永不倒数,始终命中 */

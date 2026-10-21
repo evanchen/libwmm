@@ -303,6 +303,11 @@ wmm_slab_t *wmm_phys_alloc_slab_pages(wmm_slab_t *sl, szind_t i,
 static wmm_slab_t *g_slab_hdr_free;
 
 static wmm_slab_t *slab_hdr_get(void) {
+    /* 头有两个来源(复用链/base),注入按逻辑分配点计,
+       命中复用链时也要能确定性地模拟头耗尽 */
+    if (wmm_fault_check(WMM_FAULT_SLAB_HDR))
+        return NULL;
+
     pthread_mutex_lock(&g_ext_lock);
     wmm_slab_t *sl = g_slab_hdr_free;
     if (sl != NULL)

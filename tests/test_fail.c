@@ -1,10 +1,11 @@
 /* test_fail.c —— 故障注入用例:OOM 与系统调用失败路径
  *
- * 四个注入点,覆盖分配器仅有的四类"环境说不行"分支:
+ * 五个注入点,覆盖分配器仅有的五类"环境说不行"分支:
  *   MAP     窗口 mmap 失败(extent 与新 slab 的取页都经过这里)
  *   MADVISE purge 的 madvise 失败(必须保持 DIRTY,绝不谎报已还)
  *   TCACHE  线程缓存块创建失败(退化为慢路径,分配仍须成功)
- *   BASE    元数据分配失败(slab 头取不到,按 OOM 上抛)
+ *   BASE    base 元数据 bump 失败(extent 结点等直接消费方)
+ *   SLAB_HDR slab 头分配失败(复用链与 base 两个来源都算,按 OOM 上抛)
  *
  * 为什么专门测失败路径:正常负载几乎踩不到它们,而它们最容易写出
  * "计数漂移""页表残留""状态改了一半"。每个用例在注入后核对:
@@ -290,11 +291,11 @@ static void check_madvise_failure(void) {
     CHECK(g_active_bytes == active0);
 }
 
-/* ---- BASE:元数据分配失败 ----------------------------------------- */
+/* ---- SLAB_HDR:slab 头分配失败 ------------------------------------ */
 
-static void check_base_oom(void) {
+static void check_slab_hdr_oom(void) {
     /* slab 头取不到 = 元数据耗尽,OOM 上抛;失败不得动页表或计数 */
-    fault_arm(WMM_FAULT_BASE, WMM_FAULT_ALWAYS);
+    fault_arm(WMM_FAULT_SLAB_HDR, WMM_FAULT_ALWAYS);
     wmm_slab_t *sl = wmm_phys_alloc_slab(0);
     fault_off();
 
@@ -320,7 +321,7 @@ int test_fail(void) {
 
     check_tcache_degrade();
     check_madvise_failure();
-    check_base_oom();
+    check_slab_hdr_oom();
 
     fault_off();
     CHECK(g_fault_site == 0 && g_fault_after == 0);
