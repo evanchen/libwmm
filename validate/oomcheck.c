@@ -399,13 +399,13 @@ static void oom_window_fill_case(void) {
         return;
     }
 
-    oom_fill_window();
-
-    /* 窗口仍满时 fork:子进程第一次请求就会走 window_map 失败并 abort,
-       不依赖子进程遍历已归还的 retained extent,结果确定且开销很小 */
-    if (g_fail == 0 && g_cfg.abort_child)
+    /* 必须在父进程填窗口之前 fork:64GB 的可记账映射会让 fork 在
+       overcommit 受限的机器上返回 ENOMEM。子进程自己填满窗口后
+       在 window_map 失败路径上 abort,结果确定且不依赖父进程状态 */
+    if (g_cfg.abort_child)
         (void)oom_abort_child_case();
 
+    oom_fill_window();
     if (g_fail == 0)
         oom_contract_checks(&base);
     if (g_fail == 0)
