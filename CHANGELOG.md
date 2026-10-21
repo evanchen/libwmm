@@ -22,6 +22,9 @@
 - bench server 尾延迟归因:`--server-big/realloc/session/touch 0|1`
   逐项关闭负载成分(随机流不变),stderr 打印最慢请求的对象数、
   最大尺寸、调用数与标志位。
+- soak CSV 与 `SOAK_RESULT` 增加 `window_kb`、`base_kb` 高水位:分别
+  观测窗口 bump 决定的页表常驻页与 base 元数据开销;多余列不影响
+  `gate.py` 解析。
 
 ### Changed
 
@@ -34,6 +37,9 @@
 
 ### Fixed
 
+- `test_stress` 的 RSS 总检容差补上线程缓存容量差(阶段间每多一个
+  线程一份),修复 TSan 构建下 4→16 线程阶段 22.9 MB 增长被误判
+  为复用失效的问题;精确的窗口 bump 断言不变。
 - 空 slab 退役时回收 `wmm_slab_t` 头:此前头从只增不还的 base 区
   分配且从不复用,随机释放导致的 slab 生命周期会让元数据随运行
   时长线性增长,soak 的 RSS 门禁因此失败。新建 slab 优先复用退役

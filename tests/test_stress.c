@@ -442,17 +442,21 @@ int test_stress(void) {
     /* RSS 平稳(粗粒度总检;复用的尖断言在上面盯窗口 bump):三阶段
        总步数与槽位总配额都固定,峰值工作集相同;空闲页按设计留在
        映射里等复用(真正还内核是 purge 的事),期望形态是"涨到峰值
-       后持平"。容差 20MB 的构成(首轮实测分解):每阶段新起 4/8/16
-       个线程,栈页与 ASan 线程登记/影子页在 join 后仍留驻 RSS,
-       跨阶段合计 ~8MB;再加占用率随机演化的峰值波动与线程缓存驻留
-       (缓存对象循环复用窗口内同一批页,RSS 增量与窗口增量同量级,
-       精确账在窗口断言里)。复用失效的信号量级完全不同——每阶段
-       GB 级分配流量,1% 漏复用就新增 20MB+ 触碰——容差挡得住噪声,
-       拦得住真错 */
+       后持平"。容差 = 20MB 固定项 + 线程缓存容量差:阶段结束后线程
+       退出、缓存对象倒回 bin,但对应页在后台 purge 前仍是脏页常驻,
+       每多一个线程最多多一份缓存容量。该容量项与窗口预算里的缓存
+       项是同一个输入,必须同时钉住。复用失效的信号量级完全不同——
+       每阶段 GB 级分配流量,1% 漏复用就新增 20MB+ 触碰——容差挡得
+       住噪声,拦得住真错 */
+    size_t nph = sizeof g_stress_nthreads / sizeof g_stress_nthreads[0];
+    size_t rss_tol = (size_t)20480
+                   + (size_t)(g_stress_nthreads[nph - 1]
+                              - g_stress_nthreads[0]) * (tcache_cap >> 10);
+
     CHECK(rss_first > 0);
-    CHECK(rss_last <= rss_first + 20480);
-    printf("  RSS plateau: first %zu KB, last %zu KB (tolerance 20480 KB)\n",
-           rss_first, rss_last);
+    CHECK(rss_last <= rss_first + rss_tol);
+    printf("  RSS plateau: first %zu KB, last %zu KB (tolerance %zu KB)\n",
+           rss_first, rss_last, rss_tol);
 
     if (g_fail == 0)
         printf("  all stress checks passed\n");
