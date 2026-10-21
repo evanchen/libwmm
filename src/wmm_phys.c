@@ -34,8 +34,12 @@ static void ext_node_put(wmm_extent_t *e) {
 #define WMM_EXT_EXACT_BUCKETS 256u
 #define WMM_EXT_LOG_BUCKETS   48u               /* 覆盖到 2^56 页,窗口可 -D 覆盖 */
 #define WMM_EXT_NBUCKETS      (WMM_EXT_EXACT_BUCKETS + WMM_EXT_LOG_BUCKETS)
+#define WMM_EXT_BMAP_WORDS    ((WMM_EXT_NBUCKETS + 63u) / 64u)
 
 static wmm_extent_t *g_sz_free[2][WMM_EXT_NBUCKETS];
+
+/* g_sz_free 的非空桶位图:分配搜索直接跳到下一个非空桶,不再空扫 */
+static uint64_t g_sz_free_bmp[2][WMM_EXT_BMAP_WORDS];
 
 /* 大块桶按 floor(log2(npages-1)) 分桶:257..512 → 256,513..1024 →
    257,依此类推;默认 2^24 页窗口只用前 16 个 */
@@ -58,6 +62,31 @@ static unsigned sz_state_slot(uint32_t state) {
     return state == WMM_EXT_FREE_DIRTY ? 0u : 1u;
 }
 
+static void sz_bmap_set(unsigned si, unsigned b) {
+    g_sz_free_bmp[si][b >> 6] |= (uint64_t)1 << (b & 63u);
+}
+
+static void sz_bmap_clear(unsigned si, unsigned b) {
+    g_sz_free_bmp[si][b >> 6] &= ~((uint64_t)1 << (b & 63u));
+}
+
+static bool sz_bmap_test(unsigned si, unsigned b) {
+    return (g_sz_free_bmp[si][b >> 6] >> (b & 63u)) & 1u;
+}
+
+/* 从 b 起找第一个非空桶;没有则返回 WMM_EXT_NBUCKETS */
+static unsigned sz_bmap_next(unsigned si, unsigned b) {
+    unsigned w    = b >> 6;
+    uint64_t bits = g_sz_free_bmp[si][w] & (~(uint64_t)0 << (b & 63u));
+
+    while (bits == 0) {
+        if (++w >= WMM_EXT_BMAP_WORDS)
+            return WMM_EXT_NBUCKETS;
+        bits = g_sz_free_bmp[si][w];
+    }
+    return (w << 6) + (unsigned)__builtin_ctzll(bits);
+}
+
 static void sz_insert(wmm_extent_t *e) {
     unsigned si = sz_state_slot(e->state);
     unsigned b  = sz_bucket(e->npages);
@@ -67,6 +96,7 @@ static void sz_insert(wmm_extent_t *e) {
     if (e->sz_next != NULL)
         e->sz_next->sz_prev = e;
     g_sz_free[si][b] = e;
+    sz_bmap_set(si, b);
 }
 
 static void sz_remove(wmm_extent_t *e) {
@@ -75,8 +105,11 @@ static void sz_remove(wmm_extent_t *e) {
 
     if (e->sz_prev != NULL)
         e->sz_prev->sz_next = e->sz_next;
-    else
+    else {
         g_sz_free[si][b] = e->sz_next;
+        if (e->sz_next == NULL)
+            sz_bmap_clear(si, b);
+    }
     if (e->sz_next != NULL)
         e->sz_next->sz_prev = e->sz_prev;
     e->sz_prev = NULL;
@@ -116,9 +149,10 @@ static void ar_unlink(wmm_extent_t *e) {
     e->ar_next = NULL;
 }
 
-/* 从窗口 bump 映射;MAP_FIXED 复用预留区间;失败记 OOM 事件 */
-static void *window_map(size_t npages) {
+/* 锁内预留窗口区间并挂 INUSE 占位块;真正的 mmap 由调用方在锁外做 */
+static wmm_extent_t *extent_reserve_bump_locked(size_t npages) {
     size_t bytes = npages * WMM_PAGE;
+
     if ((char *)g_heap_cur + bytes > (char *)g_heap_end) {
         size_t used = (size_t)((char *)g_heap_cur - (char *)g_heap_base);
         size_t win  = (size_t)((char *)g_heap_end - (char *)g_heap_base);
@@ -130,26 +164,55 @@ static void *window_map(size_t npages) {
         return NULL;
     }
 
-    if (wmm_fault_check(WMM_FAULT_MAP)) {
-        wmm_dprintf("OOM: injected mmap failure, %zu pages\n", npages);
+    wmm_extent_t *e = ext_node_get();
+    if (e == NULL) {
         wmm_event_log(0xDB, NULL);
-        if (g_opt.abort_oom)
-            abort();
         return NULL;
     }
 
-    void *p = mmap(g_heap_cur, bytes, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-    if (p == MAP_FAILED) {
-        wmm_dprintf("OOM: mmap %zu pages failed, errno %d\n", npages, errno);
+    e->addr    = g_heap_cur;
+    e->npages  = npages;
+    e->state   = WMM_EXT_INUSE;
+    e->slab    = NULL;
+    e->next    = NULL;
+    e->sz_prev = NULL;
+    e->sz_next = NULL;
+    ar_insert_after(g_ar_tail, e);
+
+    g_heap_cur = (char *)g_heap_cur + bytes;
+    g_active_bytes += bytes;
+    return e;
+}
+
+/* 锁外补上预留区间的映射;失败记 OOM 事件,由调用方回滚占位块 */
+static bool window_map_extent(wmm_extent_t *e) {
+    if (wmm_fault_check(WMM_FAULT_MAP)) {
+        wmm_dprintf("OOM: injected mmap failure, %zu pages\n", e->npages);
         wmm_event_log(0xDB, NULL);
         if (g_opt.abort_oom)
             abort();
-        return NULL;
+        return false;
     }
-    g_heap_cur = (char *)p + bytes;
-    g_active_bytes += bytes;
-    return p;
+
+    void *p = mmap(e->addr, e->npages * WMM_PAGE, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (p == MAP_FAILED) {
+        wmm_dprintf("OOM: mmap %zu pages failed, errno %d\n", e->npages, errno);
+        wmm_event_log(0xDB, NULL);
+        if (g_opt.abort_oom)
+            abort();
+        return false;
+    }
+    return true;
+}
+
+/* 映射失败:摘链、回滚 active 并回收结点;预留的 VA 洞直接跳过 */
+static void extent_bump_rollback(wmm_extent_t *e) {
+    pthread_mutex_lock(&g_ext_lock);
+    ar_unlink(e);
+    g_active_bytes -= e->npages * WMM_PAGE;
+    ext_node_put(e);
+    pthread_mutex_unlock(&g_ext_lock);
 }
 
 /* 从尺寸桶取块:先 DIRTY 后 RETAINED,桶号从请求页数起向大扫。
@@ -159,13 +222,19 @@ static wmm_extent_t *extent_get(size_t npages) {
     unsigned start = sz_bucket(npages);
 
     for (unsigned pass = 0; pass < 2; pass++) {
-        for (unsigned b = start; b < WMM_EXT_NBUCKETS; b++) {
+        for (unsigned b = start; b < WMM_EXT_NBUCKETS; ) {
+            b = sz_bmap_next(pass, b);
+            if (b >= WMM_EXT_NBUCKETS)
+                break;
+
             wmm_extent_t *e = g_sz_free[pass][b];
 
             while (e != NULL && e->npages < npages)
                 e = e->sz_next;
-            if (e == NULL)
+            if (e == NULL) {
+                b++;
                 continue;
+            }
 
             uint32_t old_state  = e->state;
             bool     was_dirty  = (old_state == WMM_EXT_FREE_DIRTY);
@@ -202,37 +271,34 @@ static wmm_extent_t *extent_get(size_t npages) {
             return e;
         }
     }
+    return NULL;
+}
 
-    void *addr = window_map(npages);
-    if (addr == NULL)
-        return NULL;
+/* 锁内取块:池里没有就预留窗口。bumped 为真表示块还没映射 */
+static wmm_extent_t *extent_acquire_locked(size_t npages, bool *bumped) {
+    wmm_extent_t *e = extent_get(npages);
 
-    wmm_extent_t *e = ext_node_get();
+    *bumped = false;
     if (e == NULL) {
-        wmm_event_log(0xDB, NULL);
-        return NULL;
+        e = extent_reserve_bump_locked(npages);
+        if (e != NULL)
+            *bumped = true;
     }
-
-    e->addr    = addr;
-    e->npages  = npages;
-    e->state   = WMM_EXT_INUSE;
-    e->slab    = NULL;
-    e->next    = NULL;
-    e->sz_prev = NULL;
-    e->sz_next = NULL;
-    ar_insert_after(g_ar_tail, e);
     return e;
 }
 
-/* 释放 extent:清页表项,标脏并向前后合并。空闲邻块已挂在尺寸桶里,
-   合并前先摘桶、改完尺寸再按新块入桶。合并已 purge 的邻块时把它
-   重新计为脏页与 active,因为整段现在又可复用。 */
-static void extent_release(wmm_extent_t *e) {
+/* 块仍 INUSE 且调用方独占,锁外清页表项 */
+static void extent_clear_ptes(wmm_extent_t *e) {
     wmm_pte_t zero;
     zero.raw = 0;
     for (size_t pg = 0; pg < e->npages; pg++)
         wmm_pte_set((char *)e->addr + pg * WMM_PAGE, zero);
+}
 
+/* 释放 extent(页表已由调用方清零):标脏并向前后合并。空闲邻块已
+   挂在尺寸桶里,合并前先摘桶、改完尺寸再按新块入桶。合并已 purge
+   的邻块时把它重新计为脏页与 active,因为整段现在又可复用。 */
+static void extent_release(wmm_extent_t *e) {
     e->state   = WMM_EXT_FREE_DIRTY;
     e->slab    = NULL;
     e->sz_prev = NULL;
@@ -281,11 +347,18 @@ static void extent_release(wmm_extent_t *e) {
 /* 取 extent 并初始化 slab 头;失败时不动已分配的 sl 头 */
 wmm_slab_t *wmm_phys_alloc_slab_pages(wmm_slab_t *sl, szind_t i,
                                       size_t npages, bool guarded) {
+    bool bumped;
+
     pthread_mutex_lock(&g_ext_lock);
-    wmm_extent_t *e = extent_get(npages);
+    wmm_extent_t *e = extent_acquire_locked(npages, &bumped);
     pthread_mutex_unlock(&g_ext_lock);
     if (e == NULL)
         return NULL;
+
+    if (bumped && !window_map_extent(e)) {
+        extent_bump_rollback(e);
+        return NULL;
+    }
 
     if (guarded)
         wmm_slab_init_guard(sl, e->addr, i, npages);
@@ -353,6 +426,8 @@ void wmm_phys_free_slab(wmm_slab_t *sl) {
     if (e == NULL)
         return;
 
+    extent_clear_ptes(e);
+
     pthread_mutex_lock(&g_ext_lock);
     extent_release(e);
     pthread_mutex_unlock(&g_ext_lock);
@@ -376,28 +451,43 @@ wmm_extent_t *wmm_phys_alloc_extent(size_t size) {
     }
 
     size_t npages = (size + WMM_PAGE - 1) >> WMM_LG_PAGE;
+    bool   bumped;
 
     pthread_mutex_lock(&g_ext_lock);
-    wmm_extent_t *e = extent_get(npages);
-    if (e != NULL) {
+    wmm_extent_t *e = extent_acquire_locked(npages, &bumped);
+    if (e != NULL && !bumped) {
         g_large.live++;
-        g_large.live_bytes += npages * WMM_PAGE;
+        g_large.live_bytes += e->npages * WMM_PAGE;
     }
     pthread_mutex_unlock(&g_ext_lock);
 
+    if (e == NULL)
+        return NULL;
+
+    if (bumped) {
+        if (!window_map_extent(e)) {
+            extent_bump_rollback(e);
+            return NULL;
+        }
+        pthread_mutex_lock(&g_ext_lock);
+        g_large.live++;
+        g_large.live_bytes += e->npages * WMM_PAGE;
+        pthread_mutex_unlock(&g_ext_lock);
+    }
+
     /* 块已在锁内标成 INUSE,其他线程不可能取走;指针尚未交给调用方,
        PTE 批量写在锁外完成,缩短全局临界区 */
-    if (e != NULL) {
-        wmm_pte_t pte;
-        pte.raw = (uintptr_t)e | 1u;
-        for (size_t pg = 0; pg < npages; pg++)
-            wmm_pte_set((char *)e->addr + pg * WMM_PAGE, pte);
-    }
+    wmm_pte_t pte;
+    pte.raw = (uintptr_t)e | 1u;
+    for (size_t pg = 0; pg < e->npages; pg++)
+        wmm_pte_set((char *)e->addr + pg * WMM_PAGE, pte);
     return e;
 }
 
-/* 先清统计,再交给 extent_release 合并 */
+/* 锁外清页表;锁内清统计并交给 extent_release 合并 */
 void wmm_phys_free_extent(wmm_extent_t *ext) {
+    extent_clear_ptes(ext);
+
     pthread_mutex_lock(&g_ext_lock);
     g_large.live--;
     g_large.live_bytes -= ext->npages * WMM_PAGE;
@@ -425,6 +515,9 @@ size_t wmm_phys_audit(void) {
     for (unsigned si = 0; si < 2; si++) {
         for (unsigned b = 0; b < WMM_EXT_NBUCKETS; b++) {
             wmm_extent_t *prev = NULL;
+
+            if ((g_sz_free[si][b] != NULL) != sz_bmap_test(si, b))
+                bad++;
 
             for (wmm_extent_t *e = g_sz_free[si][b]; e != NULL;
                  e = e->sz_next) {
