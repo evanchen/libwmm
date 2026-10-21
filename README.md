@@ -88,6 +88,11 @@ p999_ns,p9999_ns,max_ns,reqs,req_per_sec,alloc_fail
 场景,避免前一轮的分配器存量污染 RSS。`BENCH_REQUESTS` 控制 server
 场景的请求总数(默认 200000)。
 
+尾延迟归因可用 `--server-big 0`、`--server-realloc 0`、
+`--server-session 0`、`--server-touch 0` 逐项关闭 server 的负载成分;
+关闭时随机流不变,可直接横向对照。每次 server 运行还会在 stderr 打印
+最慢请求的对象数、最大尺寸、调用数与标志位,不影响 CSV 行。
+
 ### 生产验证
 
 `make validate` 用 release 库跑一套带明确判定的生产验证,数据落在

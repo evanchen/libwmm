@@ -8,6 +8,10 @@
  *   server 模拟一次请求:取 1..6 个对象,少量 realloc,把一部分
  *          对象留在会话槽位里跨请求存活,周期性驱逐。
  *
+ * server 支持 --server-big/realloc/session/touch 0|1 四个诊断开关,
+ * 关闭时仍消耗同一串随机数,只跳过对应动作;每次运行把最慢请求的
+ * 尺寸、调用数与标志打印到 stderr,CSV 格式与默认负载不变。
+ *
  * 除 server 外,一次 op 定义为一次分配器调用(alloc 或 free),吞吐
  * 与分位都按调用计。server 的计时单位是一次请求(含请求内的全部
  * 分配器调用),CSV 里 ops 仍是分配器调用数、reqs 才是请求数,两者
@@ -122,6 +126,10 @@ typedef struct {
     uint64_t    requests;     /* server 场景的请求总数 */
     uint64_t    seed;         /* 全局种子;每个 worker 再派生 */
     bool        header;       /* 是否打印 CSV 表头 */
+    bool        srv_big;      /* server 是否包含 >=16KB 大对象 */
+    bool        srv_realloc;  /* server 是否执行 realloc */
+    bool        srv_session;  /* server 是否使用会话槽位 */
+    bool        srv_touch;    /* server 是否触碰已分配内存 */
 } bench_options_t;
 
 typedef struct {
@@ -141,6 +149,23 @@ typedef struct {
     size_t size;
 } server_obj_t;
 
+/* 最慢请求的构成,用于把尾延迟归因到具体路径;标志位见 SRV_* */
+#define SRV_REALLOC  0x1u
+#define SRV_GROW     0x2u
+#define SRV_SESSION  0x4u
+#define SRV_EVICT    0x8u
+#define SRV_FLUSH    0x10u
+#define SRV_ALLOCFAIL 0x20u
+
+typedef struct {
+    uint64_t ns;              /* 请求耗时 */
+    uint32_t n;               /* 请求内对象数 */
+    uint32_t max_size;        /* 最大单次请求尺寸 */
+    uint32_t big;             /* >=16KB 对象数 */
+    uint32_t calls;           /* 分配器调用数 */
+    uint32_t flags;           /* SRV_* 组合 */
+} server_slow_t;
+
 typedef struct {
     size_t        per;                    /* 本线程请求数 */
     uint64_t      seed;
@@ -149,6 +174,8 @@ typedef struct {
     atomic_int   *go;
     uint64_t      calls;                  /* 计时窗口内的分配器调用数 */
     uint64_t      req_count;              /* 已执行请求数,用于周期清会话 */
+    const bench_options_t *opt;
+    server_slow_t slow;                   /* 计时窗口内最慢的一次请求 */
     server_obj_t  req[SERVER_REQ_SLOTS];
     server_obj_t  sess[SERVER_SESS_SLOTS];
 } server_worker_t;
@@ -580,11 +607,12 @@ static bool run_mt(const bench_options_t *o) {
 }
 
 /* 1/64 走 16KB/64KB/256KB 大对象,其余按权重表落在 16B..14KB。
-   权重表的总和是 SERVER_SMALL_WEIGHT,循环减法比查累积表直观。 */
-static size_t server_pick_size(uint64_t *rng) {
+   关闭大对象时仍消耗同一次抽取,改按小对象表选取,保证不同开关组合
+   使用同一条随机流、工作负载可直接对照。 */
+static size_t server_pick_size(const bench_options_t *o, uint64_t *rng) {
     uint64_t r = rng_next(rng);
 
-    if ((r & 63u) == 0) {
+    if (o->srv_big && (r & 63u) == 0) {
         static const size_t big[] = { 16u << 10, 64u << 10, 256u << 10 };
         return big[(size_t)((r >> 8) % 3)];
     }
@@ -608,70 +636,99 @@ static void server_touch(void *p, size_t size) {
 
 /* 一次请求:取 1..6 个对象,1/8 概率 realloc,1/8 概率把一个对象
    移到会话槽位,剩余释放;每 64 次请求清空会话槽位。计时包含请求
-   内全部 alloc/realloc/free 与会话驱逐/周期清理。 */
+   内全部 alloc/realloc/free 与会话驱逐/周期清理。各开关关闭时仍按
+   原顺序抽取随机数,只跳过对应动作,便于不同变体逐项对照。 */
 static void server_request(server_worker_t *w, uint64_t *rng,
                            uint64_t *lat, size_t idx) {
+    const bench_options_t *o = w->opt;
     uint64_t a = now_ns();
     unsigned n = 1u + (unsigned)(rng_next(rng) % 6u);
+    unsigned calls = 0, big = 0, max_size = 0, flags = 0;
 
     for (unsigned i = 0; i < SERVER_REQ_SLOTS; i++)
         w->req[i].p = NULL;
 
     for (unsigned i = 0; i < n; i++) {
-        size_t sz = server_pick_size(rng);
+        size_t sz = server_pick_size(o, rng);
         void  *p  = g_alloc(sz);
+        calls++;
         w->calls++;
+        if (sz > max_size)
+            max_size = (unsigned)sz;
+        if (sz >= (16u << 10))
+            big++;
         if (p == NULL) {
+            flags |= SRV_ALLOCFAIL;
             atomic_fetch_add_explicit(&g_alloc_fail, 1,
                                       memory_order_relaxed);
             w->req[i].size = 0;
             continue;
         }
-        server_touch(p, sz);
+        if (o->srv_touch)
+            server_touch(p, sz);
         w->req[i].p    = p;
         w->req[i].size = sz;
     }
 
-    if ((rng_next(rng) & 7u) == 0) {
-        unsigned i = (unsigned)(rng_next(rng) % n);
-        if (w->req[i].p != NULL) {
-            size_t old = w->req[i].size;
-            size_t sz;
-            if ((rng_next(rng) & 1u) != 0)
-                sz = old > 64 ? old - old / 4 : old + 8;
-            else
-                sz = old + old / 4 + 8;
+    uint64_t r_re = rng_next(rng);
+    unsigned i_re = 0, dir_re = 0;
+    if ((r_re & 7u) == 0) {
+        i_re = (unsigned)(rng_next(rng) % n);
+        if (w->req[i_re].p != NULL)
+            dir_re = (unsigned)(rng_next(rng) & 1u);
+    }
+    if (o->srv_realloc && (r_re & 7u) == 0 && w->req[i_re].p != NULL) {
+        size_t old = w->req[i_re].size;
+        size_t sz;
 
-            void *q = g_realloc(w->req[i].p, sz);
-            w->calls++;
-            if (q == NULL) {
-                atomic_fetch_add_explicit(&g_alloc_fail, 1,
-                                          memory_order_relaxed);
-            } else {
+        if (dir_re != 0)
+            sz = old > 64 ? old - old / 4 : old + 8;
+        else
+            sz = old + old / 4 + 8;
+
+        if (sz > max_size)
+            max_size = (unsigned)sz;
+
+        void *q = g_realloc(w->req[i_re].p, sz);
+        calls++;
+        w->calls++;
+        flags |= dir_re == 0 ? (SRV_REALLOC | SRV_GROW) : SRV_REALLOC;
+        if (q == NULL) {
+            flags |= SRV_ALLOCFAIL;
+            atomic_fetch_add_explicit(&g_alloc_fail, 1,
+                                      memory_order_relaxed);
+        } else {
+            if (o->srv_touch)
                 server_touch(q, sz);
-                w->req[i].p    = q;
-                w->req[i].size = sz;
-            }
+            w->req[i_re].p    = q;
+            w->req[i_re].size = sz;
         }
     }
 
-    if ((rng_next(rng) & 7u) == 0) {
-        unsigned i = (unsigned)(rng_next(rng) % n);
-        if (w->req[i].p != NULL) {
-            unsigned s = (unsigned)(rng_next(rng) % SERVER_SESS_SLOTS);
-            if (w->sess[s].p != NULL) {
-                g_free(w->sess[s].p);
-                w->calls++;
-            }
-            w->sess[s] = w->req[i];
-            w->req[i].p = NULL;
-            w->req[i].size = 0;
+    uint64_t r_se = rng_next(rng);
+    unsigned i_se = 0, s_se = 0;
+    if ((r_se & 7u) == 0) {
+        i_se = (unsigned)(rng_next(rng) % n);
+        if (w->req[i_se].p != NULL)
+            s_se = (unsigned)(rng_next(rng) % SERVER_SESS_SLOTS);
+    }
+    if (o->srv_session && (r_se & 7u) == 0 && w->req[i_se].p != NULL) {
+        flags |= SRV_SESSION;
+        if (w->sess[s_se].p != NULL) {
+            g_free(w->sess[s_se].p);
+            calls++;
+            w->calls++;
+            flags |= SRV_EVICT;
         }
+        w->sess[s_se] = w->req[i_se];
+        w->req[i_se].p = NULL;
+        w->req[i_se].size = 0;
     }
 
     for (unsigned i = 0; i < n; i++) {
         if (w->req[i].p != NULL) {
             g_free(w->req[i].p);
+            calls++;
             w->calls++;
             w->req[i].p = NULL;
         }
@@ -682,14 +739,27 @@ static void server_request(server_worker_t *w, uint64_t *rng,
         for (unsigned s = 0; s < SERVER_SESS_SLOTS; s++) {
             if (w->sess[s].p != NULL) {
                 g_free(w->sess[s].p);
+                calls++;
                 w->calls++;
+                flags |= SRV_FLUSH;
                 w->sess[s].p = NULL;
             }
         }
     }
 
-    if (lat != NULL)
-        lat[idx] = now_ns() - a;
+    if (lat != NULL) {
+        uint64_t dt = now_ns() - a;
+
+        lat[idx] = dt;
+        if (dt > w->slow.ns) {
+            w->slow.ns       = dt;
+            w->slow.n        = n;
+            w->slow.max_size = max_size;
+            w->slow.big      = big;
+            w->slow.calls    = calls;
+            w->slow.flags    = flags;
+        }
+    }
 }
 
 static void *server_worker(void *arg) {
@@ -753,7 +823,12 @@ static bool run_server(const bench_options_t *o) {
     atomic_int go = 0;
     unsigned created = 0;
 
+    fprintf(stderr, "bench: server config big=%u realloc=%u session=%u "
+            "touch=%u threads=%u\n", o->srv_big, o->srv_realloc,
+            o->srv_session, o->srv_touch, o->threads);
+
     for (unsigned i = 0; i < o->threads; i++) {
+        workers[i].opt   = o;
         workers[i].per   = per;
         workers[i].seed  = make_seed(o->seed, 64 + i);
         workers[i].lat   = lat + (size_t)i * per;
@@ -788,7 +863,12 @@ static bool run_server(const bench_options_t *o) {
 
     uint64_t calls = 0;
     for (unsigned i = 0; i < o->threads; i++) {
+        const server_slow_t *s = &workers[i].slow;
+
         calls += workers[i].calls;
+        fprintf(stderr, "bench: server slowest t%u %" PRIu64 "ns n=%u "
+                "max=%u big=%u calls=%u flags=0x%x\n", i, s->ns, s->n,
+                s->max_size, s->big, s->calls, s->flags);
         server_free_state(&workers[i]);
     }
 
@@ -809,6 +889,10 @@ static void usage(FILE *out) {
         "  --ops N           seq/mt/mixed 的分配器调用总数(默认 1000000)\n"
         "  --large-ops N     large 场景的调用数(默认 5000)\n"
         "  --requests N      server 场景的请求总数(默认 200000)\n"
+        "  --server-big 0|1  server 是否含 >=16KB 大对象(默认 1)\n"
+        "  --server-realloc 0|1  server 是否执行 realloc(默认 1)\n"
+        "  --server-session 0|1  server 是否使用会话槽位(默认 1)\n"
+        "  --server-touch 0|1    server 是否触碰已分配内存(默认 1)\n"
         "  --seed N          随机种子,必须非 0\n"
         "  --no-header       不打印 CSV 表头\n"
         "  --help            显示本帮助\n");
@@ -846,6 +930,10 @@ int main(int argc, char **argv) {
         .requests  = 200000,
         .seed      = 0x9E3779B97F4A7C15ull,
         .header    = true,
+        .srv_big     = true,
+        .srv_realloc = true,
+        .srv_session = true,
+        .srv_touch   = true,
     };
 
     if (strcmp(opt.impl, "wmm") != 0 && strcmp(opt.impl, "glibc") != 0) {
@@ -883,6 +971,26 @@ int main(int argc, char **argv) {
         } else if (strcmp(a, "--requests") == 0 && i + 1 < argc) {
             if (parse_u64(argv[++i], 64, 20000000, &opt.requests) != 0)
                 goto bad_arg;
+        } else if (strcmp(a, "--server-big") == 0 && i + 1 < argc) {
+            uint64_t v;
+            if (parse_u64(argv[++i], 0, 1, &v) != 0)
+                goto bad_arg;
+            opt.srv_big = v != 0;
+        } else if (strcmp(a, "--server-realloc") == 0 && i + 1 < argc) {
+            uint64_t v;
+            if (parse_u64(argv[++i], 0, 1, &v) != 0)
+                goto bad_arg;
+            opt.srv_realloc = v != 0;
+        } else if (strcmp(a, "--server-session") == 0 && i + 1 < argc) {
+            uint64_t v;
+            if (parse_u64(argv[++i], 0, 1, &v) != 0)
+                goto bad_arg;
+            opt.srv_session = v != 0;
+        } else if (strcmp(a, "--server-touch") == 0 && i + 1 < argc) {
+            uint64_t v;
+            if (parse_u64(argv[++i], 0, 1, &v) != 0)
+                goto bad_arg;
+            opt.srv_touch = v != 0;
         } else if (strcmp(a, "--seed") == 0 && i + 1 < argc) {
             if (parse_u64(argv[++i], 1, UINT64_MAX, &opt.seed) != 0)
                 goto bad_arg;
