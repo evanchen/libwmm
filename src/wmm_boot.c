@@ -289,6 +289,7 @@ struct wmm_base_block_s {
 #define WMM_BASE_HDR ((sizeof(wmm_base_block_t) + 7u) & ~(size_t)7)
 
 static wmm_base_block_t *g_base_cur;
+static size_t            g_base_map_bytes;
 
 /* 8 字节对齐的 bump 分配;返回 NULL 表示映射失败或注入故障 */
 void *wmm_base_alloc(size_t size) {
@@ -323,10 +324,19 @@ void *wmm_base_alloc(size_t size) {
         b->used = 0;
         b->cap  = cap - WMM_BASE_HDR;
         g_base_cur = b;
+        g_base_map_bytes += cap;
     }
 
     char *p = (char *)b + WMM_BASE_HDR + b->used;
     b->used += size;
     pthread_mutex_unlock(&g_base_lock);
     return p;
+}
+
+/* 已映射元数据块总字节数;只增,供验证工具观察元数据开销 */
+size_t wmm_base_bytes(void) {
+    pthread_mutex_lock(&g_base_lock);
+    size_t n = g_base_map_bytes;
+    pthread_mutex_unlock(&g_base_lock);
+    return n;
 }

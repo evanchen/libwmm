@@ -852,7 +852,7 @@ int main(int argc, char **argv) {
         fprintf(csv, "elapsed_s,phase,live_bytes,active_bytes,frag_bytes,"
                 "high_water_live,live_objects,rss_kb,cached_objs,ops,"
                 "guard_events,leak_events,oom_events,purge_events,"
-                "other_events\n");
+                "other_events,window_kb,base_kb\n");
     }
 
     pthread_t churn_tid;
@@ -900,6 +900,8 @@ int main(int argc, char **argv) {
     uint64_t peak_live = 0;
     uint64_t peak_rss = 0;
     uint64_t peak_cached = 0;
+    uint64_t peak_window_kb = 0;
+    uint64_t peak_base_kb = 0;
     uint64_t ramp_rss = 0;
     bool     ramp_rss_set = false;
     bool     rss_gate_noted = false;
@@ -982,6 +984,18 @@ int main(int argc, char **argv) {
         if (rss > peak_rss)
             peak_rss = rss;
 
+        /* 窗口 bump 只增不减:它的高水位决定页表常驻页(RSS),
+           与 live/active 脱钩,必须单独观测 */
+        uint64_t window_kb =
+            (uint64_t)((char *)g_heap_cur - (char *)g_heap_base) >> 10;
+        if (window_kb > peak_window_kb)
+            peak_window_kb = window_kb;
+
+        /* 元数据块同样只增不还,与 live 脱钩 */
+        uint64_t base_kb = (uint64_t)(wmm_base_bytes() >> 10);
+        if (base_kb > peak_base_kb)
+            peak_base_kb = base_kb;
+
         uint64_t cached = wmm_tcache_cached_total();
         if (cached > peak_cached)
             peak_cached = cached;
@@ -1011,13 +1025,13 @@ int main(int argc, char **argv) {
             fprintf(csv, "%" PRIu64 ",%s,%" PRIu64 ",%" PRIu64 ",%" PRIu64
                     ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
                     ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
-                    ",%" PRIu64 ",%" PRIu64 "\n",
+                    ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
                     (uint64_t)(elapsed_ns / 1000000000ull),
                     soak_phase_name(ph),
                     st.live_bytes, st.active_bytes, st.frag_bytes,
                     st.high_water_live, st.live_objects, rss, cached,
                     soak_total_ops(), ev_guard, ev_leak, ev_oom, ev_purge,
-                    ev_other);
+                    ev_other, window_kb, base_kb);
             fflush(csv);
         }
     }
@@ -1106,11 +1120,12 @@ int main(int argc, char **argv) {
     printf("SOAK_RESULT: %s seconds=%" PRIu64 " threads=%u ops=%" PRIu64
            " peak_live=%" PRIu64 " peak_rss_kb=%" PRIu64
            " peak_cached=%" PRIu64 " cached_final=%" PRIu64
+           " peak_window_kb=%" PRIu64 " peak_base_kb=%" PRIu64
            " leak_warnings=%" PRIu64 " purge_events=%" PRIu64
            " failures=%u\n",
            failures == 0 ? "PASS" : "FAIL", elapsed_sec, cfg.threads, ops,
-           peak_live, peak_rss, peak_cached, cached_final, ev_leak,
-           ev_purge, failures);
+           peak_live, peak_rss, peak_cached, cached_final, peak_window_kb,
+           peak_base_kb, ev_leak, ev_purge, failures);
 
     return failures == 0 ? 0 : 1;
 }

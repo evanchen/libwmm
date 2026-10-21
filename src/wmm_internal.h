@@ -383,6 +383,7 @@ extern _Atomic unsigned g_fault_after;
 bool wmm_fault_check(unsigned site);
 
 void *wmm_base_alloc(size_t size);              /* 元数据 bump 分配 */
+size_t wmm_base_bytes(void);                    /* 已映射元数据字节数 */
 
 void wmm_dprintf(const char *fmt, ...);
 
