@@ -504,6 +504,13 @@ static void *alloc_aligned(size_t alignment, size_t size) {
         return wmm_alloc(size);
 
     if (alignment <= WMM_PAGE) {
+        /* 向上取整前先挡住加法回绕;size 为 0 时按一个 alignment
+           分配,否则会落进更小的尺寸类、指针不满足对齐 */
+        if (size == 0)
+            size = alignment;
+        else if (size > SIZE_MAX - (alignment - 1))
+            return NULL;
+
         size_t rounded = (size + alignment - 1) & ~(alignment - 1);
         return wmm_alloc(rounded);
     }

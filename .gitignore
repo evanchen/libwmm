@@ -11,6 +11,10 @@ build/
 *.profdata
 bench/bench
 
+# ---- python ----
+__pycache__/
+*.pyc
+
 # ---- editor / OS ----
 .vscode/
 .idea/

@@ -226,6 +226,22 @@ static void check_aligned(void) {
        小值;挡不住就按小分配成功,挡住了应报 ENOMEM */
     CHECK(wmm_posix_memalign(&m, (size_t)1 << 62, SIZE_MAX - 100) == ENOMEM);
 
+    /* 档 2 的取整同样会回绕,必须在加法前挡住;size 为 0 时不能
+       落到 8B 类,否则返回的指针不满足请求的对齐 */
+    errno = 0;
+    CHECK(wmm_aligned_alloc(4096, SIZE_MAX) == NULL && errno == ENOMEM);
+    m = (void *)0x1;
+    CHECK(wmm_posix_memalign(&m, 4096, SIZE_MAX) == ENOMEM && m == NULL);
+
+    unsigned char *z = wmm_aligned_alloc(4096, 0);
+    CHECK(z != NULL && ((uintptr_t)z & 4095u) == 0);
+    wmm_free(z);
+
+    m = (void *)0x1;
+    CHECK(wmm_posix_memalign(&m, 4096, 0) == 0);
+    CHECK(m != NULL && ((uintptr_t)m & 4095u) == 0);
+    wmm_free(m);
+
     /* 档 2 依据的穷举证明:16..4096 全部 2 的幂 alignment 的全部
        倍数,最小上界类的规格必是 alignment 的倍数。类表一旦改坏
        (或有人动了取整逻辑),这里立刻炸——比抽测可靠。 */

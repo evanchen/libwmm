@@ -20,14 +20,16 @@
 make debug     # -O0 -g -fsanitize=address,undefined,跑测试用
 make release   # -O2,产物在 build/release/
 make test      # 白盒用例 + --wrap 冒烟与符号审计
+make tsan      # 数据竞争检查(独立的 build/tsan)
 make bench     # wmm 与 glibc 的同负载对照表
+make validate  # 生产验证基座(压测/soak/fork/OOM/cgroup 门禁)
 make monitor   # 独立只读监控进程(不链接 libwmm)
 make playbook  # 七类症状演练负载
 ```
 
 产物:`build/{debug,release}/libwmm.a`、`build/release/libwmm.so`、
 `build/test/run`、`build/test/wrap`、`build/monitor/monitor`、
-`build/bench/bench`、`build/demo/playbook`。
+`build/bench/bench`、`build/demo/playbook`、`build/validate/`。
 
 ## 使用
 
@@ -70,8 +72,58 @@ make bench
 ```
 
 场景:`seq`(单线程分配/释放)、`mt`(多线程随机槽位)、
-`mixed`(大小混合)、`large`(16 KiB~1 MiB)。输出
-`impl,scenario,ops,seconds,ops_per_sec,p50_ns,p99_ns,rss_kb`。
+`mixed`(大小混合)、`large`(16 KiB~1 MiB)、`server`(模拟请求:
+1~6 个对象、少量 realloc、会话槽位跨请求存活)。输出 14 列:
+
+```
+impl,scenario,ops,seconds,ops_per_sec,p50_ns,p99_ns,rss_kb,
+p999_ns,p9999_ns,max_ns,reqs,req_per_sec,alloc_fail
+```
+
+前 8 列含义不变。`server` 的延迟单位是一次请求,`reqs`/`req_per_sec`
+是请求数与请求吞吐;其余场景的计时单位是一次分配器调用,`reqs` 等于
+`ops`。`alloc_fail` 非零表示本轮压测少做了工作,结果不可信。
+
+`make bench` 把每个实现/场景拆成独立进程运行,并在同一进程只跑一个
+场景,避免前一轮的分配器存量污染 RSS。`BENCH_REQUESTS` 控制 server
+场景的请求总数(默认 200000)。
+
+### 生产验证
+
+`make validate` 用 release 库跑一套带明确判定的生产验证,数据落在
+`build/validate/`:
+
+```sh
+make validate        # 约 1-2 分钟:bench + 60s soak + fork + OOM + cgroup
+make validate-full   # soak 30 分钟、bench 重复 3 次取中位数
+```
+
+单独运行:
+
+```sh
+make soak SOAK_SECONDS=3600 SOAK_ARGS="--threads 8"
+make forkstress FORK_ARGS="--seconds 30 --forks 300"
+make oomcheck
+make cgroup-oom CGROUP_ARGS="--live-mb 64 --max-mb 192 --seconds 5"
+```
+
+| 工具 | 检查 |
+|---|---|
+| `validate/soak.c` | 分阶段升降负载、跨线程释放、线程 churn;每秒快照不变式、事件环、RSS 增长上限;结束时 live/active/缓存归零 |
+| `validate/forkstress.c` | 活跃分配与统计压力下反复 fork;子进程校验快照后 `_exit`;专用 forker 线程与主线程 fork 两种形态;guard 模式另跑一轮 |
+| `validate/oomcheck.c` | 用 64 MB extent 填满真实 64 GB 窗口;检查 NULL/ENOMEM 契约、旧块在 realloc 失败后完好、释放后可复用;子进程验证 `abort_oom` 的 SIGABRT |
+| `validate/cgroup_oom.sh` | cgroup v2 限额内 bounded 探针,检查退出码、oom_kill、memory.peak;无权限时 SKIP(77) |
+| `validate/gate.py` | 编排上述进程,硬门禁:退出码、alloc_fail、server p999 尾延迟、各工具 PASS、cgroup 结果 |
+
+默认硬门禁不比较吞吐排名,只抓病态:server p999 必须不超过
+`max(10 ms, 10 × glibc p999)`;p9999/max 与吞吐比只进报告。
+`--strict-perf` 可把吞吐比也纳入门禁。cgroup 不可用时报告 SKIP,
+`make cgroup-oom REQUIRE_CGROUP=1` 或 gate 的 `--require-cgroup`
+会把 SKIP 当失败,避免“没测”被当成“通过”。
+
+`build/validate/report.txt` 一行一个门禁,`report.json` 带主机、
+参数、bench 行、对比数据与门禁明细;`bench.csv`、`soak.csv` 与各
+进程日志同目录留存。
 
 ### 问题定位演练
 

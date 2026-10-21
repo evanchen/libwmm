@@ -7,7 +7,9 @@
 #                              内联优化掉、绕过 wrap
 # 产物:libwmm.a(debug/release 各一套)+ release 的 libwmm.so。
 # 用法:make debug | make release | make test | make tsan | make bench |
-#       make monitor | make playbook | make clean
+#       make monitor | make playbook | make clean |
+#       make validate | make soak | make forkstress | make oomcheck |
+#       make cgroup-oom | make validate-full
 
 # CC 用直接赋值而不是条件赋值:make 对 CC 内建有 cc 默认值,而 ?= 只在
 # 变量未定义时才生效、内建默认也算"已定义",于是 CC ?= gcc 永远解析
@@ -43,7 +45,9 @@ BUILD_DEBUG   := build/debug
 BUILD_RELEASE := build/release
 BUILD_TSAN    := build/tsan
 
-.PHONY: all debug release test tsan bench monitor playbook clean
+.PHONY: all debug release test tsan bench monitor playbook clean \
+        validate-bin soak forkstress oomcheck cgroup-oom validate \
+        validate-full
 
 all: release
 
@@ -161,13 +165,81 @@ $(BENCH_BIN): bench/bench.c $(BUILD_RELEASE)/libwmm.a $(HDRS)
 	    $(BUILD_RELEASE)/libwmm.a -lpthread
 
 bench: release $(BENCH_BIN)
-	@echo "impl,scenario,ops,seconds,ops_per_sec,p50_ns,p99_ns,rss_kb"
-	@for sc in seq mt mixed large; do \
+	@echo "impl,scenario,ops,seconds,ops_per_sec,p50_ns,p99_ns,rss_kb,p999_ns,p9999_ns,max_ns,reqs,req_per_sec,alloc_fail"
+	@for sc in seq mt mixed large server; do \
 	    for impl in wmm glibc; do \
 	        ./$(BENCH_BIN) $$impl --scenario $$sc --no-header \
-	            $(BENCH_ARGS) || exit 1; \
+	            --requests $(BENCH_REQUESTS) $(BENCH_ARGS) || exit 1; \
 	    done; \
 	done
+
+# 生产验证基座。所有探针链接 release 库,不挂 sanitizer:压测关注
+# 的是真实吞吐与 RSS,ASan 的 shadow 与插桩会改变两者,竞态与越界
+# 由 make test / make tsan 覆盖。
+#
+# 每个探针的参数都可以用变量追加;SOAK_ARGS 例如
+#   make soak SOAK_SECONDS=3600 SOAK_ARGS="--threads 8"
+VALIDATE_DIR    := build/validate
+VALIDATE_CFLAGS := $(CFLAGS_RELEASE)
+VALIDATE_BINS   := $(VALIDATE_DIR)/soak $(VALIDATE_DIR)/forkstress \
+                   $(VALIDATE_DIR)/oomcheck
+
+SOAK_SECONDS  ?= 60
+BENCH_REQUESTS ?= 200000
+SOAK_ARGS     ?=
+FORK_ARGS     ?=
+OOM_ARGS      ?=
+CGROUP_ARGS   ?=
+VALIDATE_ARGS ?=
+
+$(VALIDATE_DIR):
+	mkdir -p $@
+
+$(VALIDATE_DIR)/%: validate/%.c validate/validate_common.h \
+                    $(BUILD_RELEASE)/libwmm.a $(HDRS) | $(VALIDATE_DIR)
+	$(CC) $(VALIDATE_CFLAGS) $< -o $@ $(BUILD_RELEASE)/libwmm.a -lpthread
+
+validate-bin: $(VALIDATE_BINS)
+
+soak: release $(VALIDATE_DIR)/soak
+	./$(VALIDATE_DIR)/soak --seconds $(SOAK_SECONDS) $(SOAK_ARGS)
+
+forkstress: release $(VALIDATE_DIR)/forkstress
+	./$(VALIDATE_DIR)/forkstress $(FORK_ARGS)
+
+oomcheck: release $(VALIDATE_DIR)/oomcheck
+	./$(VALIDATE_DIR)/oomcheck --window-fill $(OOM_ARGS)
+
+cgroup-oom: release $(VALIDATE_DIR)/oomcheck
+	@bash validate/cgroup_oom.sh --probe $(VALIDATE_DIR)/oomcheck \
+	    $(CGROUP_ARGS); \
+	rc=$$?; \
+	if [ $$rc -eq 77 ] && [ "$${REQUIRE_CGROUP:-0}" != 1 ]; then \
+	    echo "cgroup: SKIP (无 cgroup v2 memory 权限,也没有可用的 systemd)"; \
+	    exit 0; \
+	fi; \
+	exit $$rc
+
+validate: release $(BENCH_BIN) validate-bin
+	@mkdir -p $(VALIDATE_DIR)
+	python3 validate/gate.py --bench-bin $(BENCH_BIN) \
+	    --soak-bin $(VALIDATE_DIR)/soak \
+	    --fork-bin $(VALIDATE_DIR)/forkstress \
+	    --oom-bin $(VALIDATE_DIR)/oomcheck \
+	    --out-dir $(VALIDATE_DIR) \
+	    --bench-requests $(BENCH_REQUESTS) \
+	    $(VALIDATE_ARGS)
+
+validate-full: release $(BENCH_BIN) validate-bin
+	@mkdir -p $(VALIDATE_DIR)
+	python3 validate/gate.py --bench-bin $(BENCH_BIN) \
+	    --soak-bin $(VALIDATE_DIR)/soak \
+	    --fork-bin $(VALIDATE_DIR)/forkstress \
+	    --oom-bin $(VALIDATE_DIR)/oomcheck \
+	    --out-dir $(VALIDATE_DIR) \
+	    --bench-requests $(BENCH_REQUESTS) \
+	    --soak-seconds 1800 --repeats 3 \
+	    $(VALIDATE_ARGS)
 
 # 演练负载用 release 库:故障模式故意写坏内存,ASan 会抢在分配器
 # 之前终止进程。-no-pie 让事件与采样里的 pc 与文件虚拟地址一致,

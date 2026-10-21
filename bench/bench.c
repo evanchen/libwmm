@@ -1,15 +1,19 @@
 /* bench.c —— libwmm 与 glibc malloc 的同负载对照基准
  *
- * 四种场景共用一套负载代码,分配器经函数指针选择:
+ * 五种场景共用一套负载代码,分配器经函数指针选择:
  *   seq    单线程顺序:反复 alloc(64) 后立即 free;
  *   mt     N 个线程各自在随机槽位上 alloc/free,槽位与随机流互不共享;
  *   mixed  单线程大小混合:尺寸在 36 个小对象类里随机取;
- *   large  单线程大对象:16KB/64KB/256KB/1MB 随机,逐页触碰。
+ *   large  单线程大对象:16KB/64KB/256KB/1MB 随机,逐页触碰;
+ *   server 模拟一次请求:取 1..6 个对象,少量 realloc,把一部分
+ *          对象留在会话槽位里跨请求存活,周期性驱逐。
  *
- * 一次 op 定义为一次分配器调用(alloc 或 free),因此吞吐与 p50/p99
- * 都按调用计,场景之间可以直接比较。延迟在每次调用前后各读一次
- * CLOCK_MONOTONIC,含两次时钟读取的固定开销(约几十纳秒),两个
- * 分配器付同样的代价。
+ * 除 server 外,一次 op 定义为一次分配器调用(alloc 或 free),吞吐
+ * 与分位都按调用计。server 的计时单位是一次请求(含请求内的全部
+ * 分配器调用),CSV 里 ops 仍是分配器调用数、reqs 才是请求数,两者
+ * 都输出,避免把"请求吞吐"和"调用吞吐"混为一谈。延迟在计时单位
+ * 前后各读一次 CLOCK_MONOTONIC,含两次时钟读取的固定开销(约几十
+ * 纳秒),两个分配器付同样的代价。
  *
  * 为什么要函数指针:同一份循环既跑 wmm_alloc 也跑 malloc,编译器
  * 无法在编译期把某一对调用折叠掉;两个实现走完全相同的代码路径,
@@ -23,18 +27,21 @@
  * 随机槽位而不是扫描空位:占用率才能在中间均衡,缓存水位有涨有落,
  * 不会一直钉在"全空"或"全满"的边界上。
  *
- * 输出 CSV 表头:impl,scenario,ops,seconds,ops_per_sec,p50_ns,p99_ns,
- * rss_kb。默认一次跑四个场景;Makefile 把每个实现/场景拆成独立进程
- * 调用,--scenario 只跑一个,这样每行的 RSS 不含前一个场景留下的
- * 分配器存量,横向可比。
+ * 输出 CSV:前 8 列保持旧格式,新列追加在 rss_kb 之后:
+ *   impl,scenario,ops,seconds,ops_per_sec,p50_ns,p99_ns,rss_kb,
+ *   p999_ns,p9999_ns,max_ns,reqs,req_per_sec,alloc_fail
+ * 默认一次跑五个场景;Makefile 把每个实现/场景拆成独立进程调用,
+ * --scenario 只跑一个,这样每行的 RSS 不含前一个场景留下的分配器
+ * 存量,横向可比。
  *
  * RSS 口径是"默认保留策略":wmm 模式不启动后台 purge 线程,glibc
  * 也不主动 trim,两边都把释放后的页留在各自缓存里。这不是要比较
  * 谁更省 RSS,而是让同一场景下的驻留差异反映分配策略本身。
  *
  * 用法:
- *   bench <wmm|glibc> [--scenario seq|mt|mixed|large|all]
- *         [--threads N] [--ops N] [--large-ops N] [--seed N] [--no-header]
+ *   bench <wmm|glibc> [--scenario seq|mt|mixed|large|server|all]
+ *         [--threads N] [--ops N] [--large-ops N] [--requests N]
+ *         [--seed N] [--no-header]
  */
 #include "wmm.h"
 
@@ -54,10 +61,12 @@
 
 typedef void *(*alloc_fn_t)(size_t);
 typedef void  (*free_fn_t)(void *);
+typedef void *(*realloc_fn_t)(void *, size_t);
 
-/* 被测分配器的入口;启动时二选一,之后所有场景只认这两个指针 */
-static alloc_fn_t g_alloc;
-static free_fn_t  g_free;
+/* 被测分配器的入口;启动时二选一,之后所有场景只认这三个指针 */
+static alloc_fn_t   g_alloc;
+static free_fn_t    g_free;
+static realloc_fn_t g_realloc;
 
 static const char *g_impl;            /* 当前实现名,写进结果行 */
 static const char *g_bench_scenario;  /* 当前场景名,写进结果行 */
@@ -71,7 +80,25 @@ enum {
     MT_SLOTS     = 512,   /* 多线程场景每线程的随机槽位数 */
     SINGLE_SLOTS = 512,   /* 大小混合场景的槽位数 */
     LARGE_SLOTS  = 32,    /* 大对象场景同时在手的对象数 */
+    SERVER_REQ_SLOTS   = 8,     /* 一次请求内同时在手的对象数 */
+    SERVER_SESS_SLOTS  = 64,    /* 跨请求存活的会话槽位数 */
+    SERVER_WARMUP      = 1000,  /* 计时前每线程的请求数 */
+    SERVER_FLUSH_EVERY = 64,    /* 每 N 次请求清空一次会话槽位 */
 };
+
+/* server 场景的小对象权重:多数请求落在 16B..4KB,少量到 14KB。
+   大对象用 1/64 的独立分支选择,避免权重表被三项大数主导。 */
+static const struct {
+    uint16_t size;
+    uint8_t  weight;
+} g_server_small[] = {
+    {   16,  8 }, {   32, 12 }, {   48, 10 }, {   64, 14 },
+    {   96,  9 }, {  128, 12 }, {  192,  8 }, {  256, 10 },
+    {  384,  6 }, {  512,  8 }, {  768,  5 }, { 1024,  7 },
+    { 1536,  4 }, { 2048,  5 }, { 3072,  3 }, { 4096,  4 },
+    { 5120,  2 }, { 8192,  2 }, {12288,  1 }, {14336,  1 },
+};
+#define SERVER_SMALL_WEIGHT 131u
 
 /* 小对象尺寸取自尺寸类边界附近与边界之间:既覆盖精确落类,也覆盖
    向上取整,避免只测到整齐尺寸的理想路径 */
@@ -88,21 +115,43 @@ static const size_t g_large_sizes[] = {
 
 typedef struct {
     const char *impl;         /* "wmm" 或 "glibc",只用于输出 */
-    const char *scenario;     /* seq/mt/mixed/large/all */
-    unsigned    threads;      /* mt 场景的线程数 */
+    const char *scenario;     /* seq/mt/mixed/large/server/all */
+    unsigned    threads;      /* mt/server 场景的线程数 */
     uint64_t    ops;          /* seq/mt/mixed 的分配器调用总数 */
     uint64_t    large_ops;    /* large 场景的调用数 */
+    uint64_t    requests;     /* server 场景的请求总数 */
     uint64_t    seed;         /* 全局种子;每个 worker 再派生 */
     bool        header;       /* 是否打印 CSV 表头 */
 } bench_options_t;
 
 typedef struct {
     uint64_t calls;           /* 完成的分配器调用数 */
+    uint64_t reqs;            /* 计时单位数:调用场景=calls,server=请求数 */
     double   seconds;         /* 计时窗口的墙钟秒数 */
-    uint64_t p50_ns;          /* 调用延迟中位数 */
-    uint64_t p99_ns;          /* 调用延迟 99% 分位 */
+    uint64_t p50_ns;          /* 计时单位延迟中位数 */
+    uint64_t p99_ns;          /* 99% 分位 */
+    uint64_t p999_ns;         /* 99.9% 分位 */
+    uint64_t p9999_ns;        /* 99.99% 分位 */
+    uint64_t max_ns;          /* 最慢一次 */
     uint64_t rss_kb;          /* 元数据释放后的进程 RSS */
 } bench_result_t;
+
+typedef struct {
+    void  *p;
+    size_t size;
+} server_obj_t;
+
+typedef struct {
+    size_t        per;                    /* 本线程请求数 */
+    uint64_t      seed;
+    uint64_t     *lat;                    /* per 个请求延迟样本 */
+    atomic_int   *ready;
+    atomic_int   *go;
+    uint64_t      calls;                  /* 计时窗口内的分配器调用数 */
+    uint64_t      req_count;              /* 已执行请求数,用于周期清会话 */
+    server_obj_t  req[SERVER_REQ_SLOTS];
+    server_obj_t  sess[SERVER_SESS_SLOTS];
+} server_worker_t;
 
 typedef struct {
     size_t      per;          /* 本线程负责的调用数 */
@@ -205,31 +254,41 @@ static uint64_t percentile(const uint64_t *sorted, size_t n, double p) {
 }
 
 /* 收尾统一在这里做:排序、取百分位、释放延迟数组、读 RSS。顺序
-   很重要——先 unmap 延迟数组再读 RSS,否则基准自己的 8MB 数组会被
+   很重要——先 unmap 延迟数组再读 RSS,否则基准自己的延迟数组会被
    算进两个分配器的 RSS,淹没真正想看的差异 */
 static bench_result_t finish_result(uint64_t *lat, size_t n,
+                                    uint64_t calls, uint64_t reqs,
                                     uint64_t t0, uint64_t t1) {
     bench_result_t r;
 
     qsort(lat, n, sizeof(*lat), cmp_u64);
-    r.calls   = n;
-    r.seconds = (double)(t1 - t0) / 1e9;
+    r.calls    = calls;
+    r.reqs     = reqs;
+    r.seconds  = (double)(t1 - t0) / 1e9;
     if (!(r.seconds > 0.0))
         r.seconds = 1e-9;
-    r.p50_ns  = percentile(lat, n, 50.0);
-    r.p99_ns  = percentile(lat, n, 99.0);
+    r.p50_ns   = percentile(lat, n, 50.0);
+    r.p99_ns   = percentile(lat, n, 99.0);
+    r.p999_ns  = percentile(lat, n, 99.9);
+    r.p9999_ns = percentile(lat, n, 99.99);
+    r.max_ns   = n != 0 ? lat[n - 1] : 0;
     bench_unmap(lat, n * sizeof(*lat));
-    r.rss_kb  = rss_kb();
+    r.rss_kb   = rss_kb();
     return r;
 }
 
 static void report_row(const bench_result_t *r) {
     double ops_ps = (double)r->calls / r->seconds;
+    double req_ps = (double)r->reqs / r->seconds;
+    uint64_t fails = atomic_load_explicit(&g_alloc_fail,
+                                          memory_order_relaxed);
 
     printf("%s,%s,%" PRIu64 ",%.6f,%.0f,%" PRIu64 ",%" PRIu64 ",%" PRIu64
+           ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%.0f,%" PRIu64
            "\n",
            g_impl, g_bench_scenario, r->calls, r->seconds, ops_ps,
-           r->p50_ns, r->p99_ns, r->rss_kb);
+           r->p50_ns, r->p99_ns, r->rss_kb, r->p999_ns, r->p9999_ns,
+           r->max_ns, r->reqs, req_ps, fails);
     fflush(stdout);
 }
 
@@ -272,7 +331,7 @@ static bool run_seq(const bench_options_t *o) {
     }
     uint64_t t1 = now_ns();
 
-    bench_result_t r = finish_result(lat, calls, t0, t1);
+    bench_result_t r = finish_result(lat, calls, calls, calls, t0, t1);
     g_bench_scenario = "seq";
     report_row(&r);
     return true;
@@ -330,7 +389,7 @@ static bool run_mixed(const bench_options_t *o) {
             g_free(slots[s]);
     bench_unmap(slots, SINGLE_SLOTS * sizeof(*slots));
 
-    bench_result_t r = finish_result(lat, calls, t0, t1);
+    bench_result_t r = finish_result(lat, calls, calls, calls, t0, t1);
     g_bench_scenario = "mixed";
     report_row(&r);
     return true;
@@ -388,7 +447,7 @@ static bool run_large(const bench_options_t *o) {
             g_free(slots[s]);
     bench_unmap(slots, LARGE_SLOTS * sizeof(*slots));
 
-    bench_result_t r = finish_result(lat, calls, t0, t1);
+    bench_result_t r = finish_result(lat, calls, calls, calls, t0, t1);
     g_bench_scenario = "large";
     report_row(&r);
     return true;
@@ -514,8 +573,230 @@ static bool run_mt(const bench_options_t *o) {
     bench_unmap(workers, o->threads * sizeof(*workers));
     bench_unmap(tids, o->threads * sizeof(*tids));
 
-    bench_result_t r = finish_result(lat, calls, t0, t1);
+    bench_result_t r = finish_result(lat, calls, calls, calls, t0, t1);
     g_bench_scenario = "mt";
+    report_row(&r);
+    return true;
+}
+
+/* 1/64 走 16KB/64KB/256KB 大对象,其余按权重表落在 16B..14KB。
+   权重表的总和是 SERVER_SMALL_WEIGHT,循环减法比查累积表直观。 */
+static size_t server_pick_size(uint64_t *rng) {
+    uint64_t r = rng_next(rng);
+
+    if ((r & 63u) == 0) {
+        static const size_t big[] = { 16u << 10, 64u << 10, 256u << 10 };
+        return big[(size_t)((r >> 8) % 3)];
+    }
+
+    unsigned pick = (unsigned)((r >> 8) % SERVER_SMALL_WEIGHT);
+    size_t   n    = sizeof(g_server_small) / sizeof(g_server_small[0]);
+    for (size_t i = 0; i < n; i++) {
+        if (pick < g_server_small[i].weight)
+            return g_server_small[i].size;
+        pick -= g_server_small[i].weight;
+    }
+    return g_server_small[n - 1].size;
+}
+
+static void server_touch(void *p, size_t size) {
+    if (size >= (16u << 10))
+        touch_large(p, size);
+    else
+        touch_small(p, size);
+}
+
+/* 一次请求:取 1..6 个对象,1/8 概率 realloc,1/8 概率把一个对象
+   移到会话槽位,剩余释放;每 64 次请求清空会话槽位。计时包含请求
+   内全部 alloc/realloc/free 与会话驱逐/周期清理。 */
+static void server_request(server_worker_t *w, uint64_t *rng,
+                           uint64_t *lat, size_t idx) {
+    uint64_t a = now_ns();
+    unsigned n = 1u + (unsigned)(rng_next(rng) % 6u);
+
+    for (unsigned i = 0; i < SERVER_REQ_SLOTS; i++)
+        w->req[i].p = NULL;
+
+    for (unsigned i = 0; i < n; i++) {
+        size_t sz = server_pick_size(rng);
+        void  *p  = g_alloc(sz);
+        w->calls++;
+        if (p == NULL) {
+            atomic_fetch_add_explicit(&g_alloc_fail, 1,
+                                      memory_order_relaxed);
+            w->req[i].size = 0;
+            continue;
+        }
+        server_touch(p, sz);
+        w->req[i].p    = p;
+        w->req[i].size = sz;
+    }
+
+    if ((rng_next(rng) & 7u) == 0) {
+        unsigned i = (unsigned)(rng_next(rng) % n);
+        if (w->req[i].p != NULL) {
+            size_t old = w->req[i].size;
+            size_t sz;
+            if ((rng_next(rng) & 1u) != 0)
+                sz = old > 64 ? old - old / 4 : old + 8;
+            else
+                sz = old + old / 4 + 8;
+
+            void *q = g_realloc(w->req[i].p, sz);
+            w->calls++;
+            if (q == NULL) {
+                atomic_fetch_add_explicit(&g_alloc_fail, 1,
+                                          memory_order_relaxed);
+            } else {
+                server_touch(q, sz);
+                w->req[i].p    = q;
+                w->req[i].size = sz;
+            }
+        }
+    }
+
+    if ((rng_next(rng) & 7u) == 0) {
+        unsigned i = (unsigned)(rng_next(rng) % n);
+        if (w->req[i].p != NULL) {
+            unsigned s = (unsigned)(rng_next(rng) % SERVER_SESS_SLOTS);
+            if (w->sess[s].p != NULL) {
+                g_free(w->sess[s].p);
+                w->calls++;
+            }
+            w->sess[s] = w->req[i];
+            w->req[i].p = NULL;
+            w->req[i].size = 0;
+        }
+    }
+
+    for (unsigned i = 0; i < n; i++) {
+        if (w->req[i].p != NULL) {
+            g_free(w->req[i].p);
+            w->calls++;
+            w->req[i].p = NULL;
+        }
+    }
+
+    w->req_count++;
+    if (w->req_count % SERVER_FLUSH_EVERY == 0) {
+        for (unsigned s = 0; s < SERVER_SESS_SLOTS; s++) {
+            if (w->sess[s].p != NULL) {
+                g_free(w->sess[s].p);
+                w->calls++;
+                w->sess[s].p = NULL;
+            }
+        }
+    }
+
+    if (lat != NULL)
+        lat[idx] = now_ns() - a;
+}
+
+static void *server_worker(void *arg) {
+    server_worker_t *w = arg;
+    uint64_t rng = w->seed;
+
+    for (int i = 0; i < SERVER_WARMUP; i++)
+        server_request(w, &rng, NULL, 0);
+
+    w->calls     = 0;
+    w->req_count = 0;
+
+    atomic_fetch_add_explicit(w->ready, 1, memory_order_release);
+    while (!atomic_load_explicit(w->go, memory_order_acquire))
+        sched_yield();
+
+    for (size_t i = 0; i < w->per; i++)
+        server_request(w, &rng, w->lat, i);
+    return NULL;
+}
+
+/* 会话对象在计时结束后由主线程统一释放:它们不计入 ops,也不会
+   把 worker 退出后留下的指针带进 RSS 统计。 */
+static void server_free_state(server_worker_t *w) {
+    for (unsigned s = 0; s < SERVER_SESS_SLOTS; s++) {
+        if (w->sess[s].p != NULL) {
+            g_free(w->sess[s].p);
+            w->sess[s].p = NULL;
+        }
+    }
+    for (unsigned i = 0; i < SERVER_REQ_SLOTS; i++) {
+        if (w->req[i].p != NULL) {
+            g_free(w->req[i].p);
+            w->req[i].p = NULL;
+        }
+    }
+}
+
+static bool run_server(const bench_options_t *o) {
+    if (o->threads == 0)
+        return false;
+
+    size_t per = (size_t)(o->requests / o->threads);
+    if (per == 0)
+        per = 1;
+    size_t nreq = per * o->threads;
+
+    uint64_t *lat = bench_map(nreq * sizeof(*lat));
+    server_worker_t *workers = bench_map(o->threads * sizeof(*workers));
+    pthread_t *tids = bench_map(o->threads * sizeof(*tids));
+    if (lat == NULL || workers == NULL || tids == NULL) {
+        fprintf(stderr, "bench: server 工作区 mmap 失败: %s\n",
+                strerror(errno));
+        bench_unmap(lat, nreq * sizeof(*lat));
+        bench_unmap(workers, o->threads * sizeof(*workers));
+        bench_unmap(tids, o->threads * sizeof(*tids));
+        return false;
+    }
+
+    atomic_int ready = 0;
+    atomic_int go = 0;
+    unsigned created = 0;
+
+    for (unsigned i = 0; i < o->threads; i++) {
+        workers[i].per   = per;
+        workers[i].seed  = make_seed(o->seed, 64 + i);
+        workers[i].lat   = lat + (size_t)i * per;
+        workers[i].ready = &ready;
+        workers[i].go    = &go;
+
+        int rc = pthread_create(&tids[i], NULL, server_worker, &workers[i]);
+        if (rc != 0) {
+            fprintf(stderr, "bench: pthread_create: %s\n", strerror(rc));
+            atomic_store(&go, 1);
+            for (unsigned k = 0; k < created; k++)
+                (void)pthread_join(tids[k], NULL);
+            for (unsigned k = 0; k < o->threads; k++)
+                server_free_state(&workers[k]);
+            bench_unmap(lat, nreq * sizeof(*lat));
+            bench_unmap(workers, o->threads * sizeof(*workers));
+            bench_unmap(tids, o->threads * sizeof(*tids));
+            return false;
+        }
+        created++;
+    }
+
+    while (atomic_load_explicit(&ready, memory_order_acquire) <
+           (int)o->threads)
+        sched_yield();
+
+    uint64_t t0 = now_ns();
+    atomic_store_explicit(&go, 1, memory_order_release);
+    for (unsigned i = 0; i < o->threads; i++)
+        (void)pthread_join(tids[i], NULL);
+    uint64_t t1 = now_ns();
+
+    uint64_t calls = 0;
+    for (unsigned i = 0; i < o->threads; i++) {
+        calls += workers[i].calls;
+        server_free_state(&workers[i]);
+    }
+
+    bench_unmap(workers, o->threads * sizeof(*workers));
+    bench_unmap(tids, o->threads * sizeof(*tids));
+
+    bench_result_t r = finish_result(lat, nreq, calls, nreq, t0, t1);
+    g_bench_scenario = "server";
     report_row(&r);
     return true;
 }
@@ -523,10 +804,11 @@ static bool run_mt(const bench_options_t *o) {
 static void usage(FILE *out) {
     fprintf(out,
         "用法: bench <wmm|glibc> [选项]\n"
-        "  --scenario NAME   seq|mt|mixed|large|all(默认 all)\n"
-        "  --threads N       多线程场景的线程数,1..64(默认 4)\n"
+        "  --scenario NAME   seq|mt|mixed|large|server|all(默认 all)\n"
+        "  --threads N       mt/server 场景的线程数,1..64(默认 4)\n"
         "  --ops N           seq/mt/mixed 的分配器调用总数(默认 1000000)\n"
         "  --large-ops N     large 场景的调用数(默认 5000)\n"
+        "  --requests N      server 场景的请求总数(默认 200000)\n"
         "  --seed N          随机种子,必须非 0\n"
         "  --no-header       不打印 CSV 表头\n"
         "  --help            显示本帮助\n");
@@ -561,6 +843,7 @@ int main(int argc, char **argv) {
         .threads   = 4,
         .ops       = 1000000,
         .large_ops = 5000,
+        .requests  = 200000,
         .seed      = 0x9E3779B97F4A7C15ull,
         .header    = true,
     };
@@ -581,6 +864,7 @@ int main(int argc, char **argv) {
                 strcmp(opt.scenario, "mt") != 0 &&
                 strcmp(opt.scenario, "mixed") != 0 &&
                 strcmp(opt.scenario, "large") != 0 &&
+                strcmp(opt.scenario, "server") != 0 &&
                 strcmp(opt.scenario, "all") != 0) {
                 fprintf(stderr, "bench: 未知场景 '%s'\n", opt.scenario);
                 return 2;
@@ -595,6 +879,9 @@ int main(int argc, char **argv) {
                 goto bad_arg;
         } else if (strcmp(a, "--large-ops") == 0 && i + 1 < argc) {
             if (parse_u64(argv[++i], 8, 5000000, &opt.large_ops) != 0)
+                goto bad_arg;
+        } else if (strcmp(a, "--requests") == 0 && i + 1 < argc) {
+            if (parse_u64(argv[++i], 64, 20000000, &opt.requests) != 0)
                 goto bad_arg;
         } else if (strcmp(a, "--seed") == 0 && i + 1 < argc) {
             if (parse_u64(argv[++i], 1, UINT64_MAX, &opt.seed) != 0)
@@ -620,16 +907,19 @@ bad_arg:
 
     if (strcmp(opt.impl, "wmm") == 0) {
         wmm_boot();
-        g_alloc = wmm_alloc;
-        g_free  = wmm_free;
+        g_alloc   = wmm_alloc;
+        g_free    = wmm_free;
+        g_realloc = wmm_realloc;
     } else {
-        g_alloc = malloc;
-        g_free  = free;
+        g_alloc   = malloc;
+        g_free    = free;
+        g_realloc = realloc;
     }
     g_impl = opt.impl;
 
     if (opt.header)
-        printf("impl,scenario,ops,seconds,ops_per_sec,p50_ns,p99_ns,rss_kb\n");
+        printf("impl,scenario,ops,seconds,ops_per_sec,p50_ns,p99_ns,rss_kb,"
+               "p999_ns,p9999_ns,max_ns,reqs,req_per_sec,alloc_fail\n");
 
     bool ok = true;
     bool all = strcmp(opt.scenario, "all") == 0;
@@ -642,6 +932,8 @@ bad_arg:
         ok = run_mixed(&opt);
     if (ok && (all || strcmp(opt.scenario, "large") == 0))
         ok = run_large(&opt);
+    if (ok && (all || strcmp(opt.scenario, "server") == 0))
+        ok = run_server(&opt);
 
     uint64_t fails = atomic_load_explicit(&g_alloc_fail, memory_order_relaxed);
     if (fails != 0)

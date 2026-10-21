@@ -28,3 +28,11 @@ payload 假阳性;其余 race 报告一律按失败处理。
 例外:`test_wrap.c` 不进 `tests/main.c` 的表。它必须以 `--wrap` 链接,
 而主测试二进制故意不 wrap(test_oracle 的 glibc 对照依赖真 malloc 家族),
 所以由 Makefile 单独构建、在主用例跑完后运行。
+
+## 生产验证
+
+`validate/` 下的 soak、forkstress、oomcheck 都是独立进程,链接 release
+库,sanitizer 不介入。它们不登记进 `tests/main.c`,也不共享单元测试的
+全局状态;由 `make validate` 与 `validate/gate.py` 编排,详见根目录
+README 的“生产验证”。OOM 用例会真的填满 64 GB 虚拟窗口(约 128 MB
+页表驻留),不要和 `make test` 并行跑。
