@@ -121,7 +121,7 @@ enum {
     WMM_EXT_FREE_RETAINED = 3,                  /* 已 madvise,复用要缺页 */
 };
 
-/* extent:窗口内一段连续页;ar 链按地址排序 */
+/* extent:窗口内一段连续页;ar 链按地址排序,sz 链挂尺寸桶 */
 typedef struct wmm_extent_s wmm_extent_t;
 struct wmm_extent_s {
     void         *addr;
@@ -129,6 +129,8 @@ struct wmm_extent_s {
     uint32_t      state;                        /* WMM_EXT_* */
     wmm_extent_t *ar_prev;
     wmm_extent_t *ar_next;
+    wmm_extent_t *sz_prev;                      /* 尺寸桶前后链,仅空闲时有效 */
+    wmm_extent_t *sz_next;
     wmm_extent_t *next;                         /* 空闲结点回收链 */
     wmm_slab_t   *slab;                         /* 承载的 slab,可为 NULL */
 };
@@ -149,6 +151,8 @@ void          wmm_phys_free_slab(wmm_slab_t *sl);
 wmm_extent_t *wmm_phys_alloc_extent(size_t size);
 
 void          wmm_phys_free_extent(wmm_extent_t *ext);
+
+size_t        wmm_phys_audit(void);             /* 白盒:尺寸桶一致性 */
 
 void wmm_phys_purge_if_needed(void);            /* 脏页超阈值才回收 */
 void wmm_phys_purge_now(void);                  /* 无条件回收 */

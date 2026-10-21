@@ -511,24 +511,26 @@ typedef struct wmm_extent_s {
     size_t      npages;
     uint32_t    state;     /* 上列三态;RETAINED 由 purge(M10)产生,M6 不做转换 */
     struct wmm_extent_s *ar_prev, *ar_next;  /* 全量地址序双向链(含 INUSE) */
+    struct wmm_extent_s *sz_prev, *sz_next;  /* 尺寸桶链,仅空闲时有效 */
     struct wmm_extent_s *next;               /* 结点壳回收链(g_ext_free_nodes,LIFO) */
     wmm_slab_t *slab;      /* 若承载小对象 slab;大对象为 NULL */
 } wmm_extent_t;
 ```
-- **单一地址序双向链**:carve 时插入、free 时原地改 state——**找邻居合并 =
-  链上 prev/next,O(1)**。新 bump 尾插、分裂余段原位后插,都不需要扫描找位置;
-- **勘误(原设计"空闲另挂一条 free 链")**:已砍掉。first-fit 直接扫地址序链过滤
-  FREE——单 arena、extent 千级,全扫是慢路径几十微秒;省一条链的全部
-  插入/摘除代码与每结点 16 字节。jemalloc 的按大小分级搜索树是多 arena
-  数十万 extent 规模的选择,不剥离语境移植;
+- **地址序双向链 + 尺寸桶**:ar 链保留全量地址序(含 INUSE),只负责邻居合并
+  (prev/next 即邻居,O(1));空闲块另按"状态 × 页数"挂尺寸桶——1..256 页
+  精确成桶,更大按 floor(log2(npages-1)) 分桶,DIRTY 与 RETAINED 分开。
+  新 bump 尾插、分裂余段原位后插,都不需要扫描找位置;
+- 分配从请求页数对应的桶向大扫,只走桶头指针,O(桶数) 而非 O(extent 数);
+  同桶内取第一个装得下的块,等价于最小适配,尽量少切大块;
 - extent 结点壳从 base 取,合并吞并后挂 `g_ext_free_nodes` 复用;slab 头不复用
   (生命与类流量同长,量级小;统计证伪则同款回收链照加)。
 
 ### M6.2 取页 extent_get(内部,已持 g_ext_lock)
-- first-fit:沿地址序链从最低地址找第一个 `state != INUSE 且 npages 足够` 的块;
-  命中则低段交付、余段(≥1 页)原位留在链上(继承原状态);元数据耗尽无法分裂
+- 尺寸桶搜索:`sz_bucket(npages)` 起向大桶扫,先 FREE_DIRTY 再 FREE_RETAINED;
+  精确桶内全是等大块,大桶内跳过 npages 不足的块。DIRTY 优先,避免把已还
+  内核的页重新激活;
+- 命中则低段交付、余段(≥1 页)按原状态挂回对应尺寸桶;元数据耗尽无法分裂
   时整块交付(多给不损坏,只浪费);
-- 偏好低地址即期望行为:低地址先复用先腾空,高地址空闲块更容易保持大块连续;
 - 无命中 → 窗口 bump `mmap(g_heap_cur, …, MAP_FIXED)` 并尾插地址序链;
 - **失败**:窗口耗尽 → OOM 路径(dprintf 用量 + abort_oom),`wmm_alloc` 返回 NULL。
 
@@ -559,6 +561,8 @@ typedef struct wmm_extent_s {
 - [ ] PHY1:奇偶交替释放 → 4 个独立空闲块;全释放 → 融成单个 128 页块;
       复用取最低地址且 `g_heap_cur` 不前进(零新映射);
 - [ ] 分裂:5 页块上取 4 页 → 低段交付、余 1 页原位空闲,计数守恒;
+- [ ] 尺寸桶:513/800 页同桶、1030 页在下一桶;800 页请求跳过 513 页块,
+      从 1030 页块低段切出,余段归桶;全部释放后收敛成单块;
 - [ ] 跨路径吸收:3 个 slab(9 页)退休 → 大对象恰要 9 页时复用同一地址;
 - [ ] PHY3:大对象每页页表登记同一 extent、usable 为页倍数、释放后全页 raw==0;
 - [ ] 结构不变量(每个检查点):地址序链严格递增、不重叠、双向互指、
@@ -906,9 +910,10 @@ void wmm_phys_purge_if_needed(void) {
   的触碰全部在 `g_ext_lock` 内,已被冻结;`atfork child` 调
   `wmm_bg_child_reset` 重建控制锁/条件变量并清零状态(子进程里
   没有该线程,join 继承来的 tid 不可移植);
-- **extent 复用改两趟扫描**:先只在 FREE_DIRTY 里 first-fit(物理页
-  还在,复用零系统调用),没有再接受 FREE_RETAINED(复用要吃缺页)。
-  没有 purge 过的进程第一趟就是全集,行为与单趟一致;
+- **extent 复用按尺寸桶两趟扫描**:先在 FREE_DIRTY 桶里找(物理页
+  还在,复用零系统调用),没有再接受 FREE_RETAINED 桶(复用要吃缺页)。
+  桶号从请求页数向大扫,优先小尺寸块以减少切分。没有 purge 过的进程
+  第一趟就是全集,行为与单趟一致;
 - **ctl 接线**:`purge` 同步回收;`bg.enable/disable` 启停;
   `config.madvise_mode` 取 int 变参,只接受 MADV_DONTNEED/
   MADV_FREE(否则 EINVAL),只影响之后的 purge。其余命令仍 ENOSYS。

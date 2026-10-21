@@ -19,6 +19,18 @@
   forkstress` / `make oomcheck` / `make cgroup-oom`。
 - bench 增加 `server` 请求模型与 p999/p9999/max、请求吞吐、分配失败
   列;前 8 列保持兼容。
+- bench server 尾延迟归因:`--server-big/realloc/session/touch 0|1`
+  逐项关闭负载成分(随机流不变),stderr 打印最慢请求的对象数、
+  最大尺寸、调用数与标志位。
+
+### Changed
+
+- 物理层空闲 extent 改为尺寸分桶:1..256 页精确成桶,更大按
+  `floor(log2(npages-1))` 分桶,DIRTY 与 RETAINED 分开;分配从请求
+  桶向大扫,不再全地址链扫描,全局 `g_ext_lock` 临界区随之缩短。
+  地址序链保留,只负责相邻合并与 purge 不变式。大对象页表登记移到
+  锁外,块在锁内已标 INUSE。新增 `wmm_phys_audit` 白盒桶一致性检查
+  并接入 `test_phys` 每个检查点;补尺寸桶跳过/切分用例。
 
 ### Fixed
 

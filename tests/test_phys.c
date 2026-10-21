@@ -4,6 +4,8 @@
  *   合并:奇偶交替释放 → 独立空闲块;全释放 → 融成单块;
  *         复用取最低地址且 g_heap_cur 不前进(零新映射);
  *   分裂:大块复用时从低段切,余段按地址留在链上,计数守恒;
+ *   尺寸桶:同桶装不下的块必须跳过,跨桶取最小可用块;切分后
+ *         余段按原状态归入新桶(每检查点跑桶一致性审计);
  *   跨路径吸收:slab 退休的页被大对象分配复用(碎片不丢);
  *   页表登记:大对象每页登记同一 extent,释放后全页 raw==0;
  *   结构不变量:地址序链严格递增、不重叠、双向指针互指、
@@ -16,7 +18,7 @@
  *   后台线程:未启动不动、启用后 2 秒内按阈值回收、停后不再动,
  *         重复启停幂等。
  *
- * 确定性策略:api/slab 用例留下的空闲 extent 会让 first-fit 落点
+ * 确定性策略:api/slab 用例留下的空闲 extent 会让分配落点
  * 不可预测,所以每个子测试先 drain_free_pool——每次按"当前最大
  * 空闲块的精确大小"分配,直到链上无空闲。此后全部 extent 都在
  * INUSE,新分配必是窗口 bump(地址连续可预知),断言才能写死。
@@ -77,6 +79,7 @@ static size_t ar_check(void) {
         prev = e;
     }
     CHECK(g_dirty_pages == dirty_sum);
+    CHECK(wmm_phys_audit() == 0);
     return dirty_sum;
 }
 
@@ -188,7 +191,7 @@ static void check_split(void) {
     wmm_free(A);                    /* 5 页空闲,是链上唯一空闲块 */
     CHECK(g_dirty_pages == 5);
 
-    /* 4 页请求:first-fit 命中它,低段切出,余 1 页留在原位 */
+    /* 4 页请求:桶搜索命中它,低段切出,余 1 页留在原位 */
     void *cur_pre = g_heap_cur;
     unsigned char *C = wmm_alloc(4 * WMM_PAGE);
     CHECK(C == A);                  /* 低段交付 */
@@ -213,6 +216,48 @@ static void check_split(void) {
         if (e->state == WMM_EXT_FREE_DIRTY)
             nfree++;
     CHECK(nfree == 1);
+    ar_check();
+}
+
+/* ---- 大块尺寸桶:同桶装不下的块必须跳过 ---- */
+static void check_size_bucket(void) {
+    drain_free_pool();
+
+    /* 513 页与 800 页同属 floor(log2(npages-1))=9 的桶;1030 页在
+       下一个桶。4 页大对象隔开 A/C,保证释放后不合并 */
+    unsigned char *A = wmm_alloc(513 * WMM_PAGE);
+    unsigned char *G = wmm_alloc(4 * WMM_PAGE);
+    unsigned char *C = wmm_alloc(1030 * WMM_PAGE);
+    CHECK(A != NULL && G != NULL && C != NULL);
+    CHECK(G == A + 513 * WMM_PAGE && C == G + 4 * WMM_PAGE);
+
+    wmm_free(A);
+    wmm_free(C);
+    CHECK(g_dirty_pages == 513 + 1030);
+
+    /* 800 页请求:桶内 A 太小必须跳过,命中 C 并从低段切出 */
+    void *cur_pre = g_heap_cur;
+    unsigned char *X = wmm_alloc(800 * WMM_PAGE);
+    CHECK(X == C);
+    CHECK(g_heap_cur == cur_pre);
+    CHECK(g_dirty_pages == 513 + (1030 - 800));
+    ar_check();
+
+    /* 放回后 A、G、C 三段相邻,应收敛成一个 1547 页空闲块 */
+    wmm_free(X);
+    wmm_free(G);
+    CHECK(g_dirty_pages == 513 + 4 + 1030);
+
+    size_t        nfree = 0;
+    wmm_extent_t *only  = NULL;
+    for (wmm_extent_t *e = g_ar_head; e != NULL; e = e->ar_next)
+        if (e->state != WMM_EXT_INUSE) {
+            nfree++;
+            only = e;
+        }
+    CHECK(nfree == 1);
+    CHECK(only != NULL && only->addr == A &&
+          only->npages == 513 + 4 + 1030);
     ar_check();
 }
 
@@ -531,6 +576,7 @@ int test_phys(void) {
     check_large_pte();
     check_merge();
     check_split();
+    check_size_bucket();
     check_slab_absorb();
     check_replay();
     check_purge();
