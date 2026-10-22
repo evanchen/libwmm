@@ -2,6 +2,7 @@
 
 #include "wmm_internal.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 wmm_bin_t       g_guard_bins[WMM_NBINS];
