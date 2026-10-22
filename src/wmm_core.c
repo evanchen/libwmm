@@ -296,17 +296,25 @@ static wmm_tcache_t *stats_slot(void) {
 /* 采样需要的帧指针起点 */
 #define WMM_ALLOC_FRAME() __builtin_frame_address(0)
 
-/* 分配入口:大对象走 extent;guard 走专用 bin;其余走 tcache,
-   缓存空则批量填充,再失败才落到 bin 慢路径。 */
+/* 分配入口:大对象先查线程 extent 缓存,未命中走物理层;guard 走专用
+   bin;其余走 tcache,缓存空则批量填充,再失败才落到 bin 慢路径。 */
 void *wmm_alloc(size_t size) {
     if (size == 0)
         size = 1;
 
     if (size > WMM_SMALL_MAXCLASS) {
-        wmm_extent_t *ext = wmm_phys_alloc_extent(size);
+        wmm_tcache_t *t = stats_slot();
+        wmm_extent_t *ext = NULL;
+
+        /* 挡住 size + PAGE - 1 回绕;窗口上限仍由物理层判定 */
+        if (t != NULL && size <= WMM_HEAP_VA_SIZE)
+            ext = wmm_tcache_large_take(t, (size + WMM_PAGE - 1)
+                                        >> WMM_LG_PAGE);
+        if (ext == NULL)
+            ext = wmm_phys_alloc_extent(size);
         if (ext == NULL)
             return NULL;
-        wmm_tcache_t *t = stats_slot();
+
         if (t != NULL) {
             wmm_tcache_count_alloc(t, ext->npages * WMM_PAGE);
 
@@ -418,12 +426,14 @@ void wmm_free(void *p) {
 
     if (wmm_pte_is_extent(p, &ext)) {
         wmm_extent_t *e = (wmm_extent_t *)ext;
+        wmm_tcache_t *t = g_tcache;
 
         size_t bytes = (size_t)((char *)e->addr + e->npages * WMM_PAGE
                                 - (char *)p);
-        wmm_phys_free_extent(e);
-        if (g_tcache != NULL)
-            wmm_tcache_count_free(g_tcache, bytes);
+        if (!wmm_tcache_large_put(t, e))
+            wmm_phys_free_extent(e);
+        if (t != NULL)
+            wmm_tcache_count_free(t, bytes);
         return;
     }
 

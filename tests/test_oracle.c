@@ -111,15 +111,21 @@ static uint64_t live_bytes_direct(void) {
     return sum + g_large.live_bytes;
 }
 
-/* 线程缓存里的对象字节数。与 wmm_tcache_cached_total 同口径同锁,
-   另把每类缓存对象折算成字节——"含缓存"的 live_bytes 对账要扣掉
-   这一层(见文件头 ④) */
+/* 线程缓存里的对象字节数:小对象按类折算,整 extent 按页数折算。
+   与 wmm_tcache_cached_total 同口径同锁——"含缓存"的 live_bytes
+   对账要扣掉这一层(见文件头 ④) */
 static uint64_t cached_bytes_total(void) {
     uint64_t sum = 0;
     pthread_mutex_lock(&g_threads_lock);
-    for (wmm_tcache_t *t = g_threads; t != NULL; t = t->next)
+    for (wmm_tcache_t *t = g_threads; t != NULL; t = t->next) {
         for (int i = 0; i < WMM_NBINS; i++)
             sum += t->bins[i].head * (uint64_t)wmm_bin_info[i].reg_size;
+        for (uint32_t p = WMM_TCACHE_LARGE_MIN_PAGES;
+             p <= t->large_max_pages; p++)
+            for (wmm_extent_t *e = t->large_head[p]; e != NULL;
+                 e = e->cache_next)
+                sum += e->npages * (uint64_t)WMM_PAGE;
+    }
     pthread_mutex_unlock(&g_threads_lock);
     return sum;
 }

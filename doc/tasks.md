@@ -713,12 +713,24 @@ wmm_alloc: if (size<=14336 && tcache 启用):
 wmm_free:  反查 szind → if (小 && tcache 启用) wmm_tcache_free(i, p)
            else 直接 bin/大对象归还
 ```
-- **大对象不进 tcache(第一版决策,勘误)**:原稿"bins[36] 容量 20"是从 jemalloc
-  剥离语境的移植错误——jemalloc 的 20 槽属于"每个大对象类各一个 cache bin"的
-  语境,弹出规格必然匹配请求;塞进单一混合槽后,要 1MB 可能弹出 16KB 的块
-  (usable_size 错乱),且固定 20 槽 × 任意大的对象可囤出 GB 级缓存。大对象
-  分配/释放直走物理层;将来若要缓存:释放对象首 8B 存页数、弹栈时校验
-  (bins[36] 已为此预留,避免届时改 tcache 结构布局)。
+- **大对象 extent 缓存(后续迭代,取代"大对象不进 tcache")**:落地形态是
+  jemalloc 式**按尺寸类**的每线程缓存:类 = extent 的精确页数
+  (4..`tcache_max`,默认 8 页 = 32 KiB,对齐 jemalloc),每类独立
+  LIFO、默认 20 槽
+  (`WMM_TCACHE_LARGE_NSLOTS`);另设每线程总页数预算
+  (`tcache_budget_pages`,默认 2048 页,0 = 不限)作为安全阀。`bins[36]`
+  仍保留不用;只做**精确页数匹配**,不切分、不跨类搬运;槽满、超单块
+  上限或超预算的释放回落物理层。缓存块保持 INUSE 并计入 `g_large.live`
+  (live 仍 = 应用持有 + 线程缓存),flush/线程退出/fork 子进程清理时
+  排空;`cached_total` 与测试侧 `cached_bytes_total` 按类链遍历计入。
+  `config.tcache_max` 与 `config.tcache_budget` 运行期可调;提高单块
+  上限只影响之后创建的线程缓存(数组在创建时切出),降低立即生效。
+- **大缓存 GC**:按"上次 GC 以来的取用次数"判活,不依赖墙钟。
+  `tcache_large_gc` 扫描每个页数类:`used == 0` 或页数超过当前上限的
+  类整类归还;用过的类保留 `used + used/4` 个最新块。触发路径三条:
+  `gc` 命令(本线程同步,其他线程置 `gc_req`)、小对象 free 与大对象
+  put 入口统一消费 `gc_req`、每 256 次大对象 put 的滚动 GC。线程退出
+  时整体 flush。
 - **live 语义(与指南 §10.1 I2 勘误一致)**:fill 时 bin 锁内 `live += n`、flush 时
   `live -= n`、慢路径直接分配/释放 ±1 → **live = 应用持有 + tcache 缓存**(jemalloc 同义)。
   自 M8 起,M7 oracle 断言④改为 `Σ live[i] − Σ tcache head[i] == 活指针集合数`;

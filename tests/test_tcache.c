@@ -25,13 +25,22 @@
  *         注册表节点全部回到基线,RSS 无量级漂移(粗检,精确账在
  *         stress 窗口预算)。
  *   关闭开关:enabled=false 时分配/释放直走 bin,缓存水位纹丝不动。
+ *   大对象缓存:类 = 精确页数,每类 20 槽;默认单块上限 32 KiB(对齐
+ *         jemalloc);16K 命中同一块,不同页数不串用;槽满、超单块上限
+ *         或超预算回落物理层;flush 与线程退出归还且不重复计 ndalloc;
+ *         enabled=false 一并旁路。
+ *   大缓存 GC:按上次 GC 以来的取用次数收缩——未取用的类整类归还,
+ *         用过的类保留取用量加 25% 的最新块;gc 命令、跨线程 gc_req、
+ *         每 256 次 put 的滚动 GC 三条触发路径分别验证。
+ *   大缓存旋钮:config.tcache_max 降低立即生效、提高只影响新线程;
+ *         config.tcache_budget 只限制放入;非法值一律 EINVAL。
  *   跨线程释放:从未分配过的线程 free 别的线程的对象,走慢路径直接
  *         归还,不为自己建缓存,也不碰原线程的栈。
- *   fork 单线程:子进程注册表只剩调用线程;缓存水位与 live 原样
- *         保留;子进程分配仍命中缓存。
- *   fork 幽灵缓存:另一线程死前留在缓存里的对象,子进程侧被钩子刷
- *         回 bin(而不是永久泄漏);注册表只剩调用线程,live 恰好
- *         少掉"死线程缓存"这一块——死线程仍被应用持有的指针随
+ *   fork 单线程:子进程注册表只剩调用线程;缓存水位、大缓存与 live
+ *         原样保留;子进程分配仍命中缓存。
+ *   fork 幽灵缓存:另一线程死前留在缓存里的对象(含大块),子进程侧
+ *         被钩子刷回 bin(而不是永久泄漏);注册表只剩调用线程,live
+ *         恰好少掉"死线程缓存"这一块——死线程仍被应用持有的指针随
  *         线程消失,fork 语义使然,不在此列。
  *
  * 每个用例自清自净:进场先 wmm_tcache_flush_all 把主线程缓存剥空,
@@ -86,6 +95,10 @@ static uint64_t flush_baseline(void) {
     return total_live();
 }
 
+static uint32_t large_slots(const wmm_tcache_t *t) {
+    return atomic_load_explicit(&t->nlarge, memory_order_relaxed);
+}
+
 /* ---- 容量公式与整块布局 ---- */
 static void check_capacity_formula(void) {
     wmm_tcache_t *t = g_tcache;
@@ -126,7 +139,33 @@ static void check_capacity_formula(void) {
         off += seg;
         total += seg;
     }
+    /* 大缓存三段数组紧跟栈区:head、count、used,长度都是 maxp+1 */
+    uint32_t maxp = t->large_max_pages;
+    size_t head_bytes = ((size_t)maxp + 1) * sizeof(wmm_extent_t *);
+    size_t u16_bytes  = ((size_t)maxp + 1) * sizeof(uint16_t);
+
+    CHECK(maxp >= WMM_TCACHE_LARGE_MIN_PAGES);
+    CHECK(maxp <= WMM_TCACHE_LARGE_MAX_PAGES);
+    CHECK(t->large_head == (wmm_extent_t **)(void *)(base + off));
+    off += head_bytes;
+    CHECK(t->large_count == (uint16_t *)(void *)(base + off));
+    off += u16_bytes;
+    CHECK(t->large_used == (uint16_t *)(void *)(base + off));
+    off += u16_bytes;
+    total += head_bytes + 2 * u16_bytes;
     CHECK(total == t->map_size);
+
+    /* 三段计数互相自洽:head 非空 <=> count 非零;Σcount 与 Σpages
+       就是跨线程可读的 nlarge 与预算记账 */
+    uint64_t cnt = 0;
+    uint64_t pages = 0;
+    for (uint32_t p = 0; p <= maxp; p++) {
+        CHECK((t->large_head[p] != NULL) == (t->large_count[p] != 0));
+        cnt += t->large_count[p];
+        pages += (uint64_t)p * t->large_count[p];
+    }
+    CHECK(t->large_pages == pages);
+    CHECK(large_slots(t) == cnt);
 
     /* 大对象槽(下标 36)预留未启用 */
     CHECK(t->bins[WMM_NBINS].stack == NULL);
@@ -623,6 +662,636 @@ static void check_disabled_path(void) {
     CHECK(total_live() == base);
 }
 
+/* ---- 整 extent 大对象缓存 ---- */
+/* 大缓存清空后的统一断言:三段数组无残留,计数归零,live 回基线 */
+static void large_expect_empty(uint64_t base) {
+    wmm_tcache_t *t = g_tcache;
+    uint64_t cnt = 0;
+
+    CHECK(t != NULL);
+    if (t == NULL)
+        return;
+
+    for (uint32_t p = WMM_TCACHE_LARGE_MIN_PAGES;
+         p <= t->large_max_pages; p++) {
+        CHECK(t->large_head[p] == NULL);
+        CHECK(t->large_count[p] == 0);
+        CHECK(t->large_used[p] == 0);
+        cnt += t->large_count[p];
+    }
+    CHECK(t->large_pages == 0);
+    CHECK(large_slots(t) == cnt);
+    CHECK(large_slots(t) == 0);
+    CHECK(t->large_gc_evt == 0);
+    CHECK(total_live() == base);
+}
+
+static void large_reset(uint64_t base) {
+    wmm_tcache_flush_all();
+    large_expect_empty(base);
+}
+
+/* 精确页数命中、类独立、每类 20 槽封顶、不同页数不串用 */
+static void check_large_basic(uint64_t base) {
+    wmm_tcache_t *t = g_tcache;
+
+    void *p = wmm_alloc(16384);
+    CHECK(p != NULL);
+    CHECK(total_live() == base + 1);
+    wmm_free(p);
+    CHECK(t->large_head[4] == p);
+    CHECK(t->large_count[4] == 1);
+    CHECK(t->large_pages == 4);
+    CHECK(large_slots(t) == 1);
+    CHECK(wmm_tcache_cached_total() == 1);
+    CHECK(total_live() == base + 1);
+
+    void *q = wmm_alloc(16384);
+    CHECK(q == p);
+    CHECK(wmm_usable_size(q) == 16384);
+    CHECK(t->large_head[4] == NULL);
+    CHECK(t->large_count[4] == 0);
+    CHECK(t->large_pages == 0);
+    CHECK(large_slots(t) == 0);
+    wmm_free(q);
+    CHECK(t->large_count[4] == 1);
+    large_reset(base);
+
+    /* 两个页数类互不挤占:默认范围内最大的 8 页类满,不影响 6 页类 */
+    void *a[WMM_TCACHE_LARGE_NSLOTS];
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++) {
+        a[k] = wmm_alloc(8 * WMM_PAGE);
+        CHECK(a[k] != NULL);
+    }
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++)
+        wmm_free(a[k]);
+    CHECK(t->large_count[8] == WMM_TCACHE_LARGE_NSLOTS);
+    CHECK(t->large_pages == 8 * WMM_TCACHE_LARGE_NSLOTS);
+
+    void *b = wmm_alloc(6 * WMM_PAGE);
+    CHECK(b != NULL);
+    wmm_free(b);
+    CHECK(t->large_count[6] == 1);
+    CHECK(t->large_count[8] == WMM_TCACHE_LARGE_NSLOTS);
+    CHECK(t->large_pages == 8 * WMM_TCACHE_LARGE_NSLOTS + 6);
+    large_reset(base);
+
+    /* 每类 20 槽封顶:第 21 块回落物理层 */
+    void *h[WMM_TCACHE_LARGE_NSLOTS + 1];
+    for (unsigned k = 0; k <= WMM_TCACHE_LARGE_NSLOTS; k++) {
+        h[k] = wmm_alloc(16384);
+        CHECK(h[k] != NULL);
+    }
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++)
+        wmm_free(h[k]);
+    CHECK(t->large_count[4] == WMM_TCACHE_LARGE_NSLOTS);
+
+    uint64_t live_hold = total_live();
+    uint64_t nd0 = atomic_load_explicit(&g_large.ndalloc,
+                                        memory_order_relaxed);
+    wmm_free(h[WMM_TCACHE_LARGE_NSLOTS]);
+    CHECK(t->large_count[4] == WMM_TCACHE_LARGE_NSLOTS);
+    CHECK(total_live() == live_hold - 1);
+    CHECK(atomic_load_explicit(&g_large.ndalloc, memory_order_relaxed) ==
+          nd0 + 1);
+    large_reset(base);
+
+    /* 精确页数:5 页块不满足 4 页请求,4 页块也不进 5 页类 */
+    void *b5 = wmm_alloc(5 * WMM_PAGE);
+    CHECK(b5 != NULL);
+    wmm_free(b5);
+    CHECK(t->large_count[5] == 1);
+    CHECK(t->large_head[4] == NULL);
+
+    void *a4 = wmm_alloc(16384);
+    CHECK(a4 != NULL && a4 != b5);
+    CHECK(wmm_usable_size(a4) == 16384);
+    CHECK(t->large_count[5] == 1);
+    CHECK(t->large_count[4] == 1);      /* 刚释放的 4 页块进 4 页类 */
+    wmm_free(a4);
+
+    void *c5 = wmm_alloc(5 * WMM_PAGE);
+    CHECK(c5 == b5);
+    CHECK(wmm_usable_size(c5) == 5 * WMM_PAGE);
+    wmm_free(c5);
+    large_reset(base);
+}
+
+/* 单块页数上限、预算与两个 ctl 命令的边界 */
+static void check_large_limits(uint64_t base) {
+    wmm_tcache_t *t = g_tcache;
+    uint32_t max0 = wmm_tcache_max_pages_now();
+    uint64_t budget0 = wmm_tcache_budget_pages_now();
+
+    /* 超过创建时数组上界的块永不入缓存 */
+    void *over = wmm_alloc(((size_t)max0 + 1) * WMM_PAGE);
+    CHECK(over != NULL);
+    wmm_free(over);
+    CHECK(large_slots(t) == 0);
+    CHECK(total_live() == base);
+
+    /* 降低单块上限:已缓存的超限类由 GC 整类归还 */
+    void *b5 = wmm_alloc(5 * WMM_PAGE);
+    CHECK(b5 != NULL);
+    wmm_free(b5);
+    CHECK(t->large_count[5] == 1);
+
+    CHECK(wmm_ctl("config.tcache_max", (int)(4 * WMM_PAGE)) == 0);
+    CHECK(wmm_tcache_max_pages_now() == 4);
+    CHECK(wmm_ctl("gc") == 0);
+    CHECK(t->large_count[5] == 0);
+    CHECK(large_slots(t) == 0);
+    CHECK(total_live() == base);
+
+    /* 上限 4 页:5 页块被拒,4 页块照常 */
+    b5 = wmm_alloc(5 * WMM_PAGE);
+    CHECK(b5 != NULL);
+    uint64_t nd0 = atomic_load_explicit(&g_large.ndalloc,
+                                        memory_order_relaxed);
+    wmm_free(b5);
+    CHECK(t->large_count[5] == 0);
+    CHECK(atomic_load_explicit(&g_large.ndalloc, memory_order_relaxed) ==
+          nd0 + 1);
+
+    void *p4 = wmm_alloc(4 * WMM_PAGE);
+    CHECK(p4 != NULL);
+    wmm_free(p4);
+    CHECK(t->large_count[4] == 1);
+    void *q4 = wmm_alloc(4 * WMM_PAGE);
+    CHECK(q4 == p4);
+    wmm_free(q4);
+
+    CHECK(wmm_ctl("config.tcache_max", (int)(max0 * WMM_PAGE)) == 0);
+    CHECK(wmm_tcache_max_pages_now() == max0);
+    large_reset(base);
+
+    /* 预算只限制放入:16 页预算装 4 个 4 页块,第 5 个被拒 */
+    CHECK(wmm_ctl("config.tcache_budget", (int)(16 * WMM_PAGE)) == 0);
+    CHECK(wmm_tcache_budget_pages_now() == 16);
+
+    void *b[5];
+    for (int k = 0; k < 5; k++) {
+        b[k] = wmm_alloc(4 * WMM_PAGE);
+        CHECK(b[k] != NULL);
+    }
+    for (int k = 0; k < 4; k++)
+        wmm_free(b[k]);
+    CHECK(t->large_count[4] == 4);
+    CHECK(t->large_pages == 16);
+
+    uint64_t live_hold = total_live();
+    nd0 = atomic_load_explicit(&g_large.ndalloc, memory_order_relaxed);
+    wmm_free(b[4]);
+    CHECK(t->large_count[4] == 4);
+    CHECK(t->large_pages == 16);
+    CHECK(total_live() == live_hold - 1);
+    CHECK(atomic_load_explicit(&g_large.ndalloc, memory_order_relaxed) ==
+          nd0 + 1);
+
+    /* 0 = 不限:先把缓存四块全部取走,再放五块回去 */
+    CHECK(wmm_ctl("config.tcache_budget", 0) == 0);
+    CHECK(wmm_tcache_budget_pages_now() == 0);
+    for (int k = 0; k < 5; k++) {
+        b[k] = wmm_alloc(4 * WMM_PAGE);
+        CHECK(b[k] != NULL);
+    }
+    CHECK(t->large_count[4] == 0);
+    for (int k = 0; k < 5; k++)
+        wmm_free(b[k]);
+    CHECK(t->large_count[4] == 5);
+    CHECK(t->large_pages == 20);
+
+    /* 降低预算不清存量,但新 put 被拒;存量仍可 take */
+    CHECK(wmm_ctl("config.tcache_budget", (int)(8 * WMM_PAGE)) == 0);
+    void *x = wmm_alloc(4 * WMM_PAGE);
+    CHECK(x != NULL);
+    CHECK(t->large_count[4] == 4);
+    CHECK(t->large_pages == 16);
+    wmm_free(x);
+    CHECK(t->large_count[4] == 4);
+    CHECK(t->large_pages == 16);
+    CHECK(total_live() == base + 4);
+
+    /* 非法参数:负值、超硬上限、非零不足一页 */
+    CHECK(wmm_ctl("config.tcache_max", -1) == -1);
+    CHECK(wmm_ctl("config.tcache_max",
+                  (int)((WMM_TCACHE_LARGE_MAX_PAGES + 1u) * WMM_PAGE)) == -1);
+    CHECK(wmm_ctl("config.tcache_max", (int)(WMM_PAGE / 2)) == -1);
+    CHECK(wmm_ctl("config.tcache_budget", -1) == -1);
+    CHECK(wmm_ctl("config.tcache_budget",
+                  (int)((WMM_TCACHE_LARGE_MAX_BUDGET_PAGES + 1u) *
+                        WMM_PAGE)) == -1);
+    CHECK(wmm_ctl("config.tcache_budget", (int)(WMM_PAGE / 2)) == -1);
+    CHECK(wmm_ctl("config.tcache_max", 0) == 0);   /* 0 = 关闭,合法 */
+    CHECK(wmm_ctl("config.tcache_max", (int)(max0 * WMM_PAGE)) == 0);
+
+    CHECK(wmm_ctl("config.tcache_budget", (int)(budget0 * WMM_PAGE)) == 0);
+    CHECK(wmm_tcache_budget_pages_now() == budget0);
+    large_reset(base);
+}
+
+/* 提高单块上限只影响之后创建的线程缓存 */
+typedef struct {
+    atomic_int ready;
+    atomic_int go;
+    unsigned   err;
+    uint32_t   maxp;
+    uint16_t   cnt4;
+    uint16_t   cnt256;
+    uint32_t   pages;
+    uint32_t   nlarge;
+} raise_arg_t;
+
+static void *raise_worker(void *arg) {
+    raise_arg_t *a = (raise_arg_t *)arg;
+    unsigned err = 0;
+
+    wmm_thread_init();
+    if (g_tcache == NULL) {
+        a->err = 1u;
+        atomic_store_explicit(&a->ready, 1, memory_order_release);
+        while (!atomic_load_explicit(&a->go, memory_order_acquire))
+            sched_yield();
+        return NULL;
+    }
+
+    a->maxp = g_tcache->large_max_pages;
+
+    void *big = wmm_alloc((size_t)1 << 20);   /* 恰 256 页 */
+    if (big == NULL)
+        err |= 2u;
+    else
+        wmm_free(big);
+    void *p = wmm_alloc(16384);
+    if (p == NULL)
+        err |= 4u;
+    else
+        wmm_free(p);
+
+    a->cnt4   = g_tcache->large_count[4];
+    a->cnt256 = g_tcache->large_count[256];
+    a->pages  = g_tcache->large_pages;
+    a->nlarge = atomic_load_explicit(&g_tcache->nlarge, memory_order_relaxed);
+    if (a->cnt4 != 1 || a->cnt256 != 1)
+        err |= 8u;
+    if (a->pages != 260 || a->nlarge != 2)
+        err |= 16u;
+    a->err = err;
+
+    atomic_store_explicit(&a->ready, 1, memory_order_release);
+    while (!atomic_load_explicit(&a->go, memory_order_acquire))
+        sched_yield();
+    return NULL;
+}
+
+static void check_large_raise(uint64_t base) {
+    uint32_t max0 = wmm_tcache_max_pages_now();
+    int nodes0 = tc_nodes();
+
+    CHECK(max0 < WMM_TCACHE_LARGE_MAX_PAGES);
+    CHECK(g_tcache->large_max_pages == max0);
+    CHECK(wmm_ctl("config.tcache_max",
+                  (int)(WMM_TCACHE_LARGE_MAX_PAGES * WMM_PAGE)) == 0);
+    CHECK(wmm_tcache_max_pages_now() == WMM_TCACHE_LARGE_MAX_PAGES);
+
+    /* 主缓存的数组仍是创建时大小,1MB 进不来 */
+    void *big = wmm_alloc((size_t)1 << 20);
+    CHECK(big != NULL);
+    wmm_free(big);
+    CHECK(large_slots(g_tcache) == 0);
+    CHECK(total_live() == base);
+
+    raise_arg_t a;
+    a.err    = 0;
+    a.maxp   = 0;
+    a.cnt4   = 0;
+    a.cnt256 = 0;
+    a.pages  = 0;
+    a.nlarge = 0;
+    atomic_init(&a.ready, 0);
+    atomic_init(&a.go, 0);
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, raise_worker, &a) != 0) {
+        printf("  FAIL @%d: pthread_create\n", __LINE__);
+        g_fail++;
+    } else {
+        while (!atomic_load_explicit(&a.ready, memory_order_acquire))
+            sched_yield();
+        CHECK(a.err == 0);
+        CHECK(a.maxp == WMM_TCACHE_LARGE_MAX_PAGES);
+        CHECK(a.cnt4 == 1 && a.cnt256 == 1);
+        CHECK(a.pages == 260 && a.nlarge == 2);
+
+        atomic_store_explicit(&a.go, 1, memory_order_release);
+        CHECK(pthread_join(th, NULL) == 0);
+        /* 新线程退出:大缓存随析构归还 */
+        CHECK(tc_nodes() == nodes0);
+        CHECK(wmm_tcache_cached_total() == 0);
+        CHECK(total_live() == base);
+    }
+
+    CHECK(wmm_ctl("config.tcache_max", (int)(max0 * WMM_PAGE)) == 0);
+    CHECK(wmm_tcache_max_pages_now() == max0);
+    large_reset(base);
+}
+
+/* flush、双释放与按取用量 GC */
+static void check_large_flush_gc(uint64_t base) {
+    wmm_tcache_t *t = g_tcache;
+
+    CHECK(t->large_max_pages >= 8);   /* 本用例的三个类都在默认上限内 */
+
+    /* flush:多类存量一次归零,ndalloc 已在应用释放时记过 */
+    void *a[4], *b[2], *c[2];
+    for (int k = 0; k < 4; k++) {
+        a[k] = wmm_alloc(4 * WMM_PAGE);
+        CHECK(a[k] != NULL);
+    }
+    for (int k = 0; k < 2; k++) {
+        b[k] = wmm_alloc(6 * WMM_PAGE);
+        CHECK(b[k] != NULL);
+        c[k] = wmm_alloc(8 * WMM_PAGE);
+        CHECK(c[k] != NULL);
+    }
+    for (int k = 0; k < 4; k++)
+        wmm_free(a[k]);
+    for (int k = 0; k < 2; k++) {
+        wmm_free(b[k]);
+        wmm_free(c[k]);
+    }
+    CHECK(t->large_count[4] == 4);
+    CHECK(t->large_count[6] == 2);
+    CHECK(t->large_count[8] == 2);
+
+    uint64_t nd0 = atomic_load_explicit(&g_large.ndalloc,
+                                        memory_order_relaxed);
+    wmm_tcache_flush_all();
+    large_expect_empty(base);
+    CHECK(atomic_load_explicit(&g_large.ndalloc, memory_order_relaxed) == nd0);
+
+    /* 缓存块再次释放:页表已清,走 0xBE 诊断,链表与计数不动 */
+    void *p = wmm_alloc(16384);
+    CHECK(p != NULL);
+    wmm_free(p);
+    CHECK(t->large_count[4] == 1);
+    CHECK(t->large_head[4] == p);
+    wmm_free(p);
+    CHECK(t->large_count[4] == 1);
+    CHECK(t->large_head[4] == p);
+    CHECK(t->large_pages == 4);
+    CHECK(large_slots(t) == 1);
+    CHECK(total_live() == base + 1);
+    CHECK(wmm_phys_audit() == 0);
+    large_reset(base);
+
+    /* GC:4 页类取用 1 次保留 1 块,6 页与 8 页类未取用整类归还 */
+    void *q[4], *r[2], *s[2];
+    for (int k = 0; k < 4; k++) {
+        q[k] = wmm_alloc(4 * WMM_PAGE);
+        CHECK(q[k] != NULL);
+    }
+    for (int k = 0; k < 2; k++) {
+        r[k] = wmm_alloc(6 * WMM_PAGE);
+        CHECK(r[k] != NULL);
+        s[k] = wmm_alloc(8 * WMM_PAGE);
+        CHECK(s[k] != NULL);
+    }
+    for (int k = 0; k < 4; k++)
+        wmm_free(q[k]);
+    for (int k = 0; k < 2; k++) {
+        wmm_free(r[k]);
+        wmm_free(s[k]);
+    }
+    CHECK(t->large_count[4] == 4);
+    CHECK(t->large_count[6] == 2);
+    CHECK(t->large_count[8] == 2);
+
+    void *hit = wmm_alloc(16384);
+    CHECK(hit != NULL);
+    CHECK(t->large_count[4] == 3);
+    CHECK(t->large_used[4] == 1);
+
+    uint64_t live0 = total_live();
+    nd0 = atomic_load_explicit(&g_large.ndalloc, memory_order_relaxed);
+    CHECK(wmm_ctl("gc") == 0);
+    CHECK(t->large_count[4] == 1);
+    CHECK(t->large_count[6] == 0);
+    CHECK(t->large_count[8] == 0);
+    CHECK(t->large_pages == 4);
+    CHECK(large_slots(t) == 1);
+    CHECK(t->large_used[4] == 0);
+    CHECK(total_live() == live0 - 6);
+    CHECK(atomic_load_explicit(&g_large.ndalloc, memory_order_relaxed) == nd0);
+    CHECK(wmm_phys_audit() == 0);
+
+    void *again = wmm_alloc(16384);
+    CHECK(again != NULL && again != hit);
+    CHECK(wmm_usable_size(again) == 16384);
+    CHECK(t->large_count[4] == 0);
+    wmm_free(again);
+    wmm_free(hit);
+    large_reset(base);
+}
+
+/* 跨线程 GC:只做大对象 free 的线程也必须在 put 入口消费 gc_req */
+typedef struct {
+    atomic_int    ready;
+    atomic_int    go;
+    atomic_int    done;
+    wmm_tcache_t *t;
+    void         *hold;
+    unsigned      err;
+    uint16_t      cnt4_after;
+    uint16_t      cnt5_after;
+    uint32_t      nlarge_after;
+} large_gc_arg_t;
+
+static void *large_gc_worker(void *arg) {
+    large_gc_arg_t *a = (large_gc_arg_t *)arg;
+    unsigned err = 0;
+
+    wmm_thread_init();
+    if (g_tcache == NULL) {
+        a->err = 1u;
+        atomic_store_explicit(&a->ready, 1, memory_order_release);
+        while (!atomic_load_explicit(&a->go, memory_order_acquire))
+            sched_yield();
+        return NULL;
+    }
+    a->t = g_tcache;
+
+    void *p = wmm_alloc(16384);
+    if (p == NULL)
+        err |= 2u;
+    else
+        wmm_free(p);                    /* 4 页类留一块存量 */
+
+    a->hold = wmm_alloc(5 * WMM_PAGE);  /* 预分配,放行后释放 */
+    if (a->hold == NULL)
+        err |= 4u;
+    if (g_tcache->large_count[4] != 1)
+        err |= 8u;
+
+    a->err = err;
+    atomic_store_explicit(&a->ready, 1, memory_order_release);
+    while (!atomic_load_explicit(&a->go, memory_order_acquire))
+        sched_yield();
+
+    if (a->hold != NULL)
+        wmm_free(a->hold);              /* 大对象 put 入口消费 gc_req */
+
+    a->cnt4_after   = g_tcache->large_count[4];
+    a->cnt5_after   = g_tcache->large_count[5];
+    a->nlarge_after = atomic_load_explicit(&g_tcache->nlarge,
+                                           memory_order_relaxed);
+    if (atomic_load_explicit(&g_tcache->gc_req, memory_order_acquire) != 0)
+        err |= 16u;
+    a->err = err;
+    atomic_store_explicit(&a->done, 1, memory_order_release);
+    return NULL;
+}
+
+static void check_large_cross_gc(uint64_t base) {
+    int nodes0 = tc_nodes();
+    large_gc_arg_t a;
+
+    a.t           = NULL;
+    a.hold        = NULL;
+    a.err         = 0;
+    a.cnt4_after  = 0;
+    a.cnt5_after  = 0;
+    a.nlarge_after = 0;
+    atomic_init(&a.ready, 0);
+    atomic_init(&a.go, 0);
+    atomic_init(&a.done, 0);
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, large_gc_worker, &a) != 0) {
+        printf("  FAIL @%d: pthread_create\n", __LINE__);
+        g_fail++;
+        return;
+    }
+    while (!atomic_load_explicit(&a.ready, memory_order_acquire))
+        sched_yield();
+
+    CHECK(a.err == 0);
+    CHECK(a.t != NULL && a.t != g_tcache);
+    if (a.t != NULL) {
+        CHECK(a.t->large_count[4] == 1);
+        CHECK(wmm_tcache_cached_total() == 1);
+
+        /* 控制线程:自己同步收缩,工作线程只置位;它停在 go 上,
+           不会消费请求,所以置位后可以稳定观察 1 */
+        CHECK(wmm_ctl("gc") == 0);
+        CHECK(atomic_load_explicit(&a.t->gc_req,
+                                   memory_order_acquire) == 1);
+    }
+
+    atomic_store_explicit(&a.go, 1, memory_order_release);
+    while (!atomic_load_explicit(&a.done, memory_order_acquire))
+        sched_yield();
+    CHECK(pthread_join(th, NULL) == 0);
+
+    CHECK(a.err == 0);
+    CHECK(a.cnt4_after == 0);       /* 请求先收缩旧类,再放入本块 */
+    CHECK(a.cnt5_after == 1);
+    CHECK(a.nlarge_after == 1);
+    CHECK(tc_nodes() == nodes0);
+    CHECK(wmm_tcache_cached_total() == 0);
+    CHECK(total_live() == base);
+}
+
+/* 滚动 GC:每 256 次大对象 put 自动收缩一次 */
+static void check_large_rolling_gc(uint64_t base) {
+    wmm_tcache_t *t = g_tcache;
+    void *h[WMM_TCACHE_LARGE_NSLOTS];
+
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++) {
+        h[k] = wmm_alloc(16384);
+        CHECK(h[k] != NULL);
+    }
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++)
+        wmm_free(h[k]);
+    CHECK(t->large_count[4] == WMM_TCACHE_LARGE_NSLOTS);
+    CHECK(t->large_used[4] == 0);
+
+    t->large_gc_evt = 0;   /* 白盒:让滚动周期从本次循环起算 */
+
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_GC_EVERY; k++) {
+        void *p = wmm_alloc(5 * WMM_PAGE);
+        CHECK(p != NULL);
+        wmm_free(p);
+    }
+    CHECK(t->large_count[4] == 0);   /* 到点,未取用的类整类归还 */
+    CHECK(t->large_gc_evt == 0);
+    CHECK(t->large_count[5] == 1);
+    CHECK(t->large_pages == 5);
+    CHECK(large_slots(t) == 1);
+    large_reset(base);
+}
+
+/* enabled=false 一并旁路大缓存,但 gc 仍能排空既有存量 */
+static void check_large_disabled(uint64_t base) {
+    wmm_tcache_t *t = g_tcache;
+
+    void *p = wmm_alloc(16384);
+    CHECK(p != NULL);
+    wmm_free(p);
+    CHECK(t->large_count[4] == 1);
+
+    bool saved = t->enabled;
+    t->enabled = false;
+
+    CHECK(wmm_ctl("gc") == 0);
+    CHECK(t->large_count[4] == 0);
+    CHECK(large_slots(t) == 0);
+    CHECK(total_live() == base);
+
+    void *x = wmm_alloc(16384);
+    CHECK(x != NULL);
+    wmm_free(x);
+    CHECK(t->large_count[4] == 0);
+    CHECK(large_slots(t) == 0);
+    CHECK(total_live() == base);
+
+    t->enabled = true;
+    void *y = wmm_alloc(16384);
+    CHECK(y != NULL);
+    wmm_free(y);
+    CHECK(t->large_count[4] == 1);
+
+    t->enabled = false;
+    void *z = wmm_alloc(16384);
+    CHECK(z != NULL && z != y);       /* 没有命中 y 的缓存 */
+    wmm_free(z);                      /* 也旁路,不进缓存 */
+    CHECK(t->large_count[4] == 1);
+
+    t->enabled = saved;
+    void *w = wmm_alloc(16384);
+    CHECK(w == y);                    /* 恢复后照常命中 */
+    wmm_free(w);
+    large_reset(base);
+}
+
+static void check_large_extent_cache(void) {
+    uint64_t base = flush_baseline();
+
+    CHECK(g_tcache != NULL);
+    if (g_tcache == NULL)
+        return;
+
+    check_large_basic(base);
+    check_large_limits(base);
+    check_large_raise(base);
+    check_large_flush_gc(base);
+    check_large_cross_gc(base);
+    check_large_rolling_gc(base);
+    check_large_disabled(base);
+
+    CHECK(flush_baseline() == base);
+}
+
 /* ---- 跨线程释放:释放者没有缓存 ----
  * 惰性创建只挂在分配路径上:pure-free 的线程不该为一次慢路径
  * 释放付一整块 mmap。同时确认原线程的缓存栈没有被别人动过。 */
@@ -681,6 +1350,7 @@ static void check_cross_thread_free(void) {
 static szind_t  g_fork_bin;
 static unsigned g_fork_head;
 static uint64_t g_fork_live;
+static void    *g_fork_large;
 
 static void check_fork_single_thread(void) {
     uint64_t base  = flush_baseline();
@@ -697,9 +1367,16 @@ static void check_fork_single_thread(void) {
         wmm_free(o[k]);              /* 全进缓存:水位回到 nfill */
     CHECK(cb->head == nfill);
 
-    g_fork_bin  = bin;
-    g_fork_head = cb->head;
-    g_fork_live = total_live();
+    /* 大缓存也带一块进子进程 */
+    void *lp = wmm_alloc(16384);
+    CHECK(lp != NULL);
+    wmm_free(lp);
+    CHECK(g_tcache->large_count[4] == 1);
+
+    g_fork_bin   = bin;
+    g_fork_head  = cb->head;
+    g_fork_live  = total_live();
+    g_fork_large = lp;
 
     pid_t pid = fork();
     if (pid == 0) {
@@ -712,10 +1389,13 @@ static void check_fork_single_thread(void) {
         if (g_threads != NULL &&
             (g_threads->prev != NULL || g_threads->next != NULL))
             bad |= 2;                /* 且是唯一节点 */
-        if (wmm_tcache_cached_total() != g_fork_head)
-            bad |= 4;                /* 缓存内容原样过继 */
+        if (wmm_tcache_cached_total() != g_fork_head + 1)
+            bad |= 4;                /* 小对象栈与大块原样过继 */
         if (total_live() != g_fork_live)
             bad |= 8;                /* 没有对象被凭空归还或吞掉 */
+        if (g_tcache->large_count[4] != 1 ||
+            g_tcache->large_head[4] != g_fork_large)
+            bad |= 64;
 
         void *p = wmm_alloc(64);     /* 必须命中:水位恰降一格 */
         if (p == NULL)
@@ -723,6 +1403,11 @@ static void check_fork_single_thread(void) {
         if ((unsigned)g_tcache->bins[g_fork_bin].head + 1 != h0)
             bad |= 32;
         wmm_free(p);
+
+        void *lq = wmm_alloc(16384);
+        if (lq != g_fork_large)
+            bad |= 128;              /* 子进程也能原样 take 到大块 */
+        wmm_free(lq);
 
         _exit(bad);
     }
@@ -749,6 +1434,7 @@ typedef struct {
     atomic_int go;
     unsigned   err;
     unsigned   head_at_ready;
+    unsigned   large_at_ready;
 } ghost_arg_t;
 
 static void *ghost_worker(void *arg) {
@@ -771,8 +1457,18 @@ static void *ghost_worker(void *arg) {
     for (unsigned k = 0; k < half; k++)
         wmm_free(o[k]);
 
-    a->head_at_ready = (g_tcache != NULL)
-                         ? g_tcache->bins[bin].head : 0;
+    if (g_tcache != NULL) {
+        void *big = wmm_alloc(16384);
+        if (big == NULL)
+            err |= 4u;
+        else
+            wmm_free(big);       /* 死线程的大缓存块也要被子进程清掉 */
+    }
+
+    a->head_at_ready  = (g_tcache != NULL)
+                          ? g_tcache->bins[bin].head : 0;
+    a->large_at_ready = (g_tcache != NULL)
+                          ? g_tcache->large_count[4] : 0;
     a->err = err;
     atomic_store_explicit(&a->ready, 1, memory_order_release);
     while (!atomic_load_explicit(&a->go, memory_order_acquire))
@@ -791,8 +1487,9 @@ static void check_fork_ghost(void) {
     int      nodes0 = tc_nodes();
     ghost_arg_t a;
 
-    a.err           = 0;
-    a.head_at_ready = 0;
+    a.err            = 0;
+    a.head_at_ready  = 0;
+    a.large_at_ready = 0;
     atomic_init(&a.ready, 0);
     atomic_init(&a.go, 0);
 
@@ -809,10 +1506,12 @@ static void check_fork_ghost(void) {
     CHECK(tc_nodes() == nodes0 + 1);
     CHECK(a.head_at_ready > 0);   /* 幽灵部分必须非空,否则这一组
                                      在子进程里什么也没验证到 */
+    CHECK(a.large_at_ready == 1);
 
     g_ghost_pre_live   = total_live();
     g_ghost_pre_cached = wmm_tcache_cached_total();
-    CHECK(g_ghost_pre_cached == a.head_at_ready);   /* 主线程缓存已空 */
+    /* 主线程缓存已空:缓存总量就是死线程的小对象加大块 */
+    CHECK(g_ghost_pre_cached == a.head_at_ready + a.large_at_ready);
 
     pid_t pid = fork();
     if (pid == 0) {
@@ -874,6 +1573,7 @@ int test_tcache(void) {
     check_thread_lifecycle();
     check_thread_churn();
     check_disabled_path();
+    check_large_extent_cache();
     check_cross_thread_free();
     check_fork_single_thread();
     check_fork_ghost();

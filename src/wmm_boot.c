@@ -38,6 +38,8 @@ pthread_key_t g_tcache_key = (pthread_key_t)-1;
 
 wmm_opt_t g_opt = {
     .dirty_max    = (size_t)8 << 20,
+    .tcache_max_pages    = WMM_TCACHE_LARGE_DEFAULT_PAGES,
+    .tcache_budget_pages = WMM_TCACHE_LARGE_DEFAULT_BUDGET_PAGES,
     .madvise_mode = MADV_DONTNEED,
     .sample_n     = 0,
     .guard        = false,

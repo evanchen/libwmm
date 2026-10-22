@@ -95,12 +95,13 @@ static uint64_t total_live(void) {
     return sum + g_large.live;
 }
 
-/* 单线程缓存的容量上限(字节):Σ ncached_max × reg_size,从真实建出的
-   缓存块读而不是重抄公式——公式或表若改,预算自动跟随。它是窗口复用
-   断言预算的第二笔:第一笔(8MB)钉的是占用率随机游走,这一笔钉的是
-   随线程数增长的缓存容量。实测全类合计约 2.1MB/线程 */
+/* 单线程缓存的容量上限(字节):Σ ncached_max × reg_size 加整 extent
+   缓存页预算,从真实建出的缓存块与当前预算读而不是重抄公式——公式
+   或表若改,预算自动跟随。它是窗口复用断言预算的第二笔:第一笔
+   (8MB)钉的是占用率随机游走,这一笔钉的是随线程数增长的缓存容量。
+   实测小对象合计约 2.1MB/线程,大 extent 预算由本组钉到 1MB */
 static size_t tcache_capacity_bytes(void) {
-    size_t sum = 0;
+    size_t sum = (size_t)wmm_tcache_budget_pages_now() * WMM_PAGE;
     for (int i = 0; i < WMM_NBINS; i++)
         sum += (size_t)g_tcache->bins[i].ncached_max
              * wmm_bin_info[i].reg_size;
@@ -348,6 +349,13 @@ int test_stress(void) {
     wmm_thread_init();
     CHECK(g_tcache != NULL);
     wmm_tcache_flush_all();
+
+    /* 大缓存预算钉到 256 页(1MB):容量项固定,窗口与 RSS 断言对
+       滞留保持敏感;组末恢复原值 */
+    uint64_t budget0 = atomic_load_explicit(&g_opt.tcache_budget_pages,
+                                            memory_order_relaxed);
+    atomic_store_explicit(&g_opt.tcache_budget_pages, 256u,
+                          memory_order_relaxed);
     size_t tcache_cap = tcache_capacity_bytes();
     printf("  per-thread tcache capacity: %zu KB\n", tcache_cap >> 10);
     g_live0 = total_live();
@@ -457,6 +465,9 @@ int test_stress(void) {
     CHECK(rss_last <= rss_first + rss_tol);
     printf("  RSS plateau: first %zu KB, last %zu KB (tolerance %zu KB)\n",
            rss_first, rss_last, rss_tol);
+
+    atomic_store_explicit(&g_opt.tcache_budget_pages, budget0,
+                          memory_order_relaxed);
 
     if (g_fail == 0)
         printf("  all stress checks passed\n");

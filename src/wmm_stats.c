@@ -144,7 +144,8 @@ int wmm_stats_snapshot(wmm_stats_t *st) {
     uint64_t large_live  = g_large.live;
     uint64_t large_bytes = g_large.live_bytes;
     st->cls[WMM_NBINS].live    = large_live;
-    st->cls[WMM_NBINS].ndalloc = g_large.ndalloc;
+    st->cls[WMM_NBINS].ndalloc = atomic_load_explicit(&g_large.ndalloc,
+                                                      memory_order_relaxed);
     st->cls[WMM_NBINS].size    = 0;
     st->active_bytes           = g_active_bytes;
     pthread_mutex_unlock(&g_ext_lock);

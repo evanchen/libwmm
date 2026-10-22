@@ -89,9 +89,15 @@ static inline bool v_align_ok(const void *p, size_t usable) {
     return ((uintptr_t)p & 15u) == 0 || usable == 8;
 }
 
-/* 每线程缓存对象上限:clamp(2*nregs, 20, 200) 求和 */
+/* 每线程缓存对象上限:小对象按 clamp(2*nregs, 20, 200) 求和,
+   大缓存按每个页数类 NSLOTS 折算对象数 */
 static inline uint64_t v_tcache_max_per_thread(void) {
     uint64_t sum = 0;
+    uint32_t maxp = g_tcache != NULL ? g_tcache->large_max_pages
+                                     : wmm_tcache_max_pages_now();
+    uint64_t ncls = maxp >= WMM_TCACHE_LARGE_MIN_PAGES
+                      ? (uint64_t)(maxp - WMM_TCACHE_LARGE_MIN_PAGES + 1u)
+                      : 0;
 
     for (szind_t i = 0; i < WMM_NBINS; i++) {
         unsigned v = 2u * wmm_bin_info[i].nregs;
@@ -101,7 +107,7 @@ static inline uint64_t v_tcache_max_per_thread(void) {
             v = WMM_TCACHE_NCACHED_MAX;
         sum += v;
     }
-    return sum;
+    return sum + (uint64_t)WMM_TCACHE_LARGE_NSLOTS * ncls;
 }
 
 /* 快照的基本恒等式。prev_valid 时额外检查 epoch 与 high_water 的

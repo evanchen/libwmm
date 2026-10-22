@@ -6,6 +6,18 @@
 
 ### Added
 
+- 每线程大对象 extent 缓存:jemalloc 式按尺寸类组织,类 = 精确页数,
+  每类独立 LIFO、默认 20 槽;单块上限 `tcache_max`(默认 32 KiB,与
+  jemalloc 一致,可调至 8 MiB)与
+  每线程页预算(默认 8 MiB)双阀,`0` 分别表示关闭与不限。稳态大对象
+  路径不再触碰全局 `g_ext_lock`。缓存块保持 INUSE 并计入 live,
+  flush/线程退出/fork 子进程清理时排空,`cached_total` 与字节对账
+  按类链同步扩展。
+- 大缓存按取用量 GC:上次 GC 以来未取用的页数类整类归还,用过的类
+  保留取用量加 25% 的最新块;`gc` 命令、跨线程 `gc_req` 与每 256 次
+  put 的滚动收缩三条路径生效。
+- 新增 `wmm_ctl` 命令 `config.tcache_max` 与 `config.tcache_budget`:
+  按字节设置并向下取整到页,带硬上限与非法值校验。
 - 项目初始化:目录结构、BSD-2-Clause 许可证、规格文档入库(`doc/`)。
 - 按 `doc/tasks.md` 建立模块骨架(手写起点,M0 起)。
 - 基准程序独立目录 `bench/`(`bench/bench.c`)。

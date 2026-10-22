@@ -188,7 +188,7 @@ static void check_defensive_free(void) {
     wmm_free(p);
     wmm_free(p);          /* guard 落地后写 0xBE 事件;现在 dprintf 后返回 */
 
-    /* 大对象同理(大对象本就不进缓存,开关无关) */
+    /* 大对象同理:enabled 关时大对象缓存一并旁路 */
     void *l = wmm_alloc((size_t)1 << 20);
     CHECK(l != NULL);
     wmm_free(l);

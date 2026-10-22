@@ -47,7 +47,8 @@ static int ctl_stats_per_class(const char *cmd, va_list ap)
     pthread_mutex_unlock(&g_guard_lock);
     pthread_mutex_lock(&g_ext_lock);
     st->cls[WMM_NBINS].live    = g_large.live;
-    st->cls[WMM_NBINS].ndalloc = g_large.ndalloc;
+    st->cls[WMM_NBINS].ndalloc = atomic_load_explicit(&g_large.ndalloc,
+                                                      memory_order_relaxed);
     st->cls[WMM_NBINS].size    = 0;
     pthread_mutex_unlock(&g_ext_lock);
     return 0;
@@ -107,6 +108,40 @@ static int ctl_config_verbose(const char *cmd, va_list ap)
     (void)cmd;
     int on = va_arg(ap, int);
     g_opt.verbose = (on != 0);
+    return 0;
+}
+
+/* 字节数向下取整到页;负值、超硬上限、非零不足一页都拒绝 */
+static int ctl_config_tcache_max(const char *cmd, va_list ap)
+{
+    (void)cmd;
+    int bytes = va_arg(ap, int);
+    if (bytes < 0 ||
+        (size_t)bytes > (size_t)WMM_TCACHE_LARGE_MAX_PAGES * WMM_PAGE ||
+        (bytes != 0 && (size_t)bytes < WMM_PAGE)) {
+        errno = EINVAL;
+        return -1;
+    }
+    atomic_store_explicit(&g_opt.tcache_max_pages,
+                          (uint32_t)((size_t)bytes / WMM_PAGE),
+                          memory_order_relaxed);
+    return 0;
+}
+
+static int ctl_config_tcache_budget(const char *cmd, va_list ap)
+{
+    (void)cmd;
+    int bytes = va_arg(ap, int);
+    if (bytes < 0 ||
+        (size_t)bytes >
+            (size_t)WMM_TCACHE_LARGE_MAX_BUDGET_PAGES * WMM_PAGE ||
+        (bytes != 0 && (size_t)bytes < WMM_PAGE)) {
+        errno = EINVAL;
+        return -1;
+    }
+    atomic_store_explicit(&g_opt.tcache_budget_pages,
+                          (uint64_t)((size_t)bytes / WMM_PAGE),
+                          memory_order_relaxed);
     return 0;
 }
 
@@ -199,12 +234,16 @@ static const wmm_ctl_cmd_t g_ctl_cmds[] = {
     { "guard.enable",        ctl_guard_enable,  "内存错误检测开(默认关)" },
     { "guard.disable",       ctl_guard_disable, "检测关(排空隔离区与回收池)" },
     { "purge",               ctl_purge,         "立即回收一次空闲内存(同步)" },
-    { "gc",                  ctl_gc,            "全部线程缓存强制收缩" },
+    { "gc",                  ctl_gc,            "全部线程缓存强制收缩(含大缓存)" },
     { "bg.enable",           ctl_bg_enable,     "后台线程启(回收+聚合)" },
     { "bg.disable",          ctl_bg_disable,    "后台线程停(退出时 join)" },
     { "config.lg_page",      ctl_config_lg_page, "查询页大小 2^N(返回值即 N)" },
     { "config.madvise_mode", ctl_madvise_mode,  "切换内核回收方式 DONTNEED/FREE" },
     { "config.verbose",      ctl_config_verbose, "调试输出开关(参数:int 非 0 开)" },
+    { "config.tcache_max",   ctl_config_tcache_max,
+      "大缓存单块页数上限(参数:int 字节,0=关)" },
+    { "config.tcache_budget", ctl_config_tcache_budget,
+      "每线程大缓存页预算(参数:int 字节,0=不限)" },
     { "shm.create",          ctl_shm_create,    "创建共享监控区(参数:文件路径)" },
 };
 

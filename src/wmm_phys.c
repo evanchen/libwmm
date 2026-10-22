@@ -288,11 +288,19 @@ static wmm_extent_t *extent_acquire_locked(size_t npages, bool *bumped) {
 }
 
 /* 块仍 INUSE 且调用方独占,锁外清页表项 */
-static void extent_clear_ptes(wmm_extent_t *e) {
+void wmm_phys_clear_extent_ptes(wmm_extent_t *e) {
     wmm_pte_t zero;
     zero.raw = 0;
     for (size_t pg = 0; pg < e->npages; pg++)
         wmm_pte_set((char *)e->addr + pg * WMM_PAGE, zero);
+}
+
+/* 块已 INUSE 且已交给调用方,锁外批量登记页表项 */
+void wmm_phys_stamp_extent_ptes(wmm_extent_t *e) {
+    wmm_pte_t pte;
+    pte.raw = (uintptr_t)e | 1u;
+    for (size_t pg = 0; pg < e->npages; pg++)
+        wmm_pte_set((char *)e->addr + pg * WMM_PAGE, pte);
 }
 
 /* 释放 extent(页表已由调用方清零):标脏并向前后合并。空闲邻块已
@@ -426,7 +434,7 @@ void wmm_phys_free_slab(wmm_slab_t *sl) {
     if (e == NULL)
         return;
 
-    extent_clear_ptes(e);
+    wmm_phys_clear_extent_ptes(e);
 
     pthread_mutex_lock(&g_ext_lock);
     extent_release(e);
@@ -476,23 +484,36 @@ wmm_extent_t *wmm_phys_alloc_extent(size_t size) {
     }
 
     /* 块已在锁内标成 INUSE,其他线程不可能取走;指针尚未交给调用方,
-       PTE 批量写在锁外完成,缩短全局临界区 */
-    wmm_pte_t pte;
-    pte.raw = (uintptr_t)e | 1u;
-    for (size_t pg = 0; pg < e->npages; pg++)
-        wmm_pte_set((char *)e->addr + pg * WMM_PAGE, pte);
+       页表批量写在锁外完成,缩短全局临界区 */
+    wmm_phys_stamp_extent_ptes(e);
     return e;
 }
 
 /* 锁外清页表;锁内清统计并交给 extent_release 合并 */
 void wmm_phys_free_extent(wmm_extent_t *ext) {
-    extent_clear_ptes(ext);
+    wmm_phys_clear_extent_ptes(ext);
 
     pthread_mutex_lock(&g_ext_lock);
     g_large.live--;
     g_large.live_bytes -= ext->npages * WMM_PAGE;
-    g_large.ndalloc++;
+    atomic_fetch_add_explicit(&g_large.ndalloc, 1, memory_order_relaxed);
     extent_release(ext);
+    pthread_mutex_unlock(&g_ext_lock);
+}
+
+/* 缓存块页表已清、保持 INUSE;锁内扣账并归还,不再计 ndalloc */
+void wmm_phys_drain_cached_extents(wmm_extent_t *const *exts, uint32_t n) {
+    if (n == 0)
+        return;
+
+    pthread_mutex_lock(&g_ext_lock);
+    for (uint32_t i = 0; i < n; i++) {
+        wmm_extent_t *e = exts[i];
+
+        g_large.live--;
+        g_large.live_bytes -= e->npages * WMM_PAGE;
+        extent_release(e);
+    }
     pthread_mutex_unlock(&g_ext_lock);
 }
 

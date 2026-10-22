@@ -132,6 +132,7 @@ struct wmm_extent_s {
     wmm_extent_t *sz_prev;                      /* 尺寸桶前后链,仅空闲时有效 */
     wmm_extent_t *sz_next;
     wmm_extent_t *next;                         /* 空闲结点回收链 */
+    wmm_extent_t *cache_next;                   /* 线程缓存链,仅缓存时有效 */
     wmm_slab_t   *slab;                         /* 承载的 slab,可为 NULL */
 };
 
@@ -152,6 +153,13 @@ void          wmm_phys_retire_slab(wmm_slab_t *sl);
 wmm_extent_t *wmm_phys_alloc_extent(size_t size);
 
 void          wmm_phys_free_extent(wmm_extent_t *ext);
+
+void          wmm_phys_clear_extent_ptes(wmm_extent_t *ext);
+void          wmm_phys_stamp_extent_ptes(wmm_extent_t *ext);
+
+/* 缓存块页表已清:锁内扣 live 并归还,不计 ndalloc */
+void          wmm_phys_drain_cached_extents(wmm_extent_t *const *exts,
+                                            uint32_t n);
 
 size_t        wmm_phys_audit(void);             /* 白盒:尺寸桶一致性 */
 
@@ -220,6 +228,50 @@ typedef struct {
     wmm_prof_slot_t  slot[WMM_PROF_RING];
 } wmm_prof_ring_t;
 
+/* 大 extent 线程缓存:类 = 精确页数,每类独立 LIFO;默认单块上限
+   8 页(32 KiB),与 jemalloc 的 tcache_max 默认值一致 */
+#ifndef WMM_TCACHE_LARGE_MIN_PAGES
+#define WMM_TCACHE_LARGE_MIN_PAGES 4u
+#endif
+#ifndef WMM_TCACHE_LARGE_NSLOTS
+#define WMM_TCACHE_LARGE_NSLOTS 20u
+#endif
+#ifndef WMM_TCACHE_LARGE_MAX_PAGES
+#define WMM_TCACHE_LARGE_MAX_PAGES 2048u
+#endif
+#ifndef WMM_TCACHE_LARGE_DEFAULT_PAGES
+#define WMM_TCACHE_LARGE_DEFAULT_PAGES 8u
+#endif
+#ifndef WMM_TCACHE_LARGE_DEFAULT_BUDGET_PAGES
+#define WMM_TCACHE_LARGE_DEFAULT_BUDGET_PAGES 2048u
+#endif
+#ifndef WMM_TCACHE_LARGE_MAX_BUDGET_PAGES
+#define WMM_TCACHE_LARGE_MAX_BUDGET_PAGES 16384u
+#endif
+#ifndef WMM_TCACHE_LARGE_GC_EVERY
+#define WMM_TCACHE_LARGE_GC_EVERY 256u
+#endif
+
+_Static_assert(WMM_TCACHE_LARGE_MIN_PAGES >= 1u &&
+               WMM_TCACHE_LARGE_MIN_PAGES <= WMM_TCACHE_LARGE_MAX_PAGES,
+               "大缓存页数下限非法");
+_Static_assert(WMM_TCACHE_LARGE_DEFAULT_PAGES <= WMM_TCACHE_LARGE_MAX_PAGES,
+               "默认大缓存上限超过硬上限");
+_Static_assert(WMM_TCACHE_LARGE_NSLOTS >= 1u &&
+               WMM_TCACHE_LARGE_NSLOTS <= UINT16_MAX,
+               "大缓存每类槽数非法");
+_Static_assert(WMM_TCACHE_LARGE_GC_EVERY >= 1u &&
+               WMM_TCACHE_LARGE_GC_EVERY <= UINT16_MAX,
+               "大缓存滚动 GC 周期非法");
+_Static_assert(WMM_TCACHE_LARGE_DEFAULT_BUDGET_PAGES <=
+               WMM_TCACHE_LARGE_MAX_BUDGET_PAGES,
+               "默认大缓存预算超过硬上限");
+_Static_assert((uint64_t)WMM_TCACHE_LARGE_NSLOTS *
+               (WMM_TCACHE_LARGE_MAX_PAGES + WMM_TCACHE_LARGE_MIN_PAGES) *
+               (WMM_TCACHE_LARGE_MAX_PAGES - WMM_TCACHE_LARGE_MIN_PAGES + 1u)
+               / 2u <= UINT32_MAX,
+               "大缓存页计数上界溢出 uint32");
+
 typedef struct wmm_tcache_s wmm_tcache_t;
 
 /* 线程缓存块:自身与各 bin 的对象栈在同一块 mmap 中 */
@@ -238,7 +290,16 @@ struct wmm_tcache_s {
     uint32_t      gc_evt;
     uint8_t       gc_next;                      /* 下一轮 GC 起始 bin */
 
-    wmm_cache_bin_t bins[WMM_NBINS + 1];        /* [36] 保留给大对象 */
+    wmm_cache_bin_t bins[WMM_NBINS + 1];        /* [36] 保留,勿用 */
+
+    /* 整 extent 大对象缓存:属主线程无锁改;按精确页数分类 */
+    _Atomic uint32_t nlarge;                    /* 缓存块总数,统计跨线程读 */
+    uint32_t         large_pages;               /* 已缓存页数,预算记账 */
+    uint32_t         large_max_pages;           /* 本缓存数组上界,创建时定 */
+    uint16_t         large_gc_evt;              /* 大对象 put 滚动 GC 计数 */
+    wmm_extent_t   **large_head;                /* [large_max_pages+1] */
+    uint16_t        *large_count;               /* 每类槽数 */
+    uint16_t        *large_used;                /* 上次 GC 以来取用次数 */
 
     uint32_t        prof_tick;
     wmm_prof_ring_t prof;
@@ -284,6 +345,12 @@ void     wmm_tcache_gc_all(void);
 
 void    *wmm_tcache_alloc(szind_t i);
 void     wmm_tcache_free(szind_t i, void *p);
+
+uint32_t wmm_tcache_max_pages_now(void);
+uint64_t wmm_tcache_budget_pages_now(void);
+
+wmm_extent_t *wmm_tcache_large_take(wmm_tcache_t *t, size_t npages);
+bool          wmm_tcache_large_put(wmm_tcache_t *t, wmm_extent_t *ext);
 
 uint64_t wmm_tcache_cached_total(void);
 
@@ -347,17 +414,20 @@ extern void *g_heap_cur;                        /* 窗口 bump 指针 */
 
 extern pthread_mutex_t g_ext_lock;
 
-/* 大对象累计统计,由 g_ext_lock 保护 */
+/* 大对象统计:live/live_bytes 由 g_ext_lock 保护;ndalloc 原子,
+   缓存释放路径在锁外累加 */
 typedef struct {
-    uint64_t live;
-    uint64_t live_bytes;
-    uint64_t ndalloc;
+    uint64_t        live;
+    uint64_t        live_bytes;
+    _Atomic uint64_t ndalloc;
 } wmm_large_stats_t;
 
 extern wmm_large_stats_t g_large;
 
 typedef struct {
     size_t   dirty_max;                         /* 脏页阈值(字节) */
+    _Atomic uint32_t tcache_max_pages;          /* 单块页数上限;0=关 */
+    _Atomic uint64_t tcache_budget_pages;       /* 每线程页预算;0=不限 */
     _Atomic int madvise_mode;                   /* MADV_DONTNEED / MADV_FREE */
     _Atomic unsigned sample_n;                  /* 采样间隔;0=关 */
     _Atomic bool guard;
