@@ -699,7 +699,7 @@ static void check_large_basic(uint64_t base) {
     CHECK(p != NULL);
     CHECK(total_live() == base + 1);
     wmm_free(p);
-    CHECK(t->large_head[4] == p);
+    CHECK(t->large_head[4] != NULL && t->large_head[4]->addr == p);
     CHECK(t->large_count[4] == 1);
     CHECK(t->large_pages == 4);
     CHECK(large_slots(t) == 1);
@@ -767,8 +767,8 @@ static void check_large_basic(uint64_t base) {
     CHECK(a4 != NULL && a4 != b5);
     CHECK(wmm_usable_size(a4) == 16384);
     CHECK(t->large_count[5] == 1);
-    CHECK(t->large_count[4] == 1);      /* 刚释放的 4 页块进 4 页类 */
     wmm_free(a4);
+    CHECK(t->large_count[4] == 1);      /* 刚释放的 4 页块进 4 页类 */
 
     void *c5 = wmm_alloc(5 * WMM_PAGE);
     CHECK(c5 == b5);
@@ -1035,10 +1035,10 @@ static void check_large_flush_gc(uint64_t base) {
     CHECK(p != NULL);
     wmm_free(p);
     CHECK(t->large_count[4] == 1);
-    CHECK(t->large_head[4] == p);
+    CHECK(t->large_head[4] != NULL && t->large_head[4]->addr == p);
     wmm_free(p);
     CHECK(t->large_count[4] == 1);
-    CHECK(t->large_head[4] == p);
+    CHECK(t->large_head[4] != NULL && t->large_head[4]->addr == p);
     CHECK(t->large_pages == 4);
     CHECK(large_slots(t) == 1);
     CHECK(total_live() == base + 1);
@@ -1394,7 +1394,8 @@ static void check_fork_single_thread(void) {
         if (total_live() != g_fork_live)
             bad |= 8;                /* 没有对象被凭空归还或吞掉 */
         if (g_tcache->large_count[4] != 1 ||
-            g_tcache->large_head[4] != g_fork_large)
+            g_tcache->large_head[4] == NULL ||
+            g_tcache->large_head[4]->addr != g_fork_large)
             bad |= 64;
 
         void *p = wmm_alloc(64);     /* 必须命中:水位恰降一格 */
