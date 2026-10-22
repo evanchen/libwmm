@@ -18,7 +18,8 @@
  *
  * 与 glibc malloc 家族一致的行为契约(专门的 API 测试逐条覆盖):
  *   - wmm_alloc 返回 16 字节对齐指针(仅 8 字节的最小类允许 8 字节);
- *   - 内存不足(OOM)返回 NULL(可配置为直接 abort,快速失败);
+ *   - 内存不足(OOM)返回 NULL 并置 errno=ENOMEM(可配置为直接
+ *     abort,快速失败);
  *   - wmm_free(NULL) 无操作;wmm_realloc(NULL, n) 等价 wmm_alloc(n);
  *     wmm_realloc(p, 0) 等价 wmm_free(p) 并返回 NULL;
  *   - wmm_usable_size(p) 恒 ≥ 当初请求的大小。
@@ -127,15 +128,18 @@ typedef struct {
  * `-Wl,--wrap` 链接期接管只是把这组函数挂到 malloc 名下,语义不变。 */
 
 /* 分配 size 字节;size==0 按 1 处理(glibc 同款)。
- * 返回 16 字节对齐指针;OOM 返回 NULL(或按配置 abort)。 */
+ * 返回 16 字节对齐指针;OOM 返回 NULL 并置 errno=ENOMEM
+ * (或按配置 abort)。 */
 void  *wmm_alloc(size_t size);
 
-/* calloc 语义:n*size 溢出返回 NULL;成功时内存已清零。 */
+/* calloc 语义:n*size 溢出返回 NULL 并置 errno=ENOMEM;
+ * 成功时内存已清零。 */
 void  *wmm_calloc(size_t n, size_t size);
 
 /* realloc 语义:p==NULL 时等价 wmm_alloc(n);n==0 时等价 wmm_free(p)
  * 并返回 NULL;n 不超过可用大小时原地返回 p(不搬移);否则新分配、
- * 拷贝 min(旧可用大小, n) 字节、释放旧块。 */
+ * 拷贝 min(旧可用大小, n) 字节、释放旧块。分配失败返回 NULL 并置
+ * errno=ENOMEM,旧块保持有效。 */
 void  *wmm_realloc(void *p, size_t size);
 
 /* reallocarray 语义:等价于 wmm_realloc(p, n*size),但先检查乘法
@@ -237,6 +241,11 @@ void wmm_atfork_child(void);
  *   config.verbose            调试输出开关,变参为 int(非 0 开)。
  *                             只影响尽力而为的诊断日志;fatal/OOM 与
  *                             事件记录不受影响
+ *   config.abort_oom          OOM 时直接 abort 而非返回 NULL,变参为
+ *                             int(非 0 开);默认关
+ *   config.dump               无参:把当前生效的调优配置打印到 stderr
+ *                             (tcache_max/budget、dirty_max、madvise、
+ *                             abort_oom、verbose、guard、采样间隔)
  *   config.tcache_max         大对象缓存单块上限,变参为 int 字节数,
  *                             范围 0..8 MiB,默认 32 KiB(与 jemalloc
  *                             的 tcache_max 一致),0=关闭;非页对齐值

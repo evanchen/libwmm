@@ -532,7 +532,8 @@ typedef struct wmm_extent_s {
 - 命中则低段交付、余段(≥1 页)按原状态挂回对应尺寸桶;元数据耗尽无法分裂
   时整块交付(多给不损坏,只浪费);
 - 无命中 → 窗口 bump `mmap(g_heap_cur, …, MAP_FIXED)` 并尾插地址序链;
-- **失败**:窗口耗尽 → OOM 路径(dprintf 用量 + abort_oom),`wmm_alloc` 返回 NULL。
+- **失败**:窗口耗尽 → OOM 路径(dprintf 用量 + abort_oom),
+  `wmm_alloc` 返回 NULL 并置 `errno=ENOMEM`。
 
 ### M6.3 释放 extent_release(核心,PHY1)
 1. **页表立即清零**(raw=0):页表语义定为"当前归属"——不清零的话,复用窗口期
@@ -1271,6 +1272,9 @@ static unsigned wmm_backtrace(void **buf, unsigned max) {
 | `purge` | M10(同步执行一次) |
 | `gc` | 遍历所有线程 tcache 强制 GC(M9) |
 | `config.lg_page` / `config.madvise_mode` | M2/M10 常量 |
+| `config.verbose` / `config.abort_oom` | 运行期开关 |
+| `config.tcache_max` / `config.tcache_budget` | M8.5 大缓存 |
+| `config.dump` | 打印当前生效配置 |
 | `bg.enable/disable` | M10 线程 |
 
 ### M15.2 `-Wl,--wrap`(指南 §12 方案 B)

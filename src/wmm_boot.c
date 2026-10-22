@@ -133,10 +133,19 @@ void wmm_boot(void) {
         abort();
     }
 
-    if (g_opt.verbose)
+    if (g_opt.verbose) {
+        size_t max_b = (size_t)atomic_load_explicit(&g_opt.tcache_max_pages,
+                                                    memory_order_relaxed)
+                       * WMM_PAGE;
+        size_t budget_b =
+            (size_t)atomic_load_explicit(&g_opt.tcache_budget_pages,
+                                         memory_order_relaxed) * WMM_PAGE;
+
         wmm_dprintf("boot ok: heap window %zu MB at %p, page table %zu MB, "
-                    "%u bins\n", win >> 20, base, pte_bytes >> 20,
-                    (unsigned)WMM_NBINS);
+                    "%u bins, tcache_max %zu B, tcache_budget %zu B\n",
+                    win >> 20, base, pte_bytes >> 20, (unsigned)WMM_NBINS,
+                    max_b, budget_b);
+    }
 
     g_boot_done = true;
 }

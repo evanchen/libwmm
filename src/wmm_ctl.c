@@ -111,6 +111,35 @@ static int ctl_config_verbose(const char *cmd, va_list ap)
     return 0;
 }
 
+/* OOM 策略:非 0 表示失败时 abort 而不是返回 NULL */
+static int ctl_config_abort_oom(const char *cmd, va_list ap)
+{
+    (void)cmd;
+    int on = va_arg(ap, int);
+    atomic_store_explicit(&g_opt.abort_oom, on != 0, memory_order_relaxed);
+    return 0;
+}
+
+/* 打印当前生效配置,供服务启动时记录到日志 */
+static int ctl_config_dump(const char *cmd, va_list ap)
+{
+    (void)cmd;
+    (void)ap;
+    size_t maxp = (size_t)atomic_load_explicit(&g_opt.tcache_max_pages,
+                                               memory_order_relaxed);
+    size_t budgetp = (size_t)atomic_load_explicit(&g_opt.tcache_budget_pages,
+                                                  memory_order_relaxed);
+
+    wmm_dprintf("config: tcache_max=%zu B (%zu pages), tcache_budget=%zu B "
+                "(%zu pages), dirty_max=%zu B, madvise=%d, abort_oom=%d, "
+                "verbose=%d, guard=%d, sample_n=%u\n",
+                maxp * WMM_PAGE, maxp, budgetp * WMM_PAGE, budgetp,
+                g_opt.dirty_max, (int)g_opt.madvise_mode,
+                (int)g_opt.abort_oom, (int)g_opt.verbose, (int)g_opt.guard,
+                (unsigned)g_opt.sample_n);
+    return 0;
+}
+
 /* 字节数向下取整到页;负值、超硬上限、非零不足一页都拒绝 */
 static int ctl_config_tcache_max(const char *cmd, va_list ap)
 {
@@ -240,6 +269,8 @@ static const wmm_ctl_cmd_t g_ctl_cmds[] = {
     { "config.lg_page",      ctl_config_lg_page, "查询页大小 2^N(返回值即 N)" },
     { "config.madvise_mode", ctl_madvise_mode,  "切换内核回收方式 DONTNEED/FREE" },
     { "config.verbose",      ctl_config_verbose, "调试输出开关(参数:int 非 0 开)" },
+    { "config.abort_oom",    ctl_config_abort_oom, "OOM 时 abort(参数:int 非 0 开)" },
+    { "config.dump",         ctl_config_dump,    "打印当前生效配置(stderr)" },
     { "config.tcache_max",   ctl_config_tcache_max,
       "大缓存单块页数上限(参数:int 字节,0=关)" },
     { "config.tcache_budget", ctl_config_tcache_budget,

@@ -18,6 +18,8 @@
   put 的滚动收缩三条路径生效。
 - 新增 `wmm_ctl` 命令 `config.tcache_max` 与 `config.tcache_budget`:
   按字节设置并向下取整到页,带硬上限与非法值校验。
+- 新增 `wmm_ctl` 命令 `config.abort_oom`(运行期切换 OOM 时 abort)
+  与 `config.dump`(把当前生效的 tcache/回收/诊断配置打印到 stderr)。
 - 项目初始化:目录结构、BSD-2-Clause 许可证、规格文档入库(`doc/`)。
 - 按 `doc/tasks.md` 建立模块骨架(手写起点,M0 起)。
 - 基准程序独立目录 `bench/`(`bench/bench.c`)。
@@ -62,6 +64,10 @@
 
 ### Fixed
 
+- `wmm_alloc`/`wmm_calloc`/`wmm_realloc` 的 OOM 失败路径补置
+  `errno=ENOMEM`(含 calloc 乘法溢出),与 glibc/POSIX 契约一致;
+  `wmm_realloc` 失败时旧块保持有效。`config.abort_oom` 同时覆盖
+  元数据结点、slab 头与 guard 头耗尽路径。
 - 大对象分配改用交付块的实际页数 `e->npages` 计入 `live_bytes` 并
   登记页表,与释放侧口径一致;切分结点分配失败导致整块超额交付时,
   不再出现分配少记、释放多减的漂移。

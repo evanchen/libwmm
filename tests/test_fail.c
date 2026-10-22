@@ -151,10 +151,12 @@ static void check_map_oom(void) {
 
     /* 池已干,64KB 大对象只能走窗口 bump,注入点必然被检查到 */
     fault_arm(WMM_FAULT_MAP, WMM_FAULT_ALWAYS);
+    errno = 0;
     void *p = wmm_alloc(64 << 10);
     fault_off();
 
     CHECK(p == NULL);
+    CHECK(errno == ENOMEM);
 
     /* 失败发生在任何状态变更之前:统计必须与实际内存一致 */
     CHECK(wmm_stats_snapshot(&s1) == 0);
@@ -173,6 +175,17 @@ static void check_map_oom(void) {
     CHECK(p != NULL);
     if (p != NULL) {
         memset(p, 0xA5, 64 << 10);
+
+        /* realloc 扩容失败:errno=ENOMEM,旧块内容保持 */
+        fault_arm(WMM_FAULT_MAP, WMM_FAULT_ALWAYS);
+        errno = 0;
+        void *q = wmm_realloc(p, 128 << 10);
+        fault_off();
+        CHECK(q == NULL);
+        CHECK(errno == ENOMEM);
+        CHECK(((unsigned char *)p)[0] == 0xA5);
+        CHECK(((unsigned char *)p)[(64 << 10) - 1] == 0xA5);
+
         wmm_free(p);
     }
 }

@@ -435,7 +435,8 @@ static int oom_abort_child_case(void) {
 
         /* 不写核心转储:64GB 地址空间的核心文件会让父进程等待超时 */
         (void)setrlimit(RLIMIT_CORE, &no_core);
-        g_opt.abort_oom = true;
+        if (wmm_ctl("config.abort_oom", 1) != 0)
+            _exit(3);
         for (;;) {
             void *p = wmm_alloc((size_t)64 << 20);
 

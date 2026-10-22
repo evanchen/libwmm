@@ -440,7 +440,7 @@ typedef struct {
     _Atomic unsigned sample_n;                  /* 采样间隔;0=关 */
     _Atomic bool guard;
     _Atomic bool verbose;
-    bool     abort_oom;                         /* OOM 时 abort 而非返回 NULL */
+    _Atomic bool abort_oom;                     /* OOM 时 abort 而非返回 NULL */
 } wmm_opt_t;
 
 extern wmm_opt_t g_opt;

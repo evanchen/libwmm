@@ -167,6 +167,8 @@ static wmm_extent_t *extent_reserve_bump_locked(size_t npages) {
     wmm_extent_t *e = ext_node_get();
     if (e == NULL) {
         wmm_event_log(0xDB, NULL);
+        if (g_opt.abort_oom)
+            abort();
         return NULL;
     }
 
@@ -415,6 +417,8 @@ wmm_slab_t *wmm_phys_alloc_slab(szind_t i) {
     wmm_slab_t *sl = slab_hdr_get();
     if (sl == NULL) {
         wmm_event_log(0xDB, NULL);
+        if (g_opt.abort_oom)
+            abort();
         return NULL;
     }
 

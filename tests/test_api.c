@@ -111,9 +111,13 @@ static void check_usable_exact(void) {
 
 /* ---- calloc:溢出与清零(含复用对象的再清零) ---- */
 static void check_calloc(void) {
-    /* 乘法溢出 → NULL,不回绕 */
+    /* 乘法溢出 → NULL,不回绕;errno 与 glibc 一致为 ENOMEM */
+    errno = 0;
     CHECK(wmm_calloc(SIZE_MAX / 2, 3) == NULL);
+    CHECK(errno == ENOMEM);
+    errno = 0;
     CHECK(wmm_calloc((size_t)1 << 40, (size_t)1 << 30) == NULL);
+    CHECK(errno == ENOMEM);
 
     /* 先造脏块再释放;同线程同类的下一次分配按 LIFO 必弹出它——
        calloc 若跳过 memset 就把 0xAB 泄漏给应用了 */

@@ -312,8 +312,10 @@ void *wmm_alloc(size_t size) {
                                         >> WMM_LG_PAGE);
         if (ext == NULL)
             ext = wmm_phys_alloc_extent(size);
-        if (ext == NULL)
+        if (ext == NULL) {
+            errno = ENOMEM;
             return NULL;
+        }
 
         if (t != NULL) {
             wmm_tcache_count_alloc(t, ext->npages * WMM_PAGE);
@@ -337,6 +339,8 @@ void *wmm_alloc(size_t size) {
                 if (g_opt.sample_n != 0)
                     wmm_prof_sample(t, reg, WMM_ALLOC_FRAME());
             }
+        } else {
+            errno = ENOMEM;
         }
         return p;
     }
@@ -376,6 +380,8 @@ void *wmm_alloc(size_t size) {
             wmm_prof_sample(g_tcache, wmm_bin_info[i].reg_size,
                             WMM_ALLOC_FRAME());
     }
+    if (p == NULL)
+        errno = ENOMEM;
     return p;
 }
 
@@ -443,8 +449,10 @@ void wmm_free(void *p) {
 
 /* 乘积溢出返回 NULL;取得内存后清零 */
 void *wmm_calloc(size_t n, size_t size) {
-    if (size != 0 && n > SIZE_MAX / size)
+    if (size != 0 && n > SIZE_MAX / size) {
+        errno = ENOMEM;
         return NULL;
+    }
 
     size_t bytes = n * size;
     void *p = wmm_alloc(bytes);

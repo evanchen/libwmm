@@ -124,6 +124,16 @@ int test_boot(void) {
     CHECK(!g_opt.verbose);
     g_opt.verbose = saved;
 
+    /* abort_oom 只验证落值与恢复;真正 abort 由 oomcheck 的子进程覆盖 */
+    bool saved_abort = g_opt.abort_oom;
+    CHECK(wmm_ctl("config.abort_oom", 1) == 0);
+    CHECK(g_opt.abort_oom);
+    CHECK(wmm_ctl("config.abort_oom", 0) == 0);
+    CHECK(!g_opt.abort_oom);
+    g_opt.abort_oom = saved_abort;
+
+    CHECK(wmm_ctl("config.dump") == 0);
+
     if (g_fail == 0)
         printf("  all boot checks passed\n");
     return g_fail;

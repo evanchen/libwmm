@@ -123,6 +123,8 @@ static wmm_slab_t *guard_slab_get_locked(szind_t i) {
         sl = (wmm_slab_t *)wmm_base_alloc(sizeof(*sl));
         if (sl == NULL) {
             wmm_event_log(0xDB, NULL);
+            if (g_opt.abort_oom)
+                abort();
             return NULL;
         }
     }

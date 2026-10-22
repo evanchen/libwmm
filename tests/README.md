@@ -4,9 +4,9 @@
 
 | 文件 | 覆盖 | 要点 |
 |---|---|---|
-| test_boot.c | 启动:窗口/页表零页/幂等/base 分配器 | 页表禁 memset 的 RSS 证据 |
+| test_boot.c | 启动:窗口/页表零页/幂等/base 分配器/运行期配置命令 | 页表禁 memset 的 RSS 证据 |
 | test_slab.c | slab 空闲链/页表登记/bin 状态机 | 满/非满/退休三态转换 |
-| test_api.c | API 契约:对齐/usable/calloc/realloc/对齐分配/防御释放 | 契约逐条对照 glibc 语义 |
+| test_api.c | API 契约:对齐/usable/calloc/realloc/对齐分配/防御释放/OOM errno | 契约逐条对照 glibc 语义 |
 | test_phys.c | 物理层:合并/分裂/尺寸桶/复用/slab 头回收/同种子重放/purge 回收/后台线程 | 重放第二遍零新映射;dirty→RETAINED 页数守恒 + RSS 实测回落;跨状态合并重新记账;退役 slab 头被下一次新 slab 复用;每个检查点跑尺寸桶一致性审计 |
 | test_oracle.c | oracle 属性测试:随机百万步对照参考模型 + glibc 对照 | 每步对账 + 每 10 万步收敛 |
 | test_stress.c | 多线程压力:4/8/16 线程独立序列 | 屏障对账 + RSS 平稳观察 |
