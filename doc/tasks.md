@@ -726,11 +726,14 @@ wmm_free:  反查 szind → if (小 && tcache 启用) wmm_tcache_free(i, p)
   `config.tcache_max` 与 `config.tcache_budget` 运行期可调;提高单块
   上限只影响之后创建的线程缓存(数组在创建时切出),降低立即生效。
 - **大缓存 GC**:按"上次 GC 以来的取用次数"判活,不依赖墙钟。
-  `tcache_large_gc` 扫描每个页数类:`used == 0` 或页数超过当前上限的
-  类整类归还;用过的类保留 `used + used/4` 个最新块。触发路径三条:
-  `gc` 命令(本线程同步,其他线程置 `gc_req`)、小对象 free 与大对象
-  put 入口统一消费 `gc_req`、每 256 次大对象 put 的滚动 GC。线程退出
-  时整体 flush。
+  `tcache_large_gc_class` 收缩单个页数类:`used == 0` 或页数超过当前
+  上限的类整类归还;用过的类保留 `used + used/4` 个最新块。触发路径
+  三条:`gc` 命令(本线程同步,其他线程置 `gc_req`)、小对象 free 与
+  大对象 put 入口统一消费 `gc_req`、每 256 次大对象 put 的滚动 GC。
+  前两条走完整收缩;滚动路径每次最多归还
+  `WMM_TCACHE_LARGE_GC_PAGES`(默认 128)页,用 `large_gc_cursor`
+  轮转页数类,被预算截断的类保留 `used` 等下一圈;超过当前上限的类
+  不可命中,遇到时整类归还且不占页预算。线程退出时整体 flush。
 - **live 语义(与指南 §10.1 I2 勘误一致)**:fill 时 bin 锁内 `live += n`、flush 时
   `live -= n`、慢路径直接分配/释放 ±1 → **live = 应用持有 + tcache 缓存**(jemalloc 同义)。
   自 M8 起,M7 oracle 断言④改为 `Σ live[i] − Σ tcache head[i] == 活指针集合数`;

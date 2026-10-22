@@ -251,6 +251,9 @@ typedef struct {
 #ifndef WMM_TCACHE_LARGE_GC_EVERY
 #define WMM_TCACHE_LARGE_GC_EVERY 256u
 #endif
+#ifndef WMM_TCACHE_LARGE_GC_PAGES
+#define WMM_TCACHE_LARGE_GC_PAGES 128u
+#endif
 
 _Static_assert(WMM_TCACHE_LARGE_MIN_PAGES >= 1u &&
                WMM_TCACHE_LARGE_MIN_PAGES <= WMM_TCACHE_LARGE_MAX_PAGES,
@@ -263,6 +266,10 @@ _Static_assert(WMM_TCACHE_LARGE_NSLOTS >= 1u &&
 _Static_assert(WMM_TCACHE_LARGE_GC_EVERY >= 1u &&
                WMM_TCACHE_LARGE_GC_EVERY <= UINT16_MAX,
                "大缓存滚动 GC 周期非法");
+_Static_assert(WMM_TCACHE_LARGE_GC_PAGES >= 1u,
+               "大缓存滚动 GC 页预算非法");
+_Static_assert(WMM_TCACHE_LARGE_MAX_PAGES <= UINT16_MAX,
+               "大缓存页数类游标溢出 uint16");
 _Static_assert(WMM_TCACHE_LARGE_DEFAULT_BUDGET_PAGES <=
                WMM_TCACHE_LARGE_MAX_BUDGET_PAGES,
                "默认大缓存预算超过硬上限");
@@ -297,6 +304,7 @@ struct wmm_tcache_s {
     uint32_t         large_pages;               /* 已缓存页数,预算记账 */
     uint32_t         large_max_pages;           /* 本缓存数组上界,创建时定 */
     uint16_t         large_gc_evt;              /* 大对象 put 滚动 GC 计数 */
+    uint16_t         large_gc_cursor;           /* 下一页数类,完整 GC 复位 */
     wmm_extent_t   **large_head;                /* [large_max_pages+1] */
     uint16_t        *large_count;               /* 每类槽数 */
     uint16_t        *large_used;                /* 上次 GC 以来取用次数 */

@@ -30,8 +30,9 @@
  *         或超预算回落物理层;flush 与线程退出归还且不重复计 ndalloc;
  *         enabled=false 一并旁路。
  *   大缓存 GC:按上次 GC 以来的取用次数收缩——未取用的类整类归还,
- *         用过的类保留取用量加 25% 的最新块;gc 命令、跨线程 gc_req、
- *         每 256 次 put 的滚动 GC 三条触发路径分别验证。
+ *         用过的类保留取用量加 25% 的最新块;gc 命令、跨线程 gc_req
+ *         是完整收缩,每 256 次 put 的滚动收缩按 128 页限额轮转页数
+ *         类,部分归还的类保留取用信号等下一圈。
  *   大缓存旋钮:config.tcache_max 降低立即生效、提高只影响新线程;
  *         config.tcache_budget 只限制放入;非法值一律 EINVAL。
  *   跨线程释放:从未分配过的线程 free 别的线程的对象,走慢路径直接
@@ -683,12 +684,45 @@ static void large_expect_empty(uint64_t base) {
     CHECK(large_slots(t) == cnt);
     CHECK(large_slots(t) == 0);
     CHECK(t->large_gc_evt == 0);
+    CHECK(t->large_gc_cursor == WMM_TCACHE_LARGE_MIN_PAGES);
     CHECK(total_live() == base);
 }
 
 static void large_reset(uint64_t base) {
     wmm_tcache_flush_all();
     large_expect_empty(base);
+}
+
+/* 白盒核对每条类链:链长、页数、nlarge 与头指针一致 */
+static void large_check_counts(const wmm_tcache_t *t) {
+    uint32_t total = 0;
+    uint32_t pages = 0;
+
+    for (uint32_t p = WMM_TCACHE_LARGE_MIN_PAGES;
+         p <= t->large_max_pages; p++) {
+        uint32_t n = 0;
+
+        for (const wmm_extent_t *e = t->large_head[p]; e != NULL;
+             e = e->cache_next)
+            n++;
+        CHECK(n == t->large_count[p]);
+        CHECK((n != 0) == (t->large_head[p] != NULL));
+        total += n;
+        pages += n * p;
+    }
+    CHECK(large_slots(t) == total);
+    CHECK(t->large_pages == pages);
+}
+
+/* 用不可缓存的页数块触发一次滚动 GC:先置事件计数再 free */
+static void large_trigger_rolling(uint32_t npages) {
+    wmm_tcache_t *t = g_tcache;
+
+    t->large_gc_evt = WMM_TCACHE_LARGE_GC_EVERY - 1;
+    void *p = wmm_alloc((size_t)npages * WMM_PAGE);
+    CHECK(p != NULL);
+    wmm_free(p);
+    CHECK(t->large_gc_evt == 0);
 }
 
 /* 精确页数命中、类独立、每类 20 槽封顶、不同页数不串用 */
@@ -900,6 +934,11 @@ typedef struct {
     uint16_t   cnt256;
     uint32_t   pages;
     uint32_t   nlarge;
+    uint16_t   cnt4_late;
+    uint16_t   cnt256_late;
+    uint16_t   cursor_late;
+    uint32_t   pages_late;
+    uint32_t   nlarge_late;
 } raise_arg_t;
 
 static void *raise_worker(void *arg) {
@@ -936,6 +975,28 @@ static void *raise_worker(void *arg) {
         err |= 8u;
     if (a->pages != 260 || a->nlarge != 2)
         err |= 16u;
+
+    /* 单块超过滚动页预算也要归还一块,保证 GC 前进 */
+    g_tcache->large_gc_cursor = 256;
+    g_tcache->large_gc_evt = WMM_TCACHE_LARGE_GC_EVERY - 1;
+    void *over = wmm_alloc(2049 * WMM_PAGE);
+    if (over == NULL) {
+        err |= 32u;
+    } else {
+        wmm_free(over);
+    }
+    a->cnt4_late   = g_tcache->large_count[4];
+    a->cnt256_late = g_tcache->large_count[256];
+    a->cursor_late = g_tcache->large_gc_cursor;
+    a->pages_late  = g_tcache->large_pages;
+    a->nlarge_late = atomic_load_explicit(&g_tcache->nlarge,
+                                          memory_order_relaxed);
+    if (a->cnt4_late != 1 || a->cnt256_late != 0)
+        err |= 64u;
+    if (a->pages_late != 4 || a->nlarge_late != 1)
+        err |= 128u;
+    if (a->cursor_late != 257)
+        err |= 256u;
     a->err = err;
 
     atomic_store_explicit(&a->ready, 1, memory_order_release);
@@ -968,6 +1029,11 @@ static void check_large_raise(uint64_t base) {
     a.cnt256 = 0;
     a.pages  = 0;
     a.nlarge = 0;
+    a.cnt4_late   = 0;
+    a.cnt256_late = 0;
+    a.cursor_late = 0;
+    a.pages_late  = 0;
+    a.nlarge_late = 0;
     atomic_init(&a.ready, 0);
     atomic_init(&a.go, 0);
 
@@ -982,6 +1048,9 @@ static void check_large_raise(uint64_t base) {
         CHECK(a.maxp == WMM_TCACHE_LARGE_MAX_PAGES);
         CHECK(a.cnt4 == 1 && a.cnt256 == 1);
         CHECK(a.pages == 260 && a.nlarge == 2);
+        CHECK(a.cnt4_late == 1 && a.cnt256_late == 0);
+        CHECK(a.pages_late == 4 && a.nlarge_late == 1);
+        CHECK(a.cursor_late == 257);
 
         atomic_store_explicit(&a.go, 1, memory_order_release);
         CHECK(pthread_join(th, NULL) == 0);
@@ -1074,7 +1143,9 @@ static void check_large_flush_gc(uint64_t base) {
 
     uint64_t live0 = total_live();
     nd0 = atomic_load_explicit(&g_large.ndalloc, memory_order_relaxed);
+    t->large_gc_cursor = 5;   /* 白盒:完整 GC 应复位游标 */
     CHECK(wmm_ctl("gc") == 0);
+    CHECK(t->large_gc_cursor == WMM_TCACHE_LARGE_MIN_PAGES);
     CHECK(t->large_count[4] == 1);
     CHECK(t->large_count[6] == 0);
     CHECK(t->large_count[8] == 0);
@@ -1092,6 +1163,21 @@ static void check_large_flush_gc(uint64_t base) {
     wmm_free(again);
     wmm_free(hit);
     large_reset(base);
+
+    /* flush 不受滚动页限额:8 页类 20 块共 160 页一次清空 */
+    void *u[WMM_TCACHE_LARGE_NSLOTS];
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++) {
+        u[k] = wmm_alloc(8 * WMM_PAGE);
+        CHECK(u[k] != NULL);
+    }
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++)
+        wmm_free(u[k]);
+    CHECK(t->large_count[8] == WMM_TCACHE_LARGE_NSLOTS);
+    CHECK(t->large_pages == 8 * WMM_TCACHE_LARGE_NSLOTS);
+
+    t->large_gc_cursor = 6;
+    wmm_tcache_flush_all();
+    large_expect_empty(base);
 }
 
 /* 跨线程 GC:只做大对象 free 的线程也必须在 put 入口消费 gc_req */
@@ -1104,6 +1190,7 @@ typedef struct {
     unsigned      err;
     uint16_t      cnt4_after;
     uint16_t      cnt5_after;
+    uint16_t      cnt8_after;
     uint32_t      nlarge_after;
 } large_gc_arg_t;
 
@@ -1127,10 +1214,24 @@ static void *large_gc_worker(void *arg) {
     else
         wmm_free(p);                    /* 4 页类留一块存量 */
 
+    void *b8[WMM_TCACHE_LARGE_NSLOTS];
+    bool  b8_ok = true;
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++) {
+        b8[k] = wmm_alloc(8 * WMM_PAGE);
+        if (b8[k] == NULL)
+            b8_ok = false;
+    }
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++)
+        if (b8[k] != NULL)
+            wmm_free(b8[k]);
+    if (!b8_ok)
+        err |= 2u;
+
     a->hold = wmm_alloc(5 * WMM_PAGE);  /* 预分配,放行后释放 */
     if (a->hold == NULL)
         err |= 4u;
-    if (g_tcache->large_count[4] != 1)
+    if (g_tcache->large_count[4] != 1 ||
+        g_tcache->large_count[8] != WMM_TCACHE_LARGE_NSLOTS)
         err |= 8u;
 
     a->err = err;
@@ -1143,6 +1244,7 @@ static void *large_gc_worker(void *arg) {
 
     a->cnt4_after   = g_tcache->large_count[4];
     a->cnt5_after   = g_tcache->large_count[5];
+    a->cnt8_after   = g_tcache->large_count[8];
     a->nlarge_after = atomic_load_explicit(&g_tcache->nlarge,
                                            memory_order_relaxed);
     if (atomic_load_explicit(&g_tcache->gc_req, memory_order_acquire) != 0)
@@ -1161,6 +1263,7 @@ static void check_large_cross_gc(uint64_t base) {
     a.err         = 0;
     a.cnt4_after  = 0;
     a.cnt5_after  = 0;
+    a.cnt8_after  = 0;
     a.nlarge_after = 0;
     atomic_init(&a.ready, 0);
     atomic_init(&a.go, 0);
@@ -1179,7 +1282,9 @@ static void check_large_cross_gc(uint64_t base) {
     CHECK(a.t != NULL && a.t != g_tcache);
     if (a.t != NULL) {
         CHECK(a.t->large_count[4] == 1);
-        CHECK(wmm_tcache_cached_total() == 1);
+        CHECK(a.t->large_count[8] == WMM_TCACHE_LARGE_NSLOTS);
+        CHECK(wmm_tcache_cached_total() ==
+              1 + WMM_TCACHE_LARGE_NSLOTS);
 
         /* 控制线程:自己同步收缩,工作线程只置位;它停在 go 上,
            不会消费请求,所以置位后可以稳定观察 1 */
@@ -1195,6 +1300,7 @@ static void check_large_cross_gc(uint64_t base) {
 
     CHECK(a.err == 0);
     CHECK(a.cnt4_after == 0);       /* 请求先收缩旧类,再放入本块 */
+    CHECK(a.cnt8_after == 0);       /* 跨线程请求是完整收缩,不受页限额 */
     CHECK(a.cnt5_after == 1);
     CHECK(a.nlarge_after == 1);
     CHECK(tc_nodes() == nodes0);
@@ -1217,6 +1323,7 @@ static void check_large_rolling_gc(uint64_t base) {
     CHECK(t->large_used[4] == 0);
 
     t->large_gc_evt = 0;   /* 白盒:让滚动周期从本次循环起算 */
+    t->large_gc_cursor = WMM_TCACHE_LARGE_MIN_PAGES;
 
     for (unsigned k = 0; k < WMM_TCACHE_LARGE_GC_EVERY; k++) {
         void *p = wmm_alloc(5 * WMM_PAGE);
@@ -1225,9 +1332,333 @@ static void check_large_rolling_gc(uint64_t base) {
     }
     CHECK(t->large_count[4] == 0);   /* 到点,未取用的类整类归还 */
     CHECK(t->large_gc_evt == 0);
+    CHECK(t->large_gc_cursor == WMM_TCACHE_LARGE_MIN_PAGES);
     CHECK(t->large_count[5] == 1);
     CHECK(t->large_pages == 5);
     CHECK(large_slots(t) == 1);
+    large_check_counts(t);
+    large_reset(base);
+}
+
+/* 滚动 GC 按页限额并轮转页数类:默认 128 页的确定性回放 */
+static void check_large_rolling_bounded(uint64_t base) {
+    wmm_tcache_t *t = g_tcache;
+    void *b4[WMM_TCACHE_LARGE_NSLOTS];
+    void *b5[WMM_TCACHE_LARGE_NSLOTS];
+    void *b6[WMM_TCACHE_LARGE_NSLOTS];
+    void *b8[WMM_TCACHE_LARGE_NSLOTS];
+
+    CHECK(WMM_TCACHE_LARGE_GC_PAGES == 128u);
+    CHECK(t->large_max_pages >= 8);
+    large_reset(base);
+
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++) {
+        b4[k] = wmm_alloc(4 * WMM_PAGE);
+        b5[k] = wmm_alloc(5 * WMM_PAGE);
+        b6[k] = wmm_alloc(6 * WMM_PAGE);
+        b8[k] = wmm_alloc(8 * WMM_PAGE);
+        CHECK(b4[k] != NULL && b5[k] != NULL &&
+              b6[k] != NULL && b8[k] != NULL);
+    }
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++) {
+        wmm_free(b4[k]);
+        wmm_free(b5[k]);
+        wmm_free(b6[k]);
+        wmm_free(b8[k]);
+    }
+    CHECK(t->large_count[4] == WMM_TCACHE_LARGE_NSLOTS);
+    CHECK(t->large_count[5] == WMM_TCACHE_LARGE_NSLOTS);
+    CHECK(t->large_count[6] == WMM_TCACHE_LARGE_NSLOTS);
+    CHECK(t->large_count[8] == WMM_TCACHE_LARGE_NSLOTS);
+    CHECK(t->large_pages == 460);
+    CHECK(t->large_used[4] == 0 && t->large_used[5] == 0 &&
+          t->large_used[6] == 0 && t->large_used[8] == 0);
+    large_check_counts(t);
+
+    t->large_gc_cursor = 4;
+    large_trigger_rolling(9);
+    CHECK(460 - t->large_pages == 125);
+    CHECK(t->large_pages == 335);
+    CHECK(t->large_count[4] == 0);
+    CHECK(t->large_count[5] == 11);
+    CHECK(t->large_count[6] == WMM_TCACHE_LARGE_NSLOTS);
+    CHECK(t->large_count[8] == WMM_TCACHE_LARGE_NSLOTS);
+    CHECK(t->large_gc_cursor == 6);
+    CHECK(total_live() == base + large_slots(t));
+    large_check_counts(t);
+
+    large_trigger_rolling(9);
+    CHECK(335 - t->large_pages == 128);
+    CHECK(t->large_pages == 207);
+    CHECK(t->large_count[6] == 0);
+    CHECK(t->large_count[8] == 19);
+    CHECK(t->large_gc_cursor == 4);
+    large_check_counts(t);
+
+    large_trigger_rolling(9);
+    CHECK(207 - t->large_pages == 127);
+    CHECK(t->large_pages == 80);
+    CHECK(t->large_count[5] == 0);
+    CHECK(t->large_count[8] == 10);
+    CHECK(t->large_gc_cursor == 4);
+    large_check_counts(t);
+
+    large_trigger_rolling(9);
+    CHECK(80 - t->large_pages == 80);
+    CHECK(t->large_pages == 0);
+    CHECK(t->large_count[8] == 0);
+    CHECK(t->large_gc_cursor == 4);
+    CHECK(large_slots(t) == 0);
+    CHECK(total_live() == base);
+    large_check_counts(t);
+
+    /* 游标持续轮转:同一类反复填满,事件最终能把它排空 */
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++) {
+        b8[k] = wmm_alloc(8 * WMM_PAGE);
+        CHECK(b8[k] != NULL);
+    }
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++)
+        wmm_free(b8[k]);
+    CHECK(t->large_count[8] == WMM_TCACHE_LARGE_NSLOTS);
+
+    unsigned events = 0;
+    while (t->large_count[8] != 0 && events < 8) {
+        large_trigger_rolling(9);
+        events++;
+    }
+    CHECK(events == 2);
+    CHECK(t->large_pages == 0);
+    CHECK(large_slots(t) == 0);
+    CHECK(total_live() == base);
+    large_check_counts(t);
+    large_reset(base);
+}
+
+/* 部分归还的类保留 used,下一圈继续朝同一目标收缩 */
+static void check_large_rolling_partial(uint64_t base) {
+    wmm_tcache_t *t = g_tcache;
+    void *b[WMM_TCACHE_LARGE_NSLOTS];
+
+    large_reset(base);
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++) {
+        b[k] = wmm_alloc(8 * WMM_PAGE);
+        CHECK(b[k] != NULL);
+    }
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++)
+        wmm_free(b[k]);
+    CHECK(t->large_count[8] == WMM_TCACHE_LARGE_NSLOTS);
+    CHECK(t->large_used[8] == 0);
+
+    void *x = wmm_alloc(8 * WMM_PAGE);
+    void *y = wmm_alloc(8 * WMM_PAGE);
+    CHECK(x != NULL && y != NULL);
+    CHECK(t->large_used[8] == 2);
+    wmm_free(x);
+    wmm_free(y);
+    CHECK(t->large_count[8] == WMM_TCACHE_LARGE_NSLOTS);
+    CHECK(t->large_used[8] == 2);
+
+    t->large_gc_cursor = 8;
+    large_trigger_rolling(9);
+    CHECK(t->large_count[8] == 4);
+    CHECK(t->large_used[8] == 2);          /* 未到 keep,保留取用信号 */
+    CHECK(t->large_pages == 4 * 8);
+    CHECK(t->large_gc_cursor == 4);
+    large_check_counts(t);
+
+    large_trigger_rolling(9);
+    CHECK(t->large_count[8] == 2);
+    CHECK(t->large_used[8] == 0);          /* 到达 keep,清信号 */
+    CHECK(t->large_pages == 2 * 8);
+    CHECK(t->large_gc_cursor == 4);
+    CHECK(total_live() == base + large_slots(t));
+    large_check_counts(t);
+    large_reset(base);
+}
+
+/* 未轮到的类保留其取用计数,游标停在预算耗尽处 */
+static void check_large_rolling_pending_used(uint64_t base) {
+    wmm_tcache_t *t = g_tcache;
+    void *b4[WMM_TCACHE_LARGE_NSLOTS];
+    void *b6[WMM_TCACHE_LARGE_NSLOTS];
+    void *b8[WMM_TCACHE_LARGE_NSLOTS];
+
+    large_reset(base);
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++) {
+        b4[k] = wmm_alloc(4 * WMM_PAGE);
+        b6[k] = wmm_alloc(6 * WMM_PAGE);
+        b8[k] = wmm_alloc(8 * WMM_PAGE);
+        CHECK(b4[k] != NULL && b6[k] != NULL && b8[k] != NULL);
+    }
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++) {
+        wmm_free(b4[k]);
+        wmm_free(b6[k]);
+        wmm_free(b8[k]);
+    }
+    CHECK(t->large_pages == 360);
+
+    void *x = wmm_alloc(8 * WMM_PAGE);
+    CHECK(x != NULL);
+    wmm_free(x);
+    CHECK(t->large_count[8] == WMM_TCACHE_LARGE_NSLOTS);
+    CHECK(t->large_used[8] == 1);
+
+    t->large_gc_cursor = 4;
+    large_trigger_rolling(9);
+    CHECK(t->large_count[4] == 0);
+    CHECK(t->large_count[6] == WMM_TCACHE_LARGE_NSLOTS - 8);
+    CHECK(t->large_count[8] == WMM_TCACHE_LARGE_NSLOTS);
+    CHECK(t->large_pages == 12 * 6 + 20 * 8);
+    CHECK(t->large_used[8] == 1);          /* 类 8 未被访问 */
+    CHECK(t->large_gc_cursor == 7);
+    CHECK(total_live() == base + large_slots(t));
+    large_check_counts(t);
+    large_reset(base);
+}
+
+/* 超限类不可命中:滚动路径整类归还且不占页预算 */
+static void check_large_rolling_above_limit(uint64_t base) {
+    wmm_tcache_t *t = g_tcache;
+    uint32_t max0 = wmm_tcache_max_pages_now();
+    void *b[WMM_TCACHE_LARGE_NSLOTS];
+
+    CHECK(max0 >= 8);
+    large_reset(base);
+
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++) {
+        b[k] = wmm_alloc(8 * WMM_PAGE);
+        CHECK(b[k] != NULL);
+    }
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++)
+        wmm_free(b[k]);
+    CHECK(t->large_count[8] == WMM_TCACHE_LARGE_NSLOTS);
+    CHECK(t->large_pages == 160);
+
+    /* 160 页超过滚动预算,但类 8 已超上限,仍一次整类归还 */
+    CHECK(wmm_ctl("config.tcache_max", (int)(4 * WMM_PAGE)) == 0);
+    t->large_gc_cursor = 4;
+    large_trigger_rolling(5);
+    CHECK(t->large_count[8] == 0);
+    CHECK(t->large_pages == 0);
+    CHECK(large_slots(t) == 0);
+    CHECK(t->large_gc_cursor == WMM_TCACHE_LARGE_MIN_PAGES);
+    CHECK(total_live() == base);
+    large_check_counts(t);
+
+    /* tcache_max=0:下一次滚动事件排空全部存量 */
+    CHECK(wmm_ctl("config.tcache_max", (int)(max0 * WMM_PAGE)) == 0);
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++) {
+        b[k] = wmm_alloc(4 * WMM_PAGE);
+        CHECK(b[k] != NULL);
+    }
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++)
+        wmm_free(b[k]);
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++) {
+        b[k] = wmm_alloc(8 * WMM_PAGE);
+        CHECK(b[k] != NULL);
+    }
+    for (unsigned k = 0; k < WMM_TCACHE_LARGE_NSLOTS; k++)
+        wmm_free(b[k]);
+    CHECK(t->large_count[4] == WMM_TCACHE_LARGE_NSLOTS);
+    CHECK(t->large_count[8] == WMM_TCACHE_LARGE_NSLOTS);
+    CHECK(t->large_pages == 240);
+
+    void *q = wmm_alloc(5 * WMM_PAGE);
+    CHECK(q != NULL);
+    CHECK(wmm_ctl("config.tcache_max", 0) == 0);
+    t->large_gc_cursor = WMM_TCACHE_LARGE_MIN_PAGES;
+    t->large_gc_evt = WMM_TCACHE_LARGE_GC_EVERY - 1;
+    wmm_free(q);
+    CHECK(t->large_gc_evt == 0);
+    CHECK(t->large_count[4] == 0);
+    CHECK(t->large_count[8] == 0);
+    CHECK(t->large_pages == 0);
+    CHECK(large_slots(t) == 0);
+    CHECK(t->large_gc_cursor == WMM_TCACHE_LARGE_MIN_PAGES);
+    CHECK(total_live() == base);
+    large_check_counts(t);
+
+    CHECK(wmm_ctl("config.tcache_max", (int)(max0 * WMM_PAGE)) == 0);
+    CHECK(wmm_tcache_max_pages_now() == max0);
+    large_reset(base);
+}
+
+/* 创建时上限为 0 的线程:滚动事件直接复位,不碰大缓存数组 */
+typedef struct {
+    atomic_int ready;
+    unsigned   err;
+    uint32_t   maxp;
+    uint16_t   evt;
+    uint16_t   cursor;
+    uint32_t   nlarge;
+} zero_max_arg_t;
+
+static void *zero_max_worker(void *arg) {
+    zero_max_arg_t *a = (zero_max_arg_t *)arg;
+    unsigned err = 0;
+
+    wmm_thread_init();
+    if (g_tcache == NULL) {
+        a->err = 1u;
+        atomic_store_explicit(&a->ready, 1, memory_order_release);
+        return NULL;
+    }
+
+    a->maxp = g_tcache->large_max_pages;
+    void *p = wmm_alloc(4 * WMM_PAGE);
+    if (p == NULL) {
+        err |= 2u;
+    } else {
+        g_tcache->large_gc_evt = WMM_TCACHE_LARGE_GC_EVERY - 1;
+        wmm_free(p);
+    }
+
+    a->evt    = g_tcache->large_gc_evt;
+    a->cursor = g_tcache->large_gc_cursor;
+    a->nlarge = atomic_load_explicit(&g_tcache->nlarge, memory_order_relaxed);
+    if (a->maxp != 0 || a->evt != 0 || a->nlarge != 0 ||
+        a->cursor != WMM_TCACHE_LARGE_MIN_PAGES)
+        err |= 4u;
+
+    a->err = err;
+    atomic_store_explicit(&a->ready, 1, memory_order_release);
+    return NULL;
+}
+
+static void check_large_zero_max_thread(uint64_t base) {
+    uint32_t max0 = wmm_tcache_max_pages_now();
+    zero_max_arg_t a;
+
+    large_reset(base);
+    a.err    = 0;
+    a.maxp   = 0;
+    a.evt    = 0;
+    a.cursor = 0;
+    a.nlarge = 0;
+    atomic_init(&a.ready, 0);
+
+    CHECK(wmm_ctl("config.tcache_max", 0) == 0);
+    CHECK(wmm_tcache_max_pages_now() == 0);
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, zero_max_worker, &a) != 0) {
+        printf("  FAIL @%d: pthread_create\n", __LINE__);
+        g_fail++;
+    } else {
+        while (!atomic_load_explicit(&a.ready, memory_order_acquire))
+            sched_yield();
+        CHECK(a.err == 0);
+        CHECK(a.maxp == 0);
+        CHECK(a.evt == 0);
+        CHECK(a.cursor == WMM_TCACHE_LARGE_MIN_PAGES);
+        CHECK(a.nlarge == 0);
+        CHECK(pthread_join(th, NULL) == 0);
+        CHECK(wmm_tcache_cached_total() == 0);
+        CHECK(total_live() == base);
+    }
+
+    CHECK(wmm_ctl("config.tcache_max", (int)(max0 * WMM_PAGE)) == 0);
+    CHECK(wmm_tcache_max_pages_now() == max0);
     large_reset(base);
 }
 
@@ -1287,6 +1718,11 @@ static void check_large_extent_cache(void) {
     check_large_flush_gc(base);
     check_large_cross_gc(base);
     check_large_rolling_gc(base);
+    check_large_rolling_bounded(base);
+    check_large_rolling_partial(base);
+    check_large_rolling_pending_used(base);
+    check_large_rolling_above_limit(base);
+    check_large_zero_max_thread(base);
     check_large_disabled(base);
 
     CHECK(flush_baseline() == base);

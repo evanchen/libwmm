@@ -74,6 +74,7 @@ static bool tcache_create(void) {
     t->large_pages     = 0;
     t->large_max_pages = maxp;
     t->large_gc_evt    = 0;
+    t->large_gc_cursor = WMM_TCACHE_LARGE_MIN_PAGES;
 
     t->prof_tick = 0;
     atomic_init(&t->prof.head, 0);
@@ -250,76 +251,158 @@ static void tcache_large_drain(wmm_tcache_t *t, bool clear_ptes) {
     t->large_pages = 0;
     memset(t->large_used, 0,
            ((size_t)t->large_max_pages + 1) * sizeof(uint16_t));
-    t->large_gc_evt = 0;
+    t->large_gc_evt    = 0;
+    t->large_gc_cursor = WMM_TCACHE_LARGE_MIN_PAGES;
 }
 
-/* 按上次 GC 以来的取用次数收缩:未取用的类整类归还,用过的类
-   保留取用量加 25% 的最新块;超过当前页数上限的存量直接归还 */
-static void tcache_large_gc(wmm_tcache_t *t) {
+/* 当前全局单块上限与本缓存数组上界的较小者 */
+static uint32_t tcache_large_lim(const wmm_tcache_t *t) {
+    uint32_t lim = wmm_tcache_max_pages_now();
+
+    return lim > t->large_max_pages ? t->large_max_pages : lim;
+}
+
+/* 收缩一个页数类,最多摘 max_evict 个最旧块;返回实际摘链块数。
+   只有真正到达保留目标才清 used,被预算截断的类下次继续。 */
+static uint32_t tcache_large_gc_class(wmm_tcache_t *t, uint32_t p,
+                                      uint32_t lim, uint32_t max_evict,
+                                      tcache_large_batch_t *b) {
+    unsigned used = t->large_used[p];
+    uint32_t count = 0;
+    uint32_t keep;
+    uint32_t evict;
+    uint32_t retain;
+    wmm_extent_t *cut;
+    wmm_extent_t *e;
+
+    for (e = t->large_head[p]; e != NULL; e = e->cache_next)
+        count++;
+    if (count == 0) {
+        t->large_count[p] = 0;
+        t->large_used[p]  = 0;
+        return 0;
+    }
+    if (t->large_count[p] != count)
+        t->large_count[p] = (uint16_t)count;
+
+    if (p > lim || used == 0) {
+        keep = 0;
+    } else {
+        keep = used + (used >> 2);
+        if (keep > count)
+            keep = count;
+    }
+
+    evict = count - keep;
+    if (evict > max_evict)
+        evict = max_evict;
+    retain = count - evict;
+
+    if (evict == 0) {
+        t->large_used[p] = 0;
+        return 0;
+    }
+
+    if (retain == 0) {
+        e = t->large_head[p];
+        t->large_head[p] = NULL;
+    } else {
+        cut = t->large_head[p];
+        for (uint32_t k = 1; k < retain; k++)
+            cut = cut->cache_next;
+        e = cut->cache_next;
+        cut->cache_next = NULL;
+    }
+
+    t->large_count[p] = (uint16_t)retain;
+    tcache_large_unaccount(t, p, evict);
+
+    while (e != NULL) {
+        wmm_extent_t *next = e->cache_next;
+
+        tcache_large_batch_add(b, e);
+        e = next;
+    }
+
+    if (retain == keep)
+        t->large_used[p] = 0;
+    return evict;
+}
+
+/* 完整收缩:显式 gc、gc_req 与排空路径使用,不受滚动页预算限制 */
+static void tcache_large_gc_full(wmm_tcache_t *t) {
     tcache_large_batch_t b = { .n = 0 };
     uint32_t lim;
 
     if (t == NULL)
         return;
 
-    lim = wmm_tcache_max_pages_now();
-    if (lim > t->large_max_pages)
-        lim = t->large_max_pages;
-
+    lim = tcache_large_lim(t);
     for (uint32_t p = WMM_TCACHE_LARGE_MIN_PAGES;
-         p <= t->large_max_pages; p++) {
-        unsigned used = t->large_used[p];
-        uint32_t count = 0;
-        uint32_t keep;
-        uint32_t evicted;
-        wmm_extent_t *evict;
-        wmm_extent_t *cut;
+         p <= t->large_max_pages; p++)
+        (void)tcache_large_gc_class(t, p, lim, UINT32_MAX, &b);
 
-        t->large_used[p] = 0;
-
-        for (wmm_extent_t *e = t->large_head[p]; e != NULL;
-             e = e->cache_next)
-            count++;
-        if (count == 0) {
-            t->large_count[p] = 0;
-            continue;
-        }
-        if (t->large_count[p] != count)
-            t->large_count[p] = (uint16_t)count;
-
-        if (p > lim || used == 0) {
-            keep = 0;
-        } else {
-            keep = used + (used >> 2);
-            if (keep > count)
-                keep = count;
-        }
-        if (keep == count)
-            continue;
-
-        if (keep == 0) {
-            evict = t->large_head[p];
-            t->large_head[p] = NULL;
-        } else {
-            cut = t->large_head[p];
-            for (uint32_t k = 1; k < keep; k++)
-                cut = cut->cache_next;
-            evict = cut->cache_next;
-            cut->cache_next = NULL;
-        }
-
-        evicted = count - keep;
-        t->large_count[p] = (uint16_t)keep;
-        tcache_large_unaccount(t, p, evicted);
-
-        while (evict != NULL) {
-            wmm_extent_t *next = evict->cache_next;
-
-            tcache_large_batch_add(&b, evict);
-            evict = next;
-        }
-    }
     tcache_large_batch_flush(&b);
+    t->large_gc_cursor = WMM_TCACHE_LARGE_MIN_PAGES;
+    t->large_gc_evt = 0;
+}
+
+/* 滚动收缩:每次事件最多归还 WMM_TCACHE_LARGE_GC_PAGES 页,
+   游标轮转页数类;超限类不可命中,整类归还且不占页预算 */
+static void tcache_large_gc_rolling(wmm_tcache_t *t) {
+    tcache_large_batch_t b = { .n = 0 };
+    uint32_t minp = WMM_TCACHE_LARGE_MIN_PAGES;
+    uint32_t maxp;
+    uint32_t lim;
+    uint32_t budget;
+    uint32_t p;
+    bool progress = false;
+
+    if (t == NULL)
+        return;
+
+    maxp = t->large_max_pages;
+    if (maxp < minp) {
+        t->large_gc_evt    = 0;
+        t->large_gc_cursor = (uint16_t)minp;
+        return;
+    }
+
+    lim = tcache_large_lim(t);
+    budget = WMM_TCACHE_LARGE_GC_PAGES;
+    p = t->large_gc_cursor;
+    if (p < minp || p > maxp)
+        p = minp;
+
+    for (uint32_t left = maxp - minp + 1; left != 0; left--) {
+        uint32_t max_evict;
+        uint32_t evicted;
+
+        if (p <= lim && budget < p && progress)
+            break;
+
+        if (p > lim)
+            max_evict = UINT32_MAX;
+        else if (budget >= p)
+            max_evict = budget / p;
+        else
+            max_evict = 1;
+
+        evicted = tcache_large_gc_class(t, p, lim, max_evict, &b);
+        if (evicted != 0)
+            progress = true;
+
+        if (p <= lim) {
+            uint64_t pages = (uint64_t)evicted * p;
+
+            budget = pages >= budget ? 0 : budget - (uint32_t)pages;
+        }
+
+        p = p == maxp ? minp : p + 1;
+    }
+
+    tcache_large_batch_flush(&b);
+    t->large_gc_cursor = (uint16_t)p;
     t->large_gc_evt = 0;
 }
 
@@ -384,7 +467,7 @@ static void tcache_process_gc_req(wmm_tcache_t *t) {
         atomic_load_explicit(&t->gc_req, memory_order_acquire) != 0 &&
         atomic_exchange_explicit(&t->gc_req, 0, memory_order_acquire) != 0) {
         tcache_gc_all_bins(t);
-        tcache_large_gc(t);
+        tcache_large_gc_full(t);
     }
 }
 
@@ -395,7 +478,7 @@ void wmm_tcache_gc_all(void) {
     if (self != NULL) {
         atomic_store_explicit(&self->gc_req, 0, memory_order_relaxed);
         tcache_gc_all_bins(self);
-        tcache_large_gc(self);
+        tcache_large_gc_full(self);
     }
 
     pthread_mutex_lock(&g_threads_lock);
@@ -424,9 +507,7 @@ wmm_extent_t *wmm_tcache_large_take(wmm_tcache_t *t, size_t npages) {
     if (t == NULL || !t->enabled)
         return NULL;
 
-    lim = wmm_tcache_max_pages_now();
-    if (lim > t->large_max_pages)
-        lim = t->large_max_pages;
+    lim = tcache_large_lim(t);
     if (npages < WMM_TCACHE_LARGE_MIN_PAGES || npages > lim)
         return NULL;
 
@@ -459,11 +540,9 @@ bool wmm_tcache_large_put(wmm_tcache_t *t, wmm_extent_t *e) {
         return false;
 
     if (++t->large_gc_evt >= WMM_TCACHE_LARGE_GC_EVERY)
-        tcache_large_gc(t);
+        tcache_large_gc_rolling(t);
 
-    lim = wmm_tcache_max_pages_now();
-    if (lim > t->large_max_pages)
-        lim = t->large_max_pages;
+    lim = tcache_large_lim(t);
     if (e->npages < WMM_TCACHE_LARGE_MIN_PAGES || e->npages > lim)
         return false;
 

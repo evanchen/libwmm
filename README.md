@@ -8,7 +8,7 @@
 ## 设计目标
 
 - 36 个小对象尺寸类 + 大对象类;slab + freelist 布局;页表反向映射
-- 无锁 tcache 快路径 + 自适应 GC;大对象按精确页数分类的线程缓存(每类 20 槽、有界预算、按取用量收缩);全局单 arena + bin 锁
+- 无锁 tcache 快路径 + 自适应 GC;大对象按精确页数分类的线程缓存(每类 20 槽、有界预算、按取用量收缩,滚动收缩按页限额轮转);全局单 arena + bin 锁
 - 尺寸分桶空闲链 + 非空桶位图 + extent 合并;retained/dirty 两级物理层;purge 后台线程
 - **可观测核心**:per-class/per-thread 计数、调用点采样、泄漏三档检测、
   guard/quarantine、事件日志、共享内存监控协议(seqlock)
