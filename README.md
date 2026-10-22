@@ -3,7 +3,7 @@
 小而精的 Linux 内存管理库:内嵌于后端服务,提供自定义内存管理 +
 **实时可观测与问题定位**(内存去哪了 / 谁在涨 / 越界与 UAF / 碎片程度)。
 
-> **状态**:开发中(in development)。按 `doc/tasks.md` 的模块分解,由作者手写实现。
+> **状态**:开发中(in development)
 
 ## 设计目标
 
@@ -138,16 +138,6 @@ make cgroup-oom CGROUP_ARGS="--live-mb 64 --max-mb 192 --seconds 5"
 ```sh
 ./build/demo/playbook leak     # 或 slowleak/rss/oob/uaf/double/peak
 ```
-
-## 文档
-
-| 文档 | 说明 |
-|---|---|
-| `doc/plan.md` | SDD 单一执行源:规格(SPEC)与 DoD |
-| `doc/tasks.md` | 手写实现任务分解(M0~M16,含自测清单) |
-| `doc/allocator_build_guide.md` | 设计规格全文 |
-| `doc/DESIGN.md` | jemalloc 架构分析(规格参考) |
-| `doc/playbook.md` | 七类症状演练:复现、读数、结论 |
 
 ## 许可证
 
