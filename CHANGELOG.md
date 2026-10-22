@@ -34,6 +34,8 @@
 - bench server 尾延迟归因:`--server-big/realloc/session/touch 0|1`
   逐项关闭负载成分(随机流不变),stderr 打印最慢请求的对象数、
   最大尺寸、调用数与标志位。
+- bench 增加 `--tcache-max` / `--tcache-budget`:启动时按字节设置
+  wmm 的大缓存单块上限与每线程预算,用于同负载对照不同调优值。
 - soak CSV 与 `SOAK_RESULT` 增加 `window_kb`、`base_kb` 高水位:分别
   观测窗口 bump 决定的页表常驻页与 base 元数据开销;多余列不影响
   `gate.py` 解析。

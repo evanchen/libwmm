@@ -45,7 +45,7 @@
  * 用法:
  *   bench <wmm|glibc> [--scenario seq|mt|mixed|large|server|all]
  *         [--threads N] [--ops N] [--large-ops N] [--requests N]
- *         [--seed N] [--no-header]
+ *         [--tcache-max N] [--tcache-budget N] [--seed N] [--no-header]
  */
 #include "wmm.h"
 
@@ -130,6 +130,8 @@ typedef struct {
     bool        srv_realloc;  /* server 是否执行 realloc */
     bool        srv_session;  /* server 是否使用会话槽位 */
     bool        srv_touch;    /* server 是否触碰已分配内存 */
+    uint64_t    tcache_max;    /* 大缓存单块上限字节;UINT64_MAX=不设置 */
+    uint64_t    tcache_budget; /* 大缓存每线程预算字节;UINT64_MAX=不设置 */
 } bench_options_t;
 
 typedef struct {
@@ -893,6 +895,8 @@ static void usage(FILE *out) {
         "  --server-realloc 0|1  server 是否执行 realloc(默认 1)\n"
         "  --server-session 0|1  server 是否使用会话槽位(默认 1)\n"
         "  --server-touch 0|1    server 是否触碰已分配内存(默认 1)\n"
+        "  --tcache-max N    wmm 大缓存单块上限字节,0=关(最高 8 MiB)\n"
+        "  --tcache-budget N wmm 每线程大缓存预算字节,0=不限(最高 64 MiB)\n"
         "  --seed N          随机种子,必须非 0\n"
         "  --no-header       不打印 CSV 表头\n"
         "  --help            显示本帮助\n");
@@ -934,6 +938,8 @@ int main(int argc, char **argv) {
         .srv_realloc = true,
         .srv_session = true,
         .srv_touch   = true,
+        .tcache_max    = UINT64_MAX,
+        .tcache_budget = UINT64_MAX,
     };
 
     if (strcmp(opt.impl, "wmm") != 0 && strcmp(opt.impl, "glibc") != 0) {
@@ -991,6 +997,12 @@ int main(int argc, char **argv) {
             if (parse_u64(argv[++i], 0, 1, &v) != 0)
                 goto bad_arg;
             opt.srv_touch = v != 0;
+        } else if (strcmp(a, "--tcache-max") == 0 && i + 1 < argc) {
+            if (parse_u64(argv[++i], 0, 8u << 20, &opt.tcache_max) != 0)
+                goto bad_arg;
+        } else if (strcmp(a, "--tcache-budget") == 0 && i + 1 < argc) {
+            if (parse_u64(argv[++i], 0, 64u << 20, &opt.tcache_budget) != 0)
+                goto bad_arg;
         } else if (strcmp(a, "--seed") == 0 && i + 1 < argc) {
             if (parse_u64(argv[++i], 1, UINT64_MAX, &opt.seed) != 0)
                 goto bad_arg;
@@ -1024,6 +1036,33 @@ bad_arg:
         g_realloc = realloc;
     }
     g_impl = opt.impl;
+
+    if (opt.tcache_max != UINT64_MAX || opt.tcache_budget != UINT64_MAX) {
+        if (strcmp(opt.impl, "wmm") != 0) {
+            fprintf(stderr, "bench: --tcache-max/--tcache-budget 仅对 wmm "
+                    "生效,已忽略\n");
+        } else {
+            if (opt.tcache_max != UINT64_MAX &&
+                wmm_ctl("config.tcache_max", (int)opt.tcache_max) != 0) {
+                fprintf(stderr, "bench: config.tcache_max: %s\n",
+                        strerror(errno));
+                return 2;
+            }
+            if (opt.tcache_budget != UINT64_MAX &&
+                wmm_ctl("config.tcache_budget",
+                        (int)opt.tcache_budget) != 0) {
+                fprintf(stderr, "bench: config.tcache_budget: %s\n",
+                        strerror(errno));
+                return 2;
+            }
+            if (opt.tcache_max != UINT64_MAX)
+                fprintf(stderr, "bench: tcache_max=%" PRIu64 " bytes\n",
+                        opt.tcache_max);
+            if (opt.tcache_budget != UINT64_MAX)
+                fprintf(stderr, "bench: tcache_budget=%" PRIu64 " bytes\n",
+                        opt.tcache_budget);
+        }
+    }
 
     if (opt.header)
         printf("impl,scenario,ops,seconds,ops_per_sec,p50_ns,p99_ns,rss_kb,"
